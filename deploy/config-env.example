@@ -1,0 +1,51 @@
+# /etc/config/config.env
+#
+# Environment file for the config service.
+# Must be owned by root with mode 600:
+#   sudo chown root:root /etc/config/config.env
+#   sudo chmod 600 /etc/config/config.env
+
+# Port the config service listens on (default 8282)
+# PORT=8282
+
+# Database path (default: config.db in the working directory)
+# DB_PATH=/var/lib/config/config.db
+
+# Environment: "production" in prod, "development" for local dev.
+# IDENTITY_ENV=production
+
+# Identity service URL — JWKS is fetched from {IDENTITY_ISSUER_URL}/.well-known/jwks.json.
+# Required in production.
+IDENTITY_ISSUER_URL=https://id.example.com
+
+# Expected JWT `iss` claim. Usually the same as IDENTITY_ISSUER_URL.
+IDENTITY_ISSUER=https://id.example.com
+
+# How long to cache the fetched JWKS before refetching (Go duration, default 5m).
+# JWKS_CACHE_TTL=5m
+
+# Cooldown between consecutive triggered backups (Go duration, default 30s).
+# BACKUP_MIN_INTERVAL=30s
+
+# Proxy trust: "cloudflare" to honour CF-Connecting-IP for rate limiting.
+# TRUST_PROXY=cloudflare
+
+# CORS origins for browser clients. Comma-separated.
+# CORS_ORIGINS=https://app.example.com
+
+# Rate limiting (leave unset in production).
+# RATE_LIMIT_DISABLED=1
+
+# Cloudflare R2 backup — optional. Leave unset to disable backups.
+# R2_ACCOUNT_ID=
+# R2_ACCESS_KEY_ID=
+# R2_SECRET_ACCESS_KEY=
+# R2_BUCKET_NAME=
+
+# Admin UI (optional). When OAUTH_CLIENT_ID is set, an admin SPA is
+# mounted at / for browser-based namespace CRUD.
+# OAUTH_CLIENT_ID=config-spa
+
+# The URL the browser uses to reach identity for OAuth flows.
+# Defaults to IDENTITY_ISSUER_URL.
+# IDENTITY_PUBLIC_URL=https://id.example.com

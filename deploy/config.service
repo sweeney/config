@@ -1,0 +1,39 @@
+[Unit]
+Description=swee.net config service
+After=network.target
+Documentation=https://github.com/sweeney/config
+
+[Service]
+Type=simple
+User=config
+Group=config
+
+ExecStart=/opt/config/bin/config-server
+WorkingDirectory=/var/lib/config
+
+EnvironmentFile=/etc/config/config.env
+
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/config
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=config
+
+[Install]
+WantedBy=multi-user.target
