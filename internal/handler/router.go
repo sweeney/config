@@ -131,26 +131,33 @@ func noListing(h http.Handler) http.Handler {
 	})
 }
 
-// requireUserToken rejects service tokens and unrecognised role claims.
+// requireUserToken accepts user tokens with a known role and service tokens
+// (which are always treated as user role). Rejects unrecognised role claims.
 func requireUserToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c := auth.ClaimsFromContext(r.Context())
-		if c == nil {
-			writeErr(w, http.StatusForbidden, "forbidden", "user token required")
+		if c := auth.ClaimsFromContext(r.Context()); c != nil {
+			role := string(c.Role)
+			if role != domain.ConfigRoleAdmin && role != domain.ConfigRoleUser {
+				writeErr(w, http.StatusForbidden, "forbidden", "unrecognised role in token")
+				return
+			}
+			next.ServeHTTP(w, r)
 			return
 		}
-		role := string(c.Role)
-		if role != domain.ConfigRoleAdmin && role != domain.ConfigRoleUser {
-			writeErr(w, http.StatusForbidden, "forbidden", "unrecognised role in token")
+		if auth.ServiceClaimsFromContext(r.Context()) != nil {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		writeErr(w, http.StatusForbidden, "forbidden", "valid user or service token required")
 	})
 }
 
 func callerFromRequest(r *http.Request) service.Caller {
-	c := auth.ClaimsFromContext(r.Context())
-	return service.Caller{Sub: c.UserID, Role: string(c.Role)}
+	if c := auth.ClaimsFromContext(r.Context()); c != nil {
+		return service.Caller{Sub: c.UserID, Role: string(c.Role)}
+	}
+	sc := auth.ServiceClaimsFromContext(r.Context())
+	return service.Caller{Sub: sc.ClientID, Role: domain.ConfigRoleUser}
 }
 
 // --- handlers ---

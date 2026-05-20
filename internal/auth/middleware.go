@@ -29,6 +29,17 @@ func ClaimsFromContext(ctx context.Context) *commonauth.TokenClaims {
 	return c
 }
 
+// ServiceClaimsFromContext extracts ServiceTokenClaims from a request context set by RequireAuth.
+// Returns nil if not present (e.g. for user tokens).
+func ServiceClaimsFromContext(ctx context.Context) *commonauth.ServiceTokenClaims {
+	v := ctx.Value(serviceClaimsContextKey)
+	if v == nil {
+		return nil
+	}
+	c, _ := v.(*commonauth.ServiceTokenClaims)
+	return c
+}
+
 // RequireAuth validates the Bearer token and injects claims into the request
 // context. Returns 401 for missing/invalid tokens, 403 for inactive accounts.
 func RequireAuth(parser TokenParser, next http.Handler) http.Handler {

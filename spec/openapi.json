@@ -250,14 +250,14 @@
     "securitySchemes": {
       "bearerAuth": {
         "bearerFormat": "JWT",
-        "description": "Identity-issued user access token (service tokens are rejected).",
+        "description": "Identity-issued user or service (client_credentials / at+jwt) token. Service tokens are accepted with fixed user role.",
         "scheme": "bearer",
         "type": "http"
       }
     }
   },
   "info": {
-    "description": "Self-hosted structured-config service. Namespaces\nare JSON documents with per-namespace read/write role ACLs. Tokens\nare verified against the identity service's JWKS endpoint.\n\n## Role model\nEach namespace declares `read_role` and `write_role` (each `admin`\nor `user`). Admins always satisfy any role. Users only satisfy\n`user`. Creating, deleting, and ACL-updating a namespace are all\nadmin-only regardless of `write_role`.\n\n## No existence leak\nCallers who lack `read_role` receive 404 (not 403) on any operation\nagainst a namespace, so they cannot probe namespace existence.\n\n## Backups\nEvery successful mutation triggers an async R2 backup. Rapid bursts\ncoalesce into one backup per cooldown window (default 30s).\n",
+    "description": "Self-hosted structured-config service. Namespaces\nare JSON documents with per-namespace read/write role ACLs. Tokens\nare verified against the identity service's JWKS endpoint.\n\n## Authentication\nBoth user tokens and service tokens (client_credentials `at+jwt`) are\naccepted. Service tokens are treated as `user` role; they cannot create,\ndelete, or update ACLs regardless of namespace settings.\n\n## Role model\nEach namespace declares `read_role` and `write_role` (each `admin`\nor `user`). Admins always satisfy any role. Users only satisfy\n`user`. Creating, deleting, and ACL-updating a namespace are all\nadmin-only regardless of `write_role`.\n\n## No existence leak\nCallers who lack `read_role` receive 404 (not 403) on any operation\nagainst a namespace, so they cannot probe namespace existence.\n\n## Backups\nEvery successful mutation triggers an async R2 backup. Rapid bursts\ncoalesce into one backup per cooldown window (default 30s).\n",
     "title": "Config API",
     "version": "1.0.0"
   },

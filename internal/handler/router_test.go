@@ -213,6 +213,16 @@ func (r *fakeRepo) Delete(name string) error {
 	return nil
 }
 
+func (r *fakeRepo) seed(name, readRole, writeRole, document string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	r.data[name] = &domain.ConfigNamespace{
+		Name: name, ReadRole: readRole, WriteRole: writeRole,
+		Document: []byte(document), CreatedAt: now, UpdatedAt: now,
+	}
+}
+
 type fakeBackup struct{}
 
 func (fakeBackup) TriggerAsync() {}
@@ -300,14 +310,111 @@ func TestList_MissingAuth_ReturnsUnauthorized(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
-func TestList_ServiceToken_Rejected(t *testing.T) {
+// --- Service token access ---
+//
+// Service tokens are accepted and treated as user role. They can read
+// user-readable namespaces but cannot write, create, delete, or change ACLs.
+// Admin-only namespaces are invisible to them (404, not 403).
+
+func svcTok(h *harness) string {
+	return h.issuer.mintService(&commonauth.ServiceTokenClaims{ClientID: "svc-client"})
+}
+
+func TestServiceToken_List_Returns200(t *testing.T) {
 	h := newHarness(t)
-	svcTok := h.issuer.mintService(&commonauth.ServiceTokenClaims{
-		ClientID: "svc", Audience: "config",
-	})
-	resp, _ := h.do("GET", "/api/v1/config", svcTok, nil)
+	resp, _ := h.do("GET", "/api/v1/config", svcTok(h), nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"service tokens must be accepted with user-level access")
+}
+
+func TestServiceToken_List_SeesOnlyUserNamespaces(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("visible", "user", "admin", `{}`)
+	h.repo.seed("hidden", "admin", "admin", `{}`)
+
+	_, body := h.do("GET", "/api/v1/config", svcTok(h), nil)
+	assert.Contains(t, string(body), "visible")
+	assert.NotContains(t, string(body), "hidden",
+		"admin-only namespaces must not appear in service token list")
+}
+
+func TestServiceToken_Get_UserNamespace_Returns200(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("pub", "user", "admin", `{"k":"v"}`)
+
+	resp, body := h.do("GET", "/api/v1/config/pub", svcTok(h), nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), `"k"`)
+}
+
+func TestServiceToken_Get_AdminNamespace_Returns404(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("secret", "admin", "admin", `{"k":"v"}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/secret", svcTok(h), nil)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"existence of admin-only namespace must not be leaked via 403")
+}
+
+func TestServiceToken_Put_AdminWriteUserRead_Returns403(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("mqtt", "user", "admin", `{"k":"v"}`)
+
+	// Service token can read mqtt (read_role=user) but write_role=admin.
+	resp, _ := h.do("PUT", "/api/v1/config/mqtt", svcTok(h), map[string]any{"k": "hijack"})
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
-		"config v1 rejects service tokens; user tokens only")
+		"service token must not be able to write to admin-write namespaces it can read")
+}
+
+func TestServiceToken_Put_AdminReadNamespace_Returns404(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("secret", "admin", "admin", `{"k":"v"}`)
+
+	resp, _ := h.do("PUT", "/api/v1/config/secret", svcTok(h), map[string]any{"k": "hijack"})
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"existence of admin-only namespace must not be leaked during write attempt")
+}
+
+func TestServiceToken_Create_Returns403(t *testing.T) {
+	h := newHarness(t)
+	resp, _ := h.do("POST", "/api/v1/config/namespaces", svcTok(h), map[string]any{
+		"name": "new", "read_role": "user", "write_role": "user",
+	})
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"service token must not be able to create namespaces (admin-only)")
+}
+
+func TestServiceToken_Delete_Returns403(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("pub", "user", "user", `{}`)
+
+	resp, _ := h.do("DELETE", "/api/v1/config/pub", svcTok(h), nil)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"service token must not be able to delete namespaces (admin-only)")
+}
+
+func TestServiceToken_PatchACL_Returns403(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("pub", "user", "admin", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/pub", svcTok(h), map[string]any{
+		"read_role": "user", "write_role": "user",
+	})
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"service token must not be able to escalate its own access via ACL patch")
+}
+
+func TestServiceToken_InvalidToken_Returns401(t *testing.T) {
+	h := newHarness(t)
+	// Forge a token with a bad signature but correct typ header.
+	badTok := h.issuer.mintService(&commonauth.ServiceTokenClaims{ClientID: "evil"})
+	// Corrupt the signature segment.
+	parts := strings.Split(badTok, ".")
+	require.Len(t, parts, 3)
+	parts[2] = "invalidsignature"
+	resp, _ := h.do("GET", "/api/v1/config", strings.Join(parts, "."), nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"tampered service token must be rejected with 401")
 }
 
 // --- Create ---
