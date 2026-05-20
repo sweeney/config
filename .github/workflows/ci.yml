@@ -139,7 +139,7 @@ jobs:
           go tool cover -func=coverage.out > coverage.txt
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: |
@@ -188,7 +188,7 @@ jobs:
           echo "| Size | **$SIZE** ($SIZE_BYTES bytes) |" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload binary
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: config-server-${{ matrix.suffix }}
           path: config-server-${{ matrix.suffix }}
