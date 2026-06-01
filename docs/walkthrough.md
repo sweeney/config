@@ -26,8 +26,13 @@ curl -s $CFG/healthz
 ```
 
 ```json
-{"status":"ok","version":"dev"}
+{"jwks":{"Fetches":0,"FetchErrors":0,"KidMisses":0,"Rotations":0,"StaleServed":0,"KeyCount":0,"FetchedAt":"0001-01-01T00:00:00Z","LastFetchError":""},"status":"ok","version":"dev"}
 ```
+
+The `jwks` block reports the JWKS verifier's cache/fetch counters (it appears
+only when the configured verifier exposes them). It's zeroed until the first
+token is verified — the JWKS is fetched lazily — so a zero `FetchedAt` and
+empty key set are normal right after startup.
 
 ## 2. Create an admin-only namespace
 

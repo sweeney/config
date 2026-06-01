@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,15 +13,15 @@ import (
 	"syscall"
 	"time"
 
-	commonauth "github.com/sweeney/identity/common/auth"
-	"github.com/sweeney/identity/common/backup"
-	"github.com/sweeney/identity/common/ratelimit"
 	configdb "github.com/sweeney/config/db"
 	"github.com/sweeney/config/internal/config"
 	"github.com/sweeney/config/internal/domain"
 	"github.com/sweeney/config/internal/handler"
 	"github.com/sweeney/config/internal/service"
 	"github.com/sweeney/config/internal/store"
+	commonauth "github.com/sweeney/identity/common/auth"
+	"github.com/sweeney/identity/common/backup"
+	"github.com/sweeney/identity/common/ratelimit"
 )
 
 const (
@@ -120,6 +121,9 @@ func runConfigServer() error {
 		Issuer:           cfg.IdentityIssuer,
 		CacheTTL:         cfg.JWKSCacheTTL,
 		RequiredAudience: cfg.RequiredAudience,
+		// Without a logger the verifier silently discards JWKS fetch/rotation/
+		// stale-cache diagnostics; route them to stderr alongside the std log.
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	})
 	if err != nil {
 		return fmt.Errorf("jwks verifier: %w", err)

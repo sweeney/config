@@ -15,7 +15,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
@@ -30,6 +29,12 @@ import (
 )
 
 const maxBodyBytes = 128 * 1024
+
+// metricsProvider is implemented by *commonauth.JWKSVerifier; used to surface
+// JWKS cache/fetch counters on /healthz when the configured verifier supports it.
+type metricsProvider interface {
+	Metrics() auth.VerifierMetrics
+}
 
 // Router exposes the config service's HTTP handlers.
 type Router struct {
@@ -54,7 +59,13 @@ func NewRouter(d Deps) *Router {
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":%q}`, d.Version)
+		resp := map[string]any{"status": "ok", "version": d.Version}
+		// The JWKSVerifier exposes cache/fetch counters; other TokenParser
+		// implementations (e.g. in tests) may not, so surface them only if present.
+		if mp, ok := d.Verifier.(metricsProvider); ok {
+			resp["jwks"] = mp.Metrics()
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {

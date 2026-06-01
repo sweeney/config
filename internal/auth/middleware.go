@@ -13,6 +13,10 @@ import (
 // TokenParser is the interface that JWKSVerifier implements.
 type TokenParser = commonauth.TokenParser
 
+// VerifierMetrics is a point-in-time snapshot of a JWKSVerifier's counters and
+// cache state (re-exported from common/auth for handlers that surface it).
+type VerifierMetrics = commonauth.VerifierMetrics
+
 type contextKey string
 
 const claimsContextKey contextKey = "auth_claims"
