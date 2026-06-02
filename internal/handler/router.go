@@ -9,6 +9,8 @@
 //	POST   /api/v1/config/namespaces           → create namespace (admin-only)
 //	PATCH  /api/v1/config/namespaces/{ns}      → update ACL (admin-only)
 //	GET    /healthz                            → unauth health probe
+//	GET    /openapi.json                       → OpenAPI spec as JSON
+//	GET    /openapi.yaml                       → OpenAPI spec as YAML
 package handler
 
 import (
@@ -69,8 +71,24 @@ func NewRouter(d Deps) *Router {
 	})
 
 	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		// Conversion is validated at startup and cached, so this won't error
+		// in practice; guard anyway rather than serving a partial document.
+		j, err := spec.Converter.JSON()
+		if err != nil {
+			http.Error(w, "openapi spec unavailable", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(spec.JSON)
+		// The spec is public and read-only; allow any origin so browser-based
+		// API tooling (Swagger UI, Stoplight, etc.) can fetch it.
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = w.Write(j)
+	})
+
+	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = w.Write(spec.Converter.YAML())
 	})
 
 	authed := func(h http.HandlerFunc) http.Handler {

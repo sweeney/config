@@ -19,6 +19,7 @@ import (
 	"github.com/sweeney/config/internal/handler"
 	"github.com/sweeney/config/internal/service"
 	"github.com/sweeney/config/internal/store"
+	"github.com/sweeney/config/spec"
 	commonauth "github.com/sweeney/identity/common/auth"
 	"github.com/sweeney/identity/common/backup"
 	"github.com/sweeney/identity/common/ratelimit"
@@ -134,6 +135,12 @@ func runConfigServer() error {
 	} else {
 		log.Printf("config: verifying tokens via JWKS at %s/.well-known/jwks.json (expected iss=%s, aud=%s)",
 			cfg.IdentityIssuerURL, cfg.IdentityIssuer, cfg.RequiredAudience)
+	}
+
+	// Convert the embedded OpenAPI YAML once up front so a malformed spec is a
+	// startup failure, not a 500 on first /openapi.json request.
+	if _, err := spec.Converter.JSON(); err != nil {
+		return fmt.Errorf("openapi spec: %w", err)
 	}
 
 	svc := service.NewConfigService(repo, backupMgr)

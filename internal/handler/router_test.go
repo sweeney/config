@@ -837,6 +837,48 @@ func TestOpenAPI_JSON_Unauth(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &v), "openapi.json must decode")
 	assert.Equal(t, "3.0.3", v["openapi"])
 	assert.Contains(t, v["info"].(map[string]any)["title"], "Config")
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"), "spec must be CORS-fetchable by browser tooling")
+}
+
+func TestOpenAPI_YAML_Unauth(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("GET", "/openapi.yaml", "", nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Content-Type"), "yaml")
+	assert.Contains(t, string(body), "openapi: 3.0.3")
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"), "spec must be CORS-fetchable by browser tooling")
+}
+
+// documentedPaths mirrors the API routes registered in NewRouter that are
+// expected to appear in the OpenAPI spec's `paths`. Keep this in sync with
+// NewRouter — TestOpenAPI_PathCoverage fails on drift. Non-API routes
+// (/openapi.json, /openapi.yaml, and SPA assets) are intentionally excluded.
+var documentedPaths = []string{
+	"/healthz",
+	"/api/v1/config",
+	"/api/v1/config/{ns}",
+	"/api/v1/config/namespaces",
+	"/api/v1/config/namespaces/{ns}",
+}
+
+// TestOpenAPI_PathCoverage cross-references the spec's paths against the routes
+// the server documents, so adding/removing an endpoint without updating the
+// spec (or vice versa) is a test failure.
+func TestOpenAPI_PathCoverage(t *testing.T) {
+	h := newHarness(t)
+	_, body := h.do("GET", "/openapi.json", "", nil)
+
+	var doc struct {
+		Paths map[string]json.RawMessage `json:"paths"`
+	}
+	require.NoError(t, json.Unmarshal(body, &doc), "openapi.json must decode")
+
+	specPaths := make([]string, 0, len(doc.Paths))
+	for p := range doc.Paths {
+		specPaths = append(specPaths, p)
+	}
+	assert.ElementsMatch(t, documentedPaths, specPaths,
+		"openapi spec paths and documentedPaths have drifted — update documentedPaths in this file or spec/openapi.yaml")
 }
 
 // Sanity: we don't leak a stack trace in errors.

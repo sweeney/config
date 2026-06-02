@@ -10,6 +10,15 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  spec-lint:
+    name: OpenAPI lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Spectral lint
+        run: npx --yes @stoplight/spectral-cli@latest lint spec/openapi.yaml
+
   test:
     name: Test
     runs-on: ubuntu-latest
