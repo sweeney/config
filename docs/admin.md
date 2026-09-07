@@ -227,19 +227,27 @@ For a self-hosted setup, the default 15-min window is usually fine.
 
 ### Cross-service token replay
 
-Identity currently issues user tokens with no `aud` claim. Any such
-token is therefore valid on every service that trusts identity's JWKS —
-config, plus any future sibling. If that matters for your deployment:
+A token carrying no `aud` claim is valid on every service that trusts
+identity's JWKS — config, plus any sibling. Config defends against this
+with `REQUIRED_AUDIENCE`, which is **enabled in production**
+(`REQUIRED_AUDIENCE=config` in `/etc/config/config.env`): the verifier
+rejects any token whose `aud` does not include `config`.
 
-1. Set `REQUIRED_AUDIENCE=config` in config's env file. The verifier
-   will then reject any token whose `aud` claim does not include
-   `config`.
-2. Have identity stamp `aud: "config"` (or a space-delimited list
-   including it) on tokens intended for config use.
+Both sides must stay in lockstep. Config running with the flag set
+while identity does not stamp `aud` on a given token rejects every
+request carrying that token, so the two constraints are:
 
-Both sides must be in lockstep: leaving config flagged on while
-identity doesn't emit `aud` will reject every request. The feature is
-off by default to keep the v1 JWT shape compatible.
+1. `REQUIRED_AUDIENCE=config` in config's env file.
+2. Identity stamps `aud: "config"` (or a space-delimited list including
+   it) on every token intended for config use — including tokens issued
+   to the admin SPA's own OAuth client.
+
+The flag remains unset by default so a fresh deployment keeps the v1
+JWT shape. Turning it on is a restart, not a redeploy: edit the env
+file and `sudo systemctl restart config`. Note that `/healthz` is
+unauthenticated and stays green even if every authenticated request is
+being rejected — verify with a real Bearer call against
+`GET /api/v1/config`, and by loading the admin SPA.
 
 ## Admin UI (optional)
 
@@ -275,7 +283,7 @@ In identity's admin UI (`https://id.example.com/admin/oauth`), click
 | Grant types | `authorization_code`, `refresh_token` |
 | Token endpoint auth method | `none` (public client; PKCE is the secret) |
 | Scopes | leave blank |
-| Audience | leave blank |
+| Audience | `config` — required, since production runs `REQUIRED_AUDIENCE=config`. A client registered with a blank audience yields tokens the config verifier rejects, so the SPA would 401 on every API call while other clients keep working. See [Cross-service token replay](#cross-service-token-replay). |
 
 Save. Note the client ID — you'll feed it to config below.
 
@@ -366,4 +374,4 @@ at `/etc/config/config.env`):
 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME` | (unset) | Required together for backups |
 | `OAUTH_CLIENT_ID` | (unset) | Public OAuth client_id registered on identity. Mounts the admin SPA at `/` when set. |
 | `IDENTITY_PUBLIC_URL` | `IDENTITY_ISSUER_URL` | URL the *browser* uses to reach identity (overrides the issuer URL when behind a reverse proxy with a different public hostname). |
-| `REQUIRED_AUDIENCE` | (unset) | Asserts incoming JWTs carry a matching `aud`. Mitigation against cross-service token replay; off until identity stamps `aud` on issuance. |
+| `REQUIRED_AUDIENCE` | (unset) | Asserts incoming JWTs carry a matching `aud`. Mitigation against cross-service token replay; **set to `config` in production**. |

@@ -46,9 +46,8 @@ Optional env vars: `PORT` (default 8282), `DB_PATH` (default `config.db`),
 ```
 
 **Prerequisite:** `install.sh` must have been run on the target host first.
-See `docs/deployment.md` for the current production state and migration path —
-the production server is currently running a bootstrap layout that differs
-from what `deploy.sh` expects.
+Production (garibaldi) is on the target layout that `deploy.sh` expects.
+See `docs/deployment.md` for the layout and routine operations.
 
 ## CLI commands
 
