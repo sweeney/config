@@ -38,12 +38,26 @@ components:
                     schema:
                         $ref: '#/components/schemas/Error'
             description: Document or request body exceeds size limit
+        ServiceUnavailable:
+            content:
+                application/json:
+                    schema:
+                        $ref: '#/components/schemas/Error'
+            description: |
+                The token could not be verified because identity was
+                unreachable. This is **not** a verdict on the token: clients
+                should honour `Retry-After` and retry, not sign the user out.
+            headers:
+                Retry-After:
+                    description: Seconds to wait before retrying
+                    schema:
+                        type: integer
         Unauthorized:
             content:
                 application/json:
                     schema:
                         $ref: '#/components/schemas/Error'
-            description: Missing or invalid Bearer token
+            description: Missing, malformed, or invalid Bearer token
     schemas:
         ACLUpdateRequest:
             properties:
@@ -235,6 +249,8 @@ paths:
                     $ref: '#/components/responses/Unauthorized'
                 "500":
                     $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
             summary: List namespaces visible to the caller
             tags:
                 - config
@@ -253,6 +269,8 @@ paths:
                     $ref: '#/components/responses/NotFound'
                 "500":
                     $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
             summary: Delete a namespace (admin-only)
             tags:
                 - admin
@@ -295,6 +313,8 @@ paths:
                     $ref: '#/components/responses/NotFound'
                 "500":
                     $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
             summary: Fetch a namespace document
             tags:
                 - config
@@ -335,6 +355,8 @@ paths:
                     $ref: '#/components/responses/PayloadTooLarge'
                 "500":
                     $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
             summary: Replace a namespace document
             tags:
                 - config
@@ -363,6 +385,8 @@ paths:
                     $ref: '#/components/responses/Conflict'
                 "500":
                     $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
             summary: Create a namespace (admin-only)
             tags:
                 - admin
@@ -416,6 +440,8 @@ paths:
                     $ref: '#/components/responses/NotFound'
                 "500":
                     $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
             summary: Update namespace ACL (admin-only)
             tags:
                 - admin

@@ -10,11 +10,18 @@ Stores and serves JSON configuration namespaces over HTTP. Auth is handled
 entirely by identity — config validates Bearer tokens by fetching identity's
 JWKS, has no login flow of its own, and issues no tokens.
 
+Because of that, an identity outage means config cannot verify *anyone*. It
+answers those requests `503` with `Retry-After` (`commonauth.ErrKeysUnavailable`
+→ `writeTokenError` in `internal/auth/middleware.go`), never `401`: a `401`
+tells every client to sign out at the moment they cannot sign back in. Bad and
+expired tokens still get `401`. `/healthz` deliberately stays green throughout —
+see **Identity coupling** in `docs/admin.md`.
+
 ## Module and dependency
 
 ```
 module github.com/sweeney/config
-require github.com/sweeney/identity/common v0.1.0
+require github.com/sweeney/identity/common v0.5.0
 ```
 
 The `common/` sub-module (at `github.com/sweeney/identity/common`) provides:
