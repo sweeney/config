@@ -59,6 +59,11 @@ type Deps struct {
 func NewRouter(d Deps) *Router {
 	mux := http.NewServeMux()
 
+	// Deliberately stays green when identity is unreachable, even though every
+	// authenticated request is then answering 503: deploy.sh gates deploys on
+	// this endpoint, and restarting config on an unhealthy signal would discard
+	// the cached JWKS keys that let it ride the outage out. The jwks counters
+	// below are the signal to alert on. See docs/admin.md, "Identity coupling".
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		resp := map[string]any{"status": "ok", "version": d.Version}

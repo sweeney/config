@@ -894,3 +894,76 @@ func TestErrors_NoInternalLeaks(t *testing.T) {
 		"error envelope must not leak internal state")
 	_ = fmt.Sprint
 }
+
+// --- JWKS outage ---
+
+// keysUnavailableIssuer mints tokens the same way testIssuer does, but reports
+// every verification as an identity outage.
+type keysUnavailableIssuer struct{ *testIssuer }
+
+func (keysUnavailableIssuer) Parse(context.Context, string) (*commonauth.TokenClaims, error) {
+	return nil, fmt.Errorf("%w: connection refused", commonauth.ErrKeysUnavailable)
+}
+
+func (keysUnavailableIssuer) ParseServiceToken(context.Context, string) (*commonauth.ServiceTokenClaims, error) {
+	return nil, fmt.Errorf("%w: connection refused", commonauth.ErrKeysUnavailable)
+}
+
+// A JWKS outage must reach the client as "retry shortly", not "your session is
+// dead" — through the real router, not just the middleware in isolation.
+func TestProtectedRoute_KeysUnavailable_Returns503(t *testing.T) {
+	iss := newTestIssuer(t, "https://test")
+	repo := newFakeRepo()
+	svc := service.NewConfigService(repo, fakeBackup{})
+	router := handler.NewRouter(handler.Deps{
+		Service:  svc,
+		Verifier: keysUnavailableIssuer{iss},
+		Version:  "test",
+	})
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+
+	tokens := map[string]string{
+		"user token": iss.mint(&commonauth.TokenClaims{
+			UserID: "u1", Username: "u1", Role: commonauth.RoleUser, IsActive: true,
+		}),
+		"service token": iss.mintService(&commonauth.ServiceTokenClaims{ClientID: "svc"}),
+	}
+
+	for name, tok := range tokens {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", srv.URL+"/api/v1/config", nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer "+tok)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close() //nolint:errcheck
+
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+			assert.NotEmpty(t, resp.Header.Get("Retry-After"))
+			assert.Empty(t, resp.Header.Get("WWW-Authenticate"),
+				"an outage must not tell clients to re-authenticate")
+		})
+	}
+}
+
+// /healthz stays green through a JWKS outage. Deliberate: deploy.sh gates
+// deploys on this endpoint, and anything that restarts config on an unhealthy
+// signal would discard the cached keys that let it ride the outage out. The
+// jwks counters in the response body are the signal to alert on instead.
+func TestHealthz_StaysOKDuringKeysOutage(t *testing.T) {
+	iss := newTestIssuer(t, "https://test")
+	svc := service.NewConfigService(newFakeRepo(), fakeBackup{})
+	router := handler.NewRouter(handler.Deps{
+		Service:  svc,
+		Verifier: keysUnavailableIssuer{iss},
+		Version:  "test",
+	})
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	require.NoError(t, err)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}

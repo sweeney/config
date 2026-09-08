@@ -173,16 +173,58 @@ sudo systemctl start config
 The config service depends on identity at runtime for token verification
 via JWKS. It does **not** depend on identity for:
 
-- Startup (config boots standalone; tokens just all fail until identity
-  is reachable again)
+- Startup (config boots standalone; tokens fail with `503` until identity
+  is reachable again — see below)
 - Database (fully separate SQLite file)
 - Backups (separate R2 prefix)
 
-If identity is down, config continues to serve cached JWKS but new
-tokens will eventually fail to verify when the cache expires
-(`JWKS_CACHE_TTL`, default 5 minutes). For a self-hosted deployment where
-both services run on the same host behind the same tunnel, this is
-rarely a concern in practice.
+If identity is down, config keeps serving cached JWKS, so most requests
+carry on working. Once the cache goes stale beyond `MaxStaleAge`
+(default 30 minutes), or a token arrives with a `kid` no cached key
+covers, config can no longer check the token at all.
+
+### Identity outages answer 503, not 401
+
+When config cannot verify a token because identity is unreachable, it
+answers **`503` with `Retry-After`**, not `401`:
+
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 30
+{"error":"keys_unavailable","message":"cannot verify tokens right now — ..."}
+```
+
+This matters because `401` has a specific meaning to clients: *your
+credentials are bad, sign out and log in again*. If an identity outage
+reported itself that way, every config user would be signed out at the
+same moment — and could not sign back in, because logging in needs the
+service that is down. A brief blip would become a mass re-authentication
+event. `503` says *try again shortly*, which is both true and survivable.
+
+Note that no `WWW-Authenticate` header is sent on the `503`: that header
+invites re-authentication, which is the behaviour being avoided.
+
+A token that is genuinely bad — malformed, bad signature, expired,
+audience mismatch — still gets `401`. That really is the caller's problem.
+
+This rests on `ErrKeysUnavailable`, added in `common` v0.4.0 and mapped in
+`internal/auth/middleware.go` (`writeTokenError`).
+
+### /healthz stays green during a JWKS outage
+
+Deliberate, and worth knowing before you wire up alerting: `/healthz`
+reports `200` even when every authenticated request is answering `503`.
+
+Two reasons. `deploy/deploy.sh` gates deploys on `/healthz`, so an
+identity blip would otherwise fail deploys that have nothing to do with
+identity. More importantly, anything that restarts config on an unhealthy
+signal would **discard the cached JWKS keys** — which are precisely what
+lets config ride out a brief outage — turning a survivable blip into a
+hard one.
+
+Alert on the `jwks` counters in the `/healthz` body instead: `StaleServed`
+climbing means config is running on cached keys it can no longer confirm, and
+`LastFetchError` carries the most recent failure.
 
 ### Rotating identity's JWT key
 

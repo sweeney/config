@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -45,7 +46,8 @@ func ServiceClaimsFromContext(ctx context.Context) *commonauth.ServiceTokenClaim
 }
 
 // RequireAuth validates the Bearer token and injects claims into the request
-// context. Returns 401 for missing/invalid tokens, 403 for inactive accounts.
+// context. Returns 401 for missing/invalid tokens, 403 for inactive accounts,
+// and 503 when the token could not be checked at all (see writeTokenError).
 func RequireAuth(parser TokenParser, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -66,8 +68,7 @@ func RequireAuth(parser TokenParser, next http.Handler) http.Handler {
 		if peekJWTTyp(token) == "at+jwt" {
 			svcClaims, svcErr := parser.ParseServiceToken(r.Context(), token)
 			if svcErr != nil || svcClaims == nil {
-				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
+				writeTokenError(w, svcErr)
 				return
 			}
 			ctx := context.WithValue(r.Context(), serviceClaimsContextKey, svcClaims)
@@ -77,8 +78,7 @@ func RequireAuth(parser TokenParser, next http.Handler) http.Handler {
 
 		claims, err := parser.Parse(r.Context(), token)
 		if err != nil {
-			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
+			writeTokenError(w, err)
 			return
 		}
 
@@ -90,6 +90,30 @@ func RequireAuth(parser TokenParser, next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), claimsContextKey, claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// writeTokenError answers a token that could not be verified.
+//
+// ErrKeysUnavailable means we could not check the token at all — identity was
+// unreachable — which is a statement about our infrastructure, not a verdict on
+// the caller. Answering 401 there tells every client to sign out during an
+// identity outage, and they cannot sign back in until it recovers. 503 tells
+// them to retry, which is both true and survivable.
+//
+// Everything else, including a nil error (claims absent with nothing to
+// inspect), stays 401: an invalid or expired token genuinely is the caller's
+// problem.
+func writeTokenError(w http.ResponseWriter, err error) {
+	if errors.Is(err, commonauth.ErrKeysUnavailable) {
+		// Longer than the verifier's refetch throttle, so a compliant client
+		// comes back to a fetch that will actually be attempted.
+		w.Header().Set("Retry-After", "30")
+		writeError(w, http.StatusServiceUnavailable, "keys_unavailable",
+			"cannot verify tokens right now — identity is unreachable; retry shortly")
+		return
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+	writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
 }
 
 func peekJWTTyp(token string) string {
