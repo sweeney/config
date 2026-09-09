@@ -22,6 +22,7 @@ import (
 
 	commonauth "github.com/sweeney/identity/common/auth"
 
+	"github.com/sweeney/config/internal/auth"
 	"github.com/sweeney/config/internal/domain"
 	"github.com/sweeney/config/internal/handler"
 	"github.com/sweeney/config/internal/service"
@@ -994,4 +995,241 @@ func TestHealthz_StaysOKDuringKeysOutage(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close() //nolint:errcheck
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// --- anonymous reads of public namespaces ---
+//
+// GET of a single namespace is the only optionally-authenticated route. The
+// list endpoint deliberately stays authenticated: knowing a namespace's name
+// is the price of reading it anonymously, and nothing advertises the names.
+
+// outageParser stands in for a verifier that cannot reach identity's JWKS.
+type outageParser struct{}
+
+func (outageParser) Parse(context.Context, string) (*commonauth.TokenClaims, error) {
+	return nil, commonauth.ErrKeysUnavailable
+}
+
+func (outageParser) ParseServiceToken(context.Context, string) (*commonauth.ServiceTokenClaims, error) {
+	return nil, commonauth.ErrKeysUnavailable
+}
+
+func newHarnessWithParser(t *testing.T, parser auth.TokenParser) *harness {
+	t.Helper()
+	repo := newFakeRepo()
+	svc := service.NewConfigService(repo, fakeBackup{})
+	srv := httptest.NewServer(handler.NewRouter(handler.Deps{
+		Service: svc, Verifier: parser, Version: "test",
+	}))
+	t.Cleanup(srv.Close)
+	return &harness{t: t, repo: repo, srv: srv}
+}
+
+func TestGet_Anonymous_PublicNamespace_Returns200(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{"unit":0.24}`)
+
+	resp, body := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `{"unit":0.24}`, string(body))
+}
+
+func TestGet_Anonymous_PrivateNamespace_Returns404(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{"secret":true}`)
+
+	resp, body := h.do("GET", "/api/v1/config/internal", "", nil)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"a private namespace must be not-found to an anonymous caller, never 401")
+	assert.NotContains(t, string(body), "secret")
+}
+
+// TestGet_Anonymous_PrivateAndMissingAreIndistinguishable is the property
+// that makes the obscurity model hold: an anonymous caller brute-forcing
+// names must not be able to tell a private namespace from one that does not
+// exist.
+func TestGet_Anonymous_PrivateAndMissingAreIndistinguishable(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	privateResp, privateBody := h.do("GET", "/api/v1/config/internal", "", nil)
+	missingResp, missingBody := h.do("GET", "/api/v1/config/nosuchns", "", nil)
+
+	assert.Equal(t, missingResp.StatusCode, privateResp.StatusCode)
+	assert.Equal(t, string(missingBody), string(privateBody))
+	assert.Empty(t, privateResp.Header.Get("X-Read-Role"),
+		"ACL headers must not leak on a denied read")
+	assert.Equal(t, missingResp.Header.Get("Cache-Control"), privateResp.Header.Get("Cache-Control"))
+}
+
+// TestGet_BrokenTokenOnPublicNamespaceReturns401: a presented token that does
+// not verify is never silently downgraded to anonymous, even where anonymous
+// would have succeeded.
+func TestGet_BrokenTokenOnPublicNamespaceReturns401(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "not-a-real-token", nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// TestGet_Anonymous_SurvivesIdentityOutage: with no token presented there is
+// nothing to verify, so a public namespace stays readable while identity is
+// unreachable. Public namespaces are the outage-resilient read path.
+func TestGet_Anonymous_SurvivesIdentityOutage(t *testing.T) {
+	h := newHarnessWithParser(t, outageParser{})
+	h.repo.seed("tariffs", "public", "user", `{"unit":0.24}`)
+
+	resp, body := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"an anonymous public read must not depend on identity being up")
+	assert.JSONEq(t, `{"unit":0.24}`, string(body))
+}
+
+func TestGet_TokenPresentedDuringIdentityOutage_Returns503(t *testing.T) {
+	h := newHarnessWithParser(t, outageParser{})
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "some-token", nil)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, "30", resp.Header.Get("Retry-After"))
+}
+
+func TestGet_AuthenticatedUserCanAlsoReadPublic(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", h.userTok, nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestGet_CacheHeaders: the TTL on a public namespace is also the revoke
+// latency — flipping read_role back does not purge a CDN or a browser cache
+// — so it is deliberately short, and Vary stays on both because the same URL
+// answers differently with and without a token.
+func TestGet_CacheHeaders(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	pub, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "public, max-age=60", pub.Header.Get("Cache-Control"))
+	assert.Equal(t, "Authorization", pub.Header.Get("Vary"))
+
+	priv, _ := h.do("GET", "/api/v1/config/internal", h.userTok, nil)
+	assert.Equal(t, "private, no-store", priv.Header.Get("Cache-Control"))
+	assert.Equal(t, "Authorization", priv.Header.Get("Vary"))
+}
+
+// TestAnonymous_EveryOtherRouteStillRequiresAToken guards the blast radius:
+// only the single-namespace GET became optionally authenticated.
+func TestAnonymous_EveryOtherRouteStillRequiresAToken(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	cases := []struct {
+		method, path string
+		body         any
+	}{
+		{"GET", "/api/v1/config", nil},
+		{"PUT", "/api/v1/config/tariffs", map[string]any{"k": 1}},
+		{"DELETE", "/api/v1/config/tariffs", nil},
+		{"POST", "/api/v1/config/namespaces", map[string]any{"name": "x", "read_role": "user", "write_role": "user"}},
+		{"PATCH", "/api/v1/config/namespaces/tariffs", map[string]any{"read_role": "user", "write_role": "user"}},
+	}
+	for _, c := range cases {
+		t.Run(c.method+" "+c.path, func(t *testing.T) {
+			resp, _ := h.do(c.method, c.path, "", c.body)
+			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+				"a public read role must not open any route but the namespace GET")
+		})
+	}
+}
+
+// --- publish confirmation ---
+
+func TestPatchACL_PublishWithoutConfirmation_Returns400(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, body := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user"})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "confirm_required", env["error"])
+
+	readRole, _, err := h.repo.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "user", readRole, "the ACL must be untouched")
+}
+
+func TestPatchACL_PublishWithConfirmation_Succeeds(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user", "confirm_public": "tariffs"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "public", resp.Header.Get("X-Read-Role"))
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, http.StatusOK, anon.StatusCode, "publishing must actually open the read path")
+}
+
+func TestPatchACL_PublishWithWrongConfirmation_Returns400(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user", "confirm_public": "some-other-ns"})
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// TestPatchACL_RevokeNeedsNoConfirmation: unpublishing is an ordinary edit,
+// and the anonymous read must stop immediately at the origin.
+func TestPatchACL_RevokeNeedsNoConfirmation(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "user", "write_role": "user"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, http.StatusNotFound, anon.StatusCode)
+}
+
+func TestCreate_PublicWithoutConfirmation_Returns400(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "public", "write_role": "user",
+		"document": map[string]any{},
+	})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "confirm_required", env["error"])
+}
+
+func TestCreate_PublicWithConfirmation_Returns201(t *testing.T) {
+	h := newHarness(t)
+	resp, _ := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "public", "write_role": "user",
+		"document": map[string]any{}, "confirm_public": "tariffs",
+	})
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+}
+
+func TestCreate_PublicWriteRole_Returns400(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "public", "write_role": "public",
+		"document": map[string]any{}, "confirm_public": "tariffs",
+	})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "invalid_role", env["error"])
 }

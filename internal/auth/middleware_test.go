@@ -261,3 +261,97 @@ func TestRequireAuth_RealVerifier_DeadJWKS(t *testing.T) {
 		assertKeysUnavailable(t, serve(verifier, mint("at+jwt")))
 	})
 }
+
+// --- OptionalAuth ---
+//
+// OptionalAuth exists for the one route that may be served anonymously: a
+// GET of a namespace whose read_role is public. The ACL lives in the
+// database, behind the service, so whether a token is required cannot be
+// known until after the lookup — which means the middleware has to let an
+// unauthenticated request through and leave the decision to the service.
+//
+// The critical property is that this is NOT a general weakening: a token
+// that is present but does not verify is still rejected. Only the total
+// absence of an Authorization header is treated as anonymous.
+
+func serveOptional(parser auth.TokenParser, token string) (*httptest.ResponseRecorder, bool, bool) {
+	var reached, sawClaims bool
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		reached = true
+		sawClaims = auth.ClaimsFromContext(r.Context()) != nil ||
+			auth.ServiceClaimsFromContext(r.Context()) != nil
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/ns", nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	auth.OptionalAuth(parser, next).ServeHTTP(rec, req)
+	return rec, reached, sawClaims
+}
+
+func TestOptionalAuth_NoHeaderProceedsAnonymously(t *testing.T) {
+	rec, reached, sawClaims := serveOptional(stubParser{}, "")
+	assert.True(t, reached, "a request with no Authorization header must reach the handler")
+	assert.False(t, sawClaims, "an anonymous request must carry no claims")
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestOptionalAuth_ValidTokenStillInjectsClaims(t *testing.T) {
+	parser := stubParser{userClaims: &commonauth.TokenClaims{
+		UserID: "u1", Role: commonauth.RoleUser, IsActive: true,
+	}}
+	_, reached, sawClaims := serveOptional(parser, userToken())
+	assert.True(t, reached)
+	assert.True(t, sawClaims, "a valid token must still be identified")
+}
+
+// TestOptionalAuth_InvalidTokenIsStillRejected is the load-bearing one. A
+// presented-but-broken token must never be silently downgraded to anonymous:
+// that would serve public namespaces to a client whose token has expired,
+// hiding the breakage until it hit a private one.
+func TestOptionalAuth_InvalidTokenIsStillRejected(t *testing.T) {
+	rec, reached, _ := serveOptional(stubParser{userErr: fmt.Errorf("bad token")}, userToken())
+	assert.False(t, reached, "a broken token must not reach the handler as anonymous")
+	assertUnauthorized(t, rec)
+}
+
+// TestOptionalAuth_KeysUnavailableStillReturns503 keeps the identity-outage
+// contract: if a token was presented and we could not check it, that is our
+// problem to report, not a verdict on the caller.
+func TestOptionalAuth_KeysUnavailableStillReturns503(t *testing.T) {
+	rec, reached, _ := serveOptional(
+		stubParser{userErr: wrapped(commonauth.ErrKeysUnavailable)}, userToken())
+	assert.False(t, reached)
+	assertKeysUnavailable(t, rec)
+}
+
+// TestOptionalAuth_NoHeaderDuringOutage: with no token presented there is
+// nothing to verify, so an identity outage does not block an anonymous read.
+// Public namespaces stay readable while identity is down.
+func TestOptionalAuth_NoHeaderDuringOutage(t *testing.T) {
+	rec, reached, _ := serveOptional(
+		stubParser{userErr: wrapped(commonauth.ErrKeysUnavailable)}, "")
+	assert.True(t, reached, "an anonymous read must survive an identity outage")
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestOptionalAuth_MalformedHeaderIsRejected(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/ns", nil)
+	req.Header.Set("Authorization", "Basic abc123")
+	reached := false
+	auth.OptionalAuth(stubParser{}, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached = true
+	})).ServeHTTP(rec, req)
+
+	assert.False(t, reached, "a malformed credential is still a presented credential")
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestOptionalAuth_ServiceTokenAccepted(t *testing.T) {
+	parser := stubParser{svcClaims: &commonauth.ServiceTokenClaims{ClientID: "svc-1"}}
+	_, reached, sawClaims := serveOptional(parser, serviceToken())
+	assert.True(t, reached)
+	assert.True(t, sawClaims)
+}

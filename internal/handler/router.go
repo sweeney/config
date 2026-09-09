@@ -3,7 +3,7 @@
 // Endpoints (all JSON):
 //
 //	GET    /api/v1/config                      → list visible namespaces
-//	GET    /api/v1/config/{ns}                 → full document (requires read_role)
+//	GET    /api/v1/config/{ns}                 → full document (read_role; anonymous if public)
 //	PUT    /api/v1/config/{ns}                 → replace document (requires write_role)
 //	DELETE /api/v1/config/{ns}                 → delete namespace (admin-only)
 //	POST   /api/v1/config/namespaces           → create namespace (admin-only)
@@ -100,8 +100,19 @@ func NewRouter(d Deps) *Router {
 		return auth.RequireAuth(d.Verifier, requireUserToken(h))
 	}
 
+	// optionallyAuthed serves a request that carries no Authorization header
+	// as the anonymous public caller. Only the single-namespace GET uses it:
+	// the service answers a namespace the caller cannot read with not-found,
+	// so an anonymous request reaches exactly the public ones.
+	optionallyAuthed := func(h http.HandlerFunc) http.Handler {
+		return auth.OptionalAuth(d.Verifier, allowAnonymous(h))
+	}
+
+	// The list route stays authenticated deliberately. Knowing a namespace's
+	// name is the price of reading it anonymously, and nothing advertises the
+	// names.
 	mux.Handle("GET /api/v1/config", authed(listHandler(d.Service)))
-	mux.Handle("GET /api/v1/config/{ns}", authed(getHandler(d.Service)))
+	mux.Handle("GET /api/v1/config/{ns}", optionallyAuthed(getHandler(d.Service)))
 	mux.Handle("PUT /api/v1/config/{ns}", authed(putHandler(d.Service)))
 	mux.Handle("DELETE /api/v1/config/{ns}", authed(deleteHandler(d.Service)))
 	mux.Handle("POST /api/v1/config/namespaces", authed(createHandler(d.Service)))
@@ -186,12 +197,37 @@ func requireUserToken(next http.Handler) http.Handler {
 	})
 }
 
+// allowAnonymous is the optional-auth counterpart to requireUserToken. A
+// token that is present must still carry a role we recognise; a request with
+// no token at all proceeds as the anonymous public caller.
+//
+// A token that was presented but did not verify never reaches here —
+// OptionalAuth has already answered it 401 (or 503).
+func allowAnonymous(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c := auth.ClaimsFromContext(r.Context()); c != nil {
+			role := string(c.Role)
+			if role != domain.ConfigRoleAdmin && role != domain.ConfigRoleUser {
+				writeErr(w, http.StatusForbidden, "forbidden", "unrecognised role in token")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func callerFromRequest(r *http.Request) service.Caller {
 	if c := auth.ClaimsFromContext(r.Context()); c != nil {
 		return service.Caller{Sub: c.UserID, Role: string(c.Role)}
 	}
-	sc := auth.ServiceClaimsFromContext(r.Context())
-	return service.Caller{Sub: sc.ClientID, Role: domain.ConfigRoleUser}
+	if sc := auth.ServiceClaimsFromContext(r.Context()); sc != nil {
+		return service.Caller{Sub: sc.ClientID, Role: domain.ConfigRoleUser}
+	}
+	// Neither kind of claim: an unauthenticated request that OptionalAuth let
+	// through. The nil check on the service claims is load-bearing — this
+	// dereferenced them unconditionally when every route demanded a token
+	// first, which would now be a panic rather than a 401.
+	return service.Caller{Role: domain.ConfigRolePublic}
 }
 
 // --- handlers ---
@@ -237,7 +273,18 @@ func getHandler(svc *service.ConfigService) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Read-Role", got.ReadRole)
 		w.Header().Set("X-Write-Role", got.WriteRole)
-		w.Header().Set("Cache-Control", "private, no-store")
+		if got.ReadRole == domain.ConfigRolePublic {
+			// Cacheable by shared caches — the point of publishing is usually
+			// that something else can serve it. The TTL is also the revoke
+			// latency: flipping read_role back to user does not purge a CDN
+			// or a browser cache, so anonymous callers keep getting the old
+			// body until it expires. Keep it short.
+			w.Header().Set("Cache-Control", "public, max-age=60")
+		} else {
+			w.Header().Set("Cache-Control", "private, no-store")
+		}
+		// Kept on both: the same URL answers differently with and without a
+		// token, so a cache must not serve one to the other.
 		w.Header().Set("Vary", "Authorization")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(got.Document)
@@ -283,6 +330,10 @@ type createBody struct {
 	ReadRole  string          `json:"read_role"`
 	WriteRole string          `json:"write_role"`
 	Document  json.RawMessage `json:"document"`
+
+	// ConfirmPublic must echo Name when ReadRole is public. See
+	// service.ErrConfigPublicConfirmRequired.
+	ConfirmPublic string `json:"confirm_public"`
 }
 
 func createHandler(svc *service.ConfigService) http.HandlerFunc {
@@ -299,10 +350,11 @@ func createHandler(svc *service.ConfigService) http.HandlerFunc {
 			doc = []byte(`{}`)
 		}
 		ns, err := svc.CreateNamespace(caller, service.CreateNamespaceInput{
-			Name:      b.Name,
-			ReadRole:  b.ReadRole,
-			WriteRole: b.WriteRole,
-			Document:  doc,
+			Name:          b.Name,
+			ReadRole:      b.ReadRole,
+			WriteRole:     b.WriteRole,
+			Document:      doc,
+			ConfirmPublic: b.ConfirmPublic,
 		})
 		if err != nil {
 			translateError(w, err)
@@ -319,6 +371,11 @@ func createHandler(svc *service.ConfigService) http.HandlerFunc {
 type aclBody struct {
 	ReadRole  string `json:"read_role"`
 	WriteRole string `json:"write_role"`
+
+	// ConfirmPublic must echo the namespace name when this request moves
+	// read access to public. Not required when it is already public, and
+	// never required when revoking.
+	ConfirmPublic string `json:"confirm_public"`
 }
 
 func updateACLHandler(svc *service.ConfigService) http.HandlerFunc {
@@ -332,8 +389,9 @@ func updateACLHandler(svc *service.ConfigService) http.HandlerFunc {
 			return
 		}
 		if err := svc.UpdateACL(caller, ns, service.UpdateACLInput{
-			ReadRole:  b.ReadRole,
-			WriteRole: b.WriteRole,
+			ReadRole:      b.ReadRole,
+			WriteRole:     b.WriteRole,
+			ConfirmPublic: b.ConfirmPublic,
 		}); err != nil {
 			translateError(w, err)
 			return
@@ -384,7 +442,11 @@ func translateError(w http.ResponseWriter, err error) {
 			"namespace name must match ^[a-z0-9_-]{1,64}$")
 	case errors.Is(err, service.ErrConfigInvalidRole):
 		writeErr(w, http.StatusBadRequest, "invalid_role",
-			"role must be 'admin' or 'user'")
+			"read_role must be 'admin', 'user' or 'public'; write_role must be 'admin' or 'user'; "+
+				"and read_role may be no stronger than write_role")
+	case errors.Is(err, service.ErrConfigPublicConfirmRequired):
+		writeErr(w, http.StatusBadRequest, "confirm_required",
+			"making a namespace public requires confirm_public to equal the namespace name")
 	case errors.Is(err, service.ErrConfigInvalidDocument):
 		writeErr(w, http.StatusBadRequest, "invalid_document",
 			"document must be a JSON object")
