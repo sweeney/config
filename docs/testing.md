@@ -58,6 +58,12 @@ Key things tested:
 - `ErrConfigNamespaceNotFound` vs `ErrConfigForbidden` distinction: a
   namespace the caller can't read must return not-found to avoid leaking
   existence
+- The role lattice (`public` < `user` < `admin`), enumerated exhaustively
+  over every (namespace read role, caller role) pair rather than
+  spot-checked — it is the authorization primitive everything else rests on
+- The publish confirmation: required on the transition into `public`, not
+  when already public and never when revoking; bound to the namespace name;
+  not usable as an existence oracle
 
 ### 2. Handler tests (`internal/handler/`)
 
@@ -84,6 +90,15 @@ Key things tested:
 - SPA bundle mounted/unmounted based on env config
 - OpenAPI spec endpoints unauthenticated
 - Error envelope shape — no SQL or stack traces in `message`
+- The anonymous read path: `200` on a public namespace with no
+  `Authorization` header, `404` on a private one, and those two responses
+  being byte-identical to a `404` for a namespace that does not exist
+- A present-but-invalid token still `401` where anonymous would have
+  succeeded — a broken token is never silently downgraded
+- An anonymous public read succeeding while the verifier reports
+  `ErrKeysUnavailable`, and a presented token still getting `503`
+- `Cache-Control` following the read role, `Vary: Authorization` on both
+- That no route other than the single-namespace GET became anonymous
 
 ### 3. Integration tests (`db/`, `internal/store/`)
 
@@ -96,11 +111,22 @@ Two files:
 | File | What it covers |
 |---|---|
 | `db/db_test.go` | `db.Open` — file creation, migrations (including idempotency on reopen), WAL mode, file permissions, foreign keys |
-| `internal/store/config_store_integration_test.go` | `ConfigStore` as a real implementation of `domain.ConfigRepository` — create/get/list/update/delete, ACL reads and writes, duplicate-name conflict, and the role `CHECK` constraint rejecting invalid values |
+| `internal/store/config_store_integration_test.go` | `ConfigStore` as a real implementation of `domain.ConfigRepository` — create/get/list/update/delete, ACL reads and writes, duplicate-name conflict, the role `CHECK` constraint rejecting invalid values, and the `config_audit` trail including its rollback with a failed mutation |
 
 This is where migration correctness is verified directly: the tests assert
 the `config_namespaces` table exists after `db.Open`, and that opening an
 already-migrated database again is a no-op.
+
+It is also the only layer where two guarantees can be tested honestly:
+
+- **The schema rebuild** in `db/schema.go` — that an old-schema database is
+  widened in place, that every column of every pre-existing row survives,
+  that the index is recreated, and that a second `Open` does not rebuild.
+- **Audit atomicity** — that a mutation which fails takes its audit row with
+  it. The role `CHECK` constraint is the failure injector, so the rollback
+  is a real database rollback. A fake cannot assert this: both writes happen
+  under one mutex there, so it would only be asserting its own construction.
+  The fakes therefore model entry shape and presence only.
 
 Both files are gated behind `//go:build integration`, so they are invisible
 to a plain `go test ./...` (which reports `[no test files]` for both

@@ -1,8 +1,13 @@
 # Config Service
 
 A standalone key-value configuration store for self-hosted apps. Namespaces
-hold JSON objects. Access is gated by role (`admin` / `user`) inherited from
-identity-issued JWT tokens.
+hold JSON objects. Access is gated by an ordered role lattice — `public` <
+`user` < `admin` — where `user` and `admin` are inherited from
+identity-issued JWT tokens. `public` is a read role only: a namespace with
+`read_role: public` is readable with no token at all, but nothing is ever
+anonymously writable, and `GET /api/v1/config` (list) always requires a
+token. Publishing a namespace requires echoing its name back in
+`confirm_public`; see **Public namespaces** in `docs/admin.md`.
 
 ## What it does
 
@@ -66,9 +71,13 @@ See `docs/deployment.md` for the layout and routine operations.
 ## Testing
 
 ```bash
-go test -race -count=1 ./...   # unit + handler tests
-./scripts/e2e.sh               # e2e (requires live identity + config)
+go test -race -count=1 ./...                  # unit + handler tests
+go test -race -count=1 -tags=integration ./...  # + real SQLite (store, migrations)
+./scripts/e2e.sh                              # e2e (requires live identity + config)
 ```
+
+The integration layer is build-tagged, so a plain `go test ./...` silently
+skips it. CI runs both.
 
 See `docs/testing.md` for the full testing guide including philosophy, test
 layers, and how to add new tests.
@@ -80,11 +89,14 @@ layers, and how to add new tests.
 | `internal/handler/router.go` | HTTP router — all endpoints, SPA mount, auth middleware |
 | `internal/service/config_service.go` | Business logic — CRUD, role enforcement, ACL invariants |
 | `internal/store/config_store.go` | SQLite store implementing `domain.ConfigRepository` |
-| `internal/domain/config.go` | Types, error sentinels, `BackupService` interface |
-| `internal/auth/middleware.go` | `RequireAuth` middleware (thin wrapper over `common/auth`) |
+| `internal/domain/config.go` | Types, role lattice, error sentinels, `BackupService` interface |
+| `internal/auth/middleware.go` | `RequireAuth` / `OptionalAuth` middleware (thin wrapper over `common/auth`) |
 | `internal/config/config.go` | Env var loading (`ConfigSvcConfig`) |
 | `db/db.go` | Opens SQLite with migrations via `common/db` |
+| `db/schema.go` | Go-side rebuild widening the `read_role` CHECK to accept `public`; idempotent, runs on every `db.Open` |
 | `db/migrations/001_init.sql` | Schema: `config_namespaces` table |
+| `db/migrations/002_config_audit.sql` | Schema: `config_audit` table (create / acl_change / delete) |
+| `internal/testutil/audit.go` | Shared in-memory audit recorder for the service and handler fakes |
 | `spec/openapi.yaml` | OpenAPI 3.0 spec (served at `/openapi.json` and `/openapi.yaml`) |
 | `ui/embed.go` + `ui/static/` | Embedded admin SPA assets |
 | `cmd/server/server.go` | Entry point — env loading, wiring, HTTP server |

@@ -2,7 +2,9 @@
 
 Stores structured configuration as named JSON documents with per-namespace
 role ACLs. Validates JWTs against the identity service's JWKS endpoint —
-so you authenticate exactly the same way you do with identity.
+so you authenticate exactly the same way you do with identity. A namespace
+can also be marked `read_role: public`, which makes it readable with no
+token at all; nothing is ever anonymously writable.
 
 - Default port: **8282**
 - OpenAPI spec (live): `GET /openapi.json` or `GET /openapi.yaml`
@@ -45,6 +47,13 @@ When the config service receives a request it:
 
 **The config service issues no tokens of its own.** Every Bearer token comes
 from identity. Token expiry, refresh, and rotation are handled there.
+
+**One endpoint is optionally authenticated.** `GET /api/v1/config/{ns}`
+accepts a request with no `Authorization` header and treats it as the
+synthetic `public` role, which satisfies namespaces at `read_role: public`
+and nothing else. A header that *is* present must still verify: a bad or
+expired token gets `401`, never a silent downgrade to an anonymous read.
+Every other endpoint requires a token.
 
 **Service tokens (client credentials) are rejected.** v1 accepts user tokens
 only. The `requireUserToken` middleware returns `403` if the token's `typ`
@@ -101,7 +110,9 @@ service does not support client credentials in v1.
 https://config.example.com
 ```
 
-All API endpoints are under `/api/v1/`. The only unauth endpoint is `/healthz`.
+All API endpoints are under `/api/v1/`. `/healthz` needs no auth, and
+`GET /api/v1/config/{ns}` serves `read_role: public` namespaces without one.
+Everything else requires a Bearer token.
 
 ### Fetching a namespace document
 
@@ -118,6 +129,7 @@ Content-Type: application/json
 X-Read-Role: user
 X-Write-Role: admin
 Cache-Control: private, no-store
+Vary: Authorization
 
 {"temperature":"home/sensors/temp","humidity":"home/sensors/humidity"}
 ```
@@ -127,8 +139,14 @@ this namespace without needing a second request:
 
 | Header | Value | Meaning |
 |---|---|---|
-| `X-Read-Role` | `admin` or `user` | Role required to read |
+| `X-Read-Role` | `admin`, `user` or `public` | Role required to read |
 | `X-Write-Role` | `admin` or `user` | Role required to write |
+
+`Cache-Control` follows the read role: `private, no-store` for everything
+normally, `public, max-age=60` for a `read_role: public` namespace so shared
+caches can serve it. `Vary: Authorization` is set either way — the same URL
+answers differently with and without a token, so a cache must never serve one
+response to the other.
 
 ### Namespace names
 
@@ -157,7 +175,12 @@ The `version` field is the git commit short SHA baked in at build time.
 ### `GET /api/v1/config` — list visible namespaces
 
 Returns summaries of every namespace the caller's role can read. Admins see
-all namespaces; users see only those with `read_role=user`.
+all namespaces; users see those with `read_role=user` and `read_role=public`.
+
+**A token is always required here**, including for public namespaces: the
+list endpoint answers `401` without one and never enumerates public
+namespaces to an anonymous caller. Knowing a namespace's name is the price of
+reading it anonymously; nothing advertises the names.
 
 ```bash
 curl https://config.example.com/api/v1/config \
@@ -213,6 +236,34 @@ namespace has `"document": {}` stored, you get `{}`.
 
 Both cases return the same response so callers cannot probe namespace existence
 without read access.
+
+#### Anonymous reads
+
+Omit the header entirely and the request is treated as the `public` role:
+
+```bash
+curl -i https://config.example.com/api/v1/config/tariffs
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Read-Role: public
+X-Write-Role: admin
+Cache-Control: public, max-age=60
+Vary: Authorization
+
+{"standing":0.51,"unit":0.24}
+```
+
+Anonymously, a private namespace and a namespace that does not exist return
+byte-identical `404`s, so the anonymous path cannot be used to enumerate what
+exists. A header that is present but carries a bad or expired token is `401`
+even on a public namespace — it is never downgraded to an anonymous read.
+
+Because an anonymous read verifies no token, it needs no JWKS and therefore
+keeps working while identity is unreachable, when authenticated requests are
+answering `503`. See **Identity coupling** in `docs/admin.md`.
 
 ---
 
@@ -287,10 +338,37 @@ a read-modify-write. The valid combinations:
 
 | `read_role` | `write_role` | Allowed? |
 |---|---|---|
+| `public` | `user` | ✓ anyone can read, tokenless; any user writes |
+| `public` | `admin` | ✓ anyone can read, tokenless; only admins write |
 | `user` | `user` | ✓ anyone can read and write |
 | `user` | `admin` | ✓ anyone can read; only admins write |
 | `admin` | `admin` | ✓ admins only |
 | `admin` | `user` | ✗ writers can't read — rejected |
+| any | `public` | ✗ `public` is a read role only — rejected |
+
+**Publishing requires confirmation.** Setting `read_role: public` — here or on
+PATCH — requires a `confirm_public` field whose value is exactly the namespace
+name. Otherwise the call is rejected with `400 confirm_required`:
+
+```bash
+curl -X POST https://config.example.com/api/v1/config/namespaces \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name":           "tariffs",
+    "read_role":      "public",
+    "write_role":     "admin",
+    "document":       {"unit":0.24},
+    "confirm_public": "tariffs"
+  }'
+```
+
+Publishing is the one ACL change that cannot be undone — revoking stops future
+reads but cannot unfetch what has already been served — and PATCH rewrites both
+roles on every call, so without the guard a stale `public` in a saved payload
+could publish a namespace as a side effect of an unrelated edit. Binding the
+confirmation to the name also stops a body being replayed against a different
+namespace.
 
 ---
 
@@ -314,6 +392,16 @@ Content-Type: application/json
 {"name":"mqtt_topics","read_role":"admin","write_role":"admin"}
 ```
 
+Both roles are replaced on every call — this is a whole-ACL replacement, not a
+partial update. Moving `read_role` to `public` requires `confirm_public` (see
+above); a namespace that is already public does not need it again, and revoking
+never does.
+
+Watch the read ≤ write invariant when revoking. A namespace at
+`read_role: public, write_role: user` can move to `read_role: user` freely, but
+going straight to `read_role: admin` must raise `write_role` to `admin` in the
+same PATCH, or the combination is rejected with `400 invalid_role`.
+
 ---
 
 ## Error reference
@@ -327,16 +415,18 @@ All errors use the same envelope:
 | HTTP | `error` | Cause |
 |---|---|---|
 | 400 | `invalid_name` | Namespace name doesn't match `^[a-z0-9_-]{1,64}$` |
-| 400 | `invalid_role` | Role must be `admin` or `user`; or ACL constraint violated |
+| 400 | `invalid_role` | `read_role` must be `admin`, `user` or `public`; `write_role` must be `admin` or `user`; or `read_role` is stronger than `write_role` |
+| 400 | `confirm_required` | Setting `read_role: public` without `confirm_public` equal to the namespace name |
 | 400 | `invalid_document` | Body isn't a JSON object, or nesting > 64 levels |
 | 400 | `invalid_request` | Malformed JSON body |
-| 401 | `unauthorized` | Missing `Authorization` header |
-| 401 | `unauthorized` | Token expired, signature invalid, or wrong issuer |
+| 401 | `unauthorized` | Missing `Authorization` header on an endpoint that requires one (everything except `GET /api/v1/config/{ns}`) |
+| 401 | `unauthorized` | Token expired, signature invalid, or wrong issuer — including on a public namespace, where a bad token is never downgraded to an anonymous read |
 | 403 | `account_disabled` | Token valid but the identity account is disabled |
 | 403 | `forbidden` | Service token presented (user token required) |
+| 403 | `forbidden` | Token carries a role the service does not recognise |
 | 403 | `forbidden` | Caller can read the namespace but their role doesn't satisfy `write_role` |
 | 403 | `forbidden` | Operation requires `admin` (create/delete/patch-acl) |
-| 404 | `not_found` | Namespace missing, or caller lacks `read_role` |
+| 404 | `not_found` | Namespace missing, or caller lacks `read_role` — including an anonymous caller on any namespace that isn't `read_role: public` |
 | 409 | `conflict` | `POST /namespaces` with a name that already exists |
 | 413 | `document_too_large` | Stored document would exceed 64 KB |
 | 413 | `request_too_large` | Request body exceeds 128 KB |
@@ -346,22 +436,37 @@ All errors use the same envelope:
 
 ## Role model and ACL matrix
 
-Each namespace carries a `read_role` and a `write_role`, each `admin` or `user`.
-Callers carry a role claim in their JWT.
+Each namespace carries a `read_role` (`admin`, `user` or `public`) and a
+`write_role` (`admin` or `user`). Callers carry a role claim in their JWT; a
+request with no `Authorization` header is the synthetic `public` caller.
+
+Roles are ranked `public` (0) < `user` (1) < `admin` (2), and two rules cover
+every decision:
+
+- A caller may read a namespace when its rank is at least the namespace's
+  `read_role` rank.
+- A namespace's `read_role` may be no stronger than its `write_role`.
+
+A role the service does not recognise is unranked and satisfies nothing, so a
+malformed `role` claim fails closed rather than falling through to `public`.
 
 **Role resolution:**
 
-| Caller role | Satisfies `admin` requirement | Satisfies `user` requirement |
-|---|---|---|
-| `admin` | ✓ | ✓ |
-| `user` | ✗ | ✓ |
+| Caller role | Satisfies `admin` | Satisfies `user` | Satisfies `public` |
+|---|---|---|---|
+| `admin` | ✓ | ✓ | ✓ |
+| `user` | ✗ | ✓ | ✓ |
+| `public` (no token) | ✗ | ✗ | ✓ |
+
+`public` is a valid `read_role` only, never a `write_role`. A namespace may be
+readable without a token; nothing is ever anonymously writable.
 
 **Per-operation requirements:**
 
 | Operation | Required role |
 |---|---|
-| `GET /api/v1/config` | Any valid user token |
-| `GET /api/v1/config/{ns}` | Satisfies namespace `read_role` |
+| `GET /api/v1/config` | Any valid user token (never anonymous) |
+| `GET /api/v1/config/{ns}` | Satisfies namespace `read_role`; anonymous when that is `public` |
 | `PUT /api/v1/config/{ns}` | Satisfies namespace `write_role` |
 | `DELETE /api/v1/config/{ns}` | `admin` (regardless of namespace ACL) |
 | `POST /api/v1/config/namespaces` | `admin` |
@@ -522,9 +627,12 @@ waiting for a 401. Identity returns `expires_in` alongside the token if you
 need to compute the deadline.
 
 **Config caching.** The config service sets `Cache-Control: private, no-store`
-on document responses. Cache on the client side with your own TTL. A reasonable
-default for most config is 1–5 minutes; shorter for anything the service needs
-to react to quickly.
+on document responses, except for `read_role: public` namespaces, which get
+`public, max-age=60` so shared caches can serve them. Cache on the client side
+with your own TTL. A reasonable default for most config is 1–5 minutes; shorter
+for anything the service needs to react to quickly. Note that the 60-second TTL
+on a public namespace is also its revoke latency — un-publishing does not purge
+edge or browser caches.
 
 **404 is authoritative.** If the namespace doesn't exist or your token can't
 read it, you get 404. Don't retry 404s in a loop. Check your role and whether
@@ -541,7 +649,9 @@ re-apply configuration on every deploy.
 
 **Don't store secrets here.** Config documents are intended for non-sensitive
 structured data — MQTT topics, device names, feature flags, UI copy. Anyone
-with `read_role` access can read everything in the document.
+with `read_role` access can read everything in the document — and for a
+`read_role: public` namespace, that is anyone at all. See **Public namespaces**
+in `docs/admin.md` before publishing one.
 
 **Rate limiting.** The API allows 5 requests/second per IP (burst 20). Service
 startups that need config often boot in parallel; this budget is intentionally
