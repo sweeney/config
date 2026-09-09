@@ -268,12 +268,130 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
   -H "Authorization: Bearer $ADMIN_TOK" "$CFG_BASE/api/v1/config/mqtt")
 check "GET after DELETE = 404" "404" "$STATUS"
 
-# ── 11. SPA logout revokes the refresh token ──────────────────────────
+# ── 11. Public namespaces (anonymous reads) ──────────────────────────
+echo
+echo "=== 11. Public namespaces ==="
+
+# Publishing at create time requires confirm_public to echo the namespace name.
+R=$(curl -s -X POST "$CFG_BASE/api/v1/config/namespaces" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"tariffs","read_role":"public","write_role":"user","document":{"unit":0.24}}' \
+  -w '\n%{http_code}')
+STATUS=$(echo "$R" | tail -n1)
+BODY=$(echo "$R" | sed '$d')
+check "create public without confirm_public = 400" "400" "$STATUS"
+check_contains "rejection names confirm_required" "confirm_required" "$BODY"
+
+# A confirmation for a different namespace must not work — that is the whole
+# point of binding it to the name rather than using a boolean.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$CFG_BASE/api/v1/config/namespaces" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"tariffs","read_role":"public","write_role":"user","document":{},"confirm_public":"houses"}')
+check "create public with mismatched confirm = 400" "400" "$STATUS"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$CFG_BASE/api/v1/config/namespaces" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"tariffs","read_role":"public","write_role":"user","document":{"unit":0.24},"confirm_public":"tariffs"}')
+check "create public with confirm_public = 201" "201" "$STATUS"
+
+# public is never a valid write role, confirmation or not.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$CFG_BASE/api/v1/config/namespaces" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"nope","read_role":"public","write_role":"public","document":{},"confirm_public":"nope"}')
+check "public write_role rejected = 400" "400" "$STATUS"
+
+# The anonymous read — no Authorization header at all. This is the whole
+# feature, and it is the one thing only a live stack can prove.
+R=$(curl -s "$CFG_BASE/api/v1/config/tariffs" -w '\n%{http_code}')
+STATUS=$(echo "$R" | tail -n1)
+BODY=$(echo "$R" | sed '$d')
+check "anonymous GET of public namespace = 200" "200" "$STATUS"
+check_contains "anonymous read returns the document" "0.24" "$BODY"
+
+HDRS=$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/tariffs")
+check_contains "public namespace is shared-cacheable" "max-age=60" "$HDRS"
+check_contains "Vary: Authorization set on public read" "Vary: Authorization" "$HDRS"
+
+# A private namespace and a nonexistent one must be indistinguishable, or the
+# 404 becomes an existence oracle for anonymous callers.
+PRIV=$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config/houses")
+MISS=$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config/nosuchnamespace")
+check "anonymous GET of private namespace = 404" "404" "$PRIV"
+check "anonymous GET of missing namespace = 404" "404" "$MISS"
+
+# A token that was presented but does not verify is never downgraded to
+# anonymous, even where anonymous would have succeeded.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer not-a-real-token" "$CFG_BASE/api/v1/config/tariffs")
+check "broken token on a public namespace = 401" "401" "$STATUS"
+
+# A public read role must not open any other route.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config")
+check "anonymous list still = 401" "401" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$CFG_BASE/api/v1/config/tariffs" \
+  -H 'Content-Type: application/json' -d '{"unit":9.99}')
+check "anonymous PUT to a public namespace = 401" "401" "$STATUS"
+
+# Publishing an existing namespace through PATCH. Uses its own namespace:
+# 'mqtt' was deleted back in section 10, and reusing it made these checks
+# pass or fail on a missing namespace rather than on the publish guard.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$CFG_BASE/api/v1/config/namespaces" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"feeds","read_role":"user","write_role":"admin","document":{"poll":30}}')
+check "create private 'feeds' for the publish flow = 201" "201" "$STATUS"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X PATCH "$CFG_BASE/api/v1/config/namespaces/feeds" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"read_role":"public","write_role":"admin"}')
+check "publish via PATCH without confirm = 400" "400" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config/feeds")
+check "refused publish left it unreadable = 404" "404" "$STATUS"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X PATCH "$CFG_BASE/api/v1/config/namespaces/feeds" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"read_role":"public","write_role":"admin","confirm_public":"feeds"}')
+check "publish via PATCH with confirm = 200" "200" "$STATUS"
+R=$(curl -s "$CFG_BASE/api/v1/config/feeds" -w '\n%{http_code}')
+check "anonymous read after publish = 200" "200" "$(echo "$R" | tail -n1)"
+check_contains "published document is served anonymously" "30" "$(echo "$R" | sed '$d')"
+
+# Revoking is an ordinary edit — no confirmation — and closes the anonymous
+# read at the origin immediately. (Caches downstream keep serving until the
+# max-age above expires; that is the real revoke latency.)
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X PATCH "$CFG_BASE/api/v1/config/namespaces/feeds" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"read_role":"user","write_role":"admin"}')
+check "revoke without confirm = 200" "200" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config/feeds")
+check "anonymous read after revoke = 404" "404" "$STATUS"
+
+# Locking a user-writable public namespace all the way down needs the write
+# role raised in the same call, or it violates writers-are-readers.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X PATCH "$CFG_BASE/api/v1/config/namespaces/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"read_role":"admin","write_role":"user"}')
+check "public -> admin read with user write = 400" "400" "$STATUS"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X PATCH "$CFG_BASE/api/v1/config/namespaces/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"read_role":"admin","write_role":"admin"}')
+check "public -> admin read with admin write = 200" "200" "$STATUS"
+
+# ── 12. SPA logout revokes the refresh token ──────────────────────────
 # Regression: the SPA used to call /api/v1/auth/logout without an
 # Authorization header — silently 401'd. This test uses the same call
 # shape the SPA now uses and asserts the refresh token is dead server-side.
 echo
-echo "=== 11. SPA logout revokes refresh token ==="
+echo "=== 12. SPA logout revokes refresh token ==="
 LOGOUT_LOGIN=$(curl -s -X POST "$ID_BASE/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}")
@@ -313,9 +431,9 @@ POST_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ID_BASE/api/v1/au
   -d "{\"refresh_token\":\"$LOGOUT_REFRESH\"}")
 check "refresh fails after logout (token revoked)" "401" "$POST_STATUS"
 
-# ── 12. Cleanup ──────────────────────────────────────────────────────
+# ── 13. Cleanup ──────────────────────────────────────────────────────
 echo
-echo "=== 12. Cleanup ==="
+echo "=== 13. Cleanup ==="
 if [ -n "$USER_ID" ]; then
   STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -X DELETE "$ID_BASE/api/v1/users/$USER_ID" \
@@ -326,6 +444,14 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
   -X DELETE "$CFG_BASE/api/v1/config/houses" \
   -H "Authorization: Bearer $ADMIN_TOK")
 check "deleted 'houses' namespace" "204" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X DELETE "$CFG_BASE/api/v1/config/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK")
+check "deleted 'tariffs' namespace" "204" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X DELETE "$CFG_BASE/api/v1/config/feeds" \
+  -H "Authorization: Bearer $ADMIN_TOK")
+check "deleted 'feeds' namespace" "204" "$STATUS"
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo
