@@ -331,7 +331,10 @@ func updateACLHandler(svc *service.ConfigService) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, "invalid_request", "malformed JSON body")
 			return
 		}
-		if err := svc.UpdateACL(caller, ns, b.ReadRole, b.WriteRole); err != nil {
+		if err := svc.UpdateACL(caller, ns, service.UpdateACLInput{
+			ReadRole:  b.ReadRole,
+			WriteRole: b.WriteRole,
+		}); err != nil {
 			translateError(w, err)
 			return
 		}

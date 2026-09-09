@@ -144,6 +144,10 @@ func newConfigSvc(t *testing.T) (*service.ConfigService, *fakeConfigRepo, *fakeB
 var admin = service.Caller{Sub: "admin-1", Role: domain.ConfigRoleAdmin}
 var user = service.Caller{Sub: "user-1", Role: domain.ConfigRoleUser}
 
+// anon is the synthetic caller the HTTP layer mints for a request that
+// carried no Authorization header at all.
+var anon = service.Caller{Sub: "", Role: domain.ConfigRolePublic}
+
 // --- CreateNamespace ---
 
 func TestCreate_AdminCanCreate(t *testing.T) {
@@ -434,13 +438,13 @@ func TestUpdateACL_AdminOnly(t *testing.T) {
 		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
 	}))
 
-	require.NoError(t, svc.UpdateACL(admin, "n", "user", "admin"))
+	require.NoError(t, svc.UpdateACL(admin, "n", service.UpdateACLInput{ReadRole: "user", WriteRole: "admin"}))
 	assert.Equal(t, 1, b.count())
 
 	got, _ := svc.Get(admin, "n")
 	assert.Equal(t, "user", got.ReadRole)
 
-	err := svc.UpdateACL(user, "n", "user", "user")
+	err := svc.UpdateACL(user, "n", service.UpdateACLInput{ReadRole: "user", WriteRole: "user"})
 	assert.ErrorIs(t, err, service.ErrConfigForbidden)
 }
 
@@ -451,7 +455,7 @@ func TestUpdateACL_InvalidRole(t *testing.T) {
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
 		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
 	}))
-	err := svc.UpdateACL(admin, "n", "root", "admin")
+	err := svc.UpdateACL(admin, "n", service.UpdateACLInput{ReadRole: "root", WriteRole: "admin"})
 	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
 }
 
@@ -474,4 +478,236 @@ func TestDelete_AdminOnly(t *testing.T) {
 
 	_, err = svc.Get(admin, "n")
 	assert.True(t, errors.Is(err, service.ErrConfigNamespaceNotFound))
+}
+
+// --- public read role ---
+
+// seedNS is a small helper for the public-role tests, which care about the
+// ACL rather than the document.
+func seedNS(t *testing.T, repo *fakeConfigRepo, name, readRole, writeRole string) {
+	t.Helper()
+	now := time.Now().UTC()
+	require.NoError(t, repo.Create(&domain.ConfigNamespace{
+		Name: name, ReadRole: readRole, WriteRole: writeRole,
+		Document: []byte(`{"k":1}`), UpdatedAt: now, UpdatedBy: "seed", CreatedAt: now,
+	}))
+}
+
+// TestGet_RoleMatrix enumerates every (namespace read_role, caller role)
+// pair rather than spot-checking. This is the authorization primitive the
+// whole feature rests on, and an exhaustive table is cheap at 3x3.
+//
+// A denied read must surface as not-found, never forbidden, so an anonymous
+// caller cannot use the status code to discover which namespaces exist.
+func TestGet_RoleMatrix(t *testing.T) {
+	callers := map[string]service.Caller{"anonymous": anon, "user": user, "admin": admin}
+	allowed := map[string]map[string]bool{
+		//  namespace read_role -> caller -> may read
+		"public": {"anonymous": true, "user": true, "admin": true},
+		"user":   {"anonymous": false, "user": true, "admin": true},
+		"admin":  {"anonymous": false, "user": false, "admin": true},
+	}
+
+	for nsRole, byCaller := range allowed {
+		for callerName, want := range byCaller {
+			t.Run(nsRole+"/"+callerName, func(t *testing.T) {
+				svc, repo, _ := newConfigSvc(t)
+				writeRole := nsRole
+				if nsRole == "public" {
+					writeRole = "user" // public is never a write role
+				}
+				seedNS(t, repo, "ns", nsRole, writeRole)
+
+				got, err := svc.Get(callers[callerName], "ns")
+				if want {
+					require.NoError(t, err)
+					assert.JSONEq(t, `{"k":1}`, string(got.Document))
+					return
+				}
+				assert.ErrorIs(t, err, service.ErrConfigNamespaceNotFound,
+					"a denied read must be indistinguishable from a missing namespace")
+			})
+		}
+	}
+}
+
+// TestGet_AnonymousMissingNamespace pins the other half of the
+// indistinguishability property: a namespace that does not exist and one the
+// anonymous caller may not read must produce the same error.
+func TestGet_AnonymousMissingNamespace(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "private", "user", "user")
+
+	_, errPrivate := svc.Get(anon, "private")
+	_, errMissing := svc.Get(anon, "nosuchns")
+	assert.ErrorIs(t, errPrivate, service.ErrConfigNamespaceNotFound)
+	assert.ErrorIs(t, errMissing, service.ErrConfigNamespaceNotFound)
+	assert.Equal(t, errMissing, errPrivate, "the two cases must be the same error value")
+}
+
+func TestCreate_PublicReadRequiresConfirmation(t *testing.T) {
+	svc, _, b := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "admin", Document: []byte(`{}`),
+	})
+	assert.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired)
+	assert.Equal(t, 0, b.count(), "a rejected publish must not trigger a backup")
+}
+
+func TestCreate_PublicReadWrongConfirmation(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "admin",
+		Document: []byte(`{}`), ConfirmPublic: "something-else",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired,
+		"the confirmation must match this namespace, so a body cannot be replayed against another")
+}
+
+func TestCreate_PublicReadWithConfirmation(t *testing.T) {
+	svc, _, b := newConfigSvc(t)
+	ns, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "admin",
+		Document: []byte(`{}`), ConfirmPublic: "tariffs",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "public", ns.ReadRole)
+	assert.Equal(t, 1, b.count())
+}
+
+func TestCreate_PublicWriteRoleAlwaysRejected(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "public",
+		Document: []byte(`{}`), ConfirmPublic: "tariffs",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigInvalidRole,
+		"nothing is anonymously writable, confirmation or not")
+}
+
+// TestCreate_PublicReadPermitsUserWrite covers the loosened invariant:
+// public is the weakest read requirement, so any write role satisfies
+// writers-are-readers.
+func TestCreate_PublicReadPermitsUserWrite(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "user",
+		Document: []byte(`{}`), ConfirmPublic: "tariffs",
+	})
+	require.NoError(t, err)
+}
+
+func TestUpdateACL_PublishRequiresConfirmation(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired)
+
+	readRole, _, gerr := repo.GetACL("tariffs")
+	require.NoError(t, gerr)
+	assert.Equal(t, "user", readRole, "a rejected publish must not have changed the ACL")
+}
+
+func TestUpdateACL_PublishWithConfirmation(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user", ConfirmPublic: "tariffs",
+	}))
+	readRole, _, err := repo.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "public", readRole)
+}
+
+// TestUpdateACL_AlreadyPublicNeedsNoConfirmation: the guard exists to make
+// the transition deliberate. A namespace that is already public is not
+// transitioning, so an unrelated write-role edit must not demand it.
+func TestUpdateACL_AlreadyPublicNeedsNoConfirmation(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "admin",
+	}))
+}
+
+// TestUpdateACL_RevokePublic: unpublishing is an ordinary ACL edit and must
+// never be gated behind a confirmation.
+func TestUpdateACL_RevokePublic(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "user", WriteRole: "user",
+	}))
+	readRole, _, err := repo.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "user", readRole)
+}
+
+// TestUpdateACL_RevokeToAdminNeedsWriteRaised documents the sharp edge in
+// revocation: read=admin with write=user violates writers-are-readers, so
+// locking a public namespace all the way down means raising both.
+func TestUpdateACL_RevokeToAdminNeedsWriteRaised(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "admin", WriteRole: "user",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "admin", WriteRole: "admin",
+	}))
+}
+
+func TestUpdateACL_PublicWriteRoleRejected(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "public", ConfirmPublic: "tariffs",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
+}
+
+// TestUpdateACL_ConfirmationOnMissingNamespace: not-found must win over the
+// confirmation error, so the guard cannot be used to probe for existence.
+func TestUpdateACL_ConfirmationOnMissingNamespace(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	err := svc.UpdateACL(admin, "nosuchns", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigNamespaceNotFound)
+}
+
+// TestListVisible_AnonymousSeesOnlyPublic documents the service contract.
+// The HTTP list route is authenticated, so this path is not reachable
+// anonymously today — the test guards the behaviour if that ever changes.
+func TestListVisible_AnonymousSeesOnlyPublic(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "open", "public", "user")
+	seedNS(t, repo, "internal", "user", "user")
+	seedNS(t, repo, "secret", "admin", "admin")
+
+	list, err := svc.ListVisible(anon)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "open", list[0].Name)
+}
+
+// TestPutDocument_AnonymousCannotWrite: the write path has no anonymous
+// entry point at the HTTP layer, but the service must refuse regardless.
+func TestPutDocument_AnonymousCannotWrite(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "open", "public", "user")
+
+	_, err := svc.PutDocument(anon, "open", []byte(`{"k":2}`))
+	assert.ErrorIs(t, err, service.ErrConfigForbidden,
+		"a public namespace is readable without a token, never writable")
 }
