@@ -1,3 +1,27 @@
+// Package auth adapts common/auth's JWKS token verification to this
+// service's HTTP layer.
+//
+// It offers two middlewares, and choosing between them is a security
+// decision:
+//
+//   - RequireAuth: a valid token is mandatory. This is the default, and the
+//     right choice for every route unless there is a specific reason
+//     otherwise.
+//   - OptionalAuth: a request with no Authorization header proceeds
+//     unauthenticated, and the handler must be able to answer safely for an
+//     anonymous caller.
+//
+// OptionalAuth exists for exactly one route — GET of a single namespace,
+// which may be published with read_role=public — because whether that route
+// needs a token is a property of the namespace and cannot be known before
+// the database lookup. It is safe there only because the service answers a
+// namespace the caller cannot read with not-found. Do not reach for it to
+// make a route "easier to call": a handler behind OptionalAuth receives no
+// claims at all, so anything reading the caller's identity must cope with
+// its absence rather than assume a token was checked upstream.
+//
+// Neither middleware ever treats a broken token as anonymous. See
+// OptionalAuth's own documentation for why that matters.
 package auth
 
 import (
