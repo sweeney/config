@@ -25,6 +25,7 @@ import (
 	"github.com/sweeney/config/internal/domain"
 	"github.com/sweeney/config/internal/handler"
 	"github.com/sweeney/config/internal/service"
+	"github.com/sweeney/config/internal/testutil"
 )
 
 // --- testIssuer ---
@@ -133,6 +134,10 @@ func (ti *testIssuer) ParseServiceToken(_ context.Context, tokenStr string) (*co
 type fakeRepo struct {
 	mu   sync.Mutex
 	data map[string]*domain.ConfigNamespace
+
+	// Audit recording is shared with the other suite's fake so the two
+	// cannot disagree about what gets recorded; see internal/testutil.
+	audit testutil.AuditLog
 }
 
 func newFakeRepo() *fakeRepo {
@@ -200,17 +205,40 @@ func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time)
 	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionACLChange,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		NewReadRole:  rRole,
+		NewWriteRole: wRole,
+		Actor:        updatedBy,
+		At:           at,
+	})
 	ns.ReadRole, ns.WriteRole, ns.UpdatedBy, ns.UpdatedAt = rRole, wRole, updatedBy, at
 	return nil
 }
-func (r *fakeRepo) Delete(name string) error {
+func (r *fakeRepo) Delete(name, deletedBy string, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.data[name]; !ok {
+	ns, ok := r.data[name]
+	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionDelete,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		Actor:        deletedBy,
+		At:           at,
+	})
 	delete(r.data, name)
 	return nil
+}
+
+func (r *fakeRepo) ListAudit(namespace string) ([]domain.AuditEntry, error) {
+	return r.audit.List(namespace), nil
 }
 
 func (r *fakeRepo) seed(name, readRole, writeRole, document string) {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/sweeney/config/internal/domain"
 	"github.com/sweeney/config/internal/service"
+	"github.com/sweeney/config/internal/testutil"
 )
 
 // --- fakes ---
@@ -23,6 +24,10 @@ import (
 type fakeConfigRepo struct {
 	mu   sync.Mutex
 	data map[string]*domain.ConfigNamespace
+
+	// Audit recording is shared with the other suite's fake so the two
+	// cannot disagree about what gets recorded; see internal/testutil.
+	audit testutil.AuditLog
 }
 
 func newFakeConfigRepo() *fakeConfigRepo {
@@ -74,6 +79,14 @@ func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace) error {
 	}
 	copied := *ns
 	r.data[ns.Name] = &copied
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    ns.Name,
+		Action:       domain.AuditActionCreate,
+		NewReadRole:  ns.ReadRole,
+		NewWriteRole: ns.WriteRole,
+		Actor:        ns.UpdatedBy,
+		At:           ns.CreatedAt,
+	})
 	return nil
 }
 
@@ -97,6 +110,16 @@ func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, 
 	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionACLChange,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		NewReadRole:  readRole,
+		NewWriteRole: writeRole,
+		Actor:        updatedBy,
+		At:           at,
+	})
 	ns.ReadRole = readRole
 	ns.WriteRole = writeRole
 	ns.UpdatedBy = updatedBy
@@ -104,14 +127,27 @@ func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, 
 	return nil
 }
 
-func (r *fakeConfigRepo) Delete(name string) error {
+func (r *fakeConfigRepo) Delete(name, deletedBy string, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.data[name]; !ok {
+	ns, ok := r.data[name]
+	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionDelete,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		Actor:        deletedBy,
+		At:           at,
+	})
 	delete(r.data, name)
 	return nil
+}
+
+func (r *fakeConfigRepo) ListAudit(namespace string) ([]domain.AuditEntry, error) {
+	return r.audit.List(namespace), nil
 }
 
 // fakeBackup records TriggerAsync calls so tests can assert on-write
@@ -710,4 +746,62 @@ func TestPutDocument_AnonymousCannotWrite(t *testing.T) {
 	_, err := svc.PutDocument(anon, "open", []byte(`{"k":2}`))
 	assert.ErrorIs(t, err, service.ErrConfigForbidden,
 		"a public namespace is readable without a token, never writable")
+}
+
+// --- audit ---
+//
+// The service does not record audit entries itself — the store does, inside
+// the transaction that performs the mutation. What the service decides is
+// *who* is recorded, so that is what these assert. Rollback behaviour is
+// tested against real SQLite in internal/store's integration suite, where it
+// is real; a fake cannot meaningfully assert it.
+
+func TestDelete_AuditRecordsTheCaller(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "temp", "admin", "admin")
+
+	require.NoError(t, svc.Delete(admin, "temp"))
+
+	entries, err := repo.ListAudit("temp")
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "create then delete")
+	assert.Equal(t, domain.AuditActionDelete, entries[1].Action)
+	assert.Equal(t, admin.Sub, entries[1].Actor,
+		"the deleting admin must be recorded, not the namespace's last writer")
+	assert.False(t, entries[1].At.IsZero(), "the service supplies the clock")
+}
+
+func TestUpdateACL_AuditRecordsPublishTransition(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user", ConfirmPublic: "tariffs",
+	}))
+
+	entries, err := repo.ListAudit("tariffs")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	assert.Equal(t, domain.AuditActionACLChange, entries[1].Action)
+	assert.Equal(t, admin.Sub, entries[1].Actor)
+	assert.Equal(t, "user", entries[1].OldReadRole)
+	assert.Equal(t, "public", entries[1].NewReadRole,
+		"publishing is the transition the trail exists to record")
+}
+
+// TestUpdateACL_RejectedPublishLeavesNoAuditEntry: the confirmation is
+// checked before the repository is touched, so a rejected publish must not
+// appear in the history at all.
+func TestUpdateACL_RejectedPublishLeavesNoAuditEntry(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user",
+	})
+	require.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired)
+
+	entries, aerr := repo.ListAudit("tariffs")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "only the create")
 }

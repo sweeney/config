@@ -31,6 +31,31 @@ var roleRanks = map[string]int{
 	ConfigRoleAdmin:  2,
 }
 
+// Audit actions recorded in the config_audit table.
+const (
+	AuditActionCreate    = "create"
+	AuditActionACLChange = "acl_change"
+	AuditActionDelete    = "delete"
+)
+
+// AuditEntry is one recorded change to a namespace's existence or its access
+// rules. Document writes are not audited and document bodies are never
+// recorded — this answers "who changed the rules, and when", not "what was
+// in it".
+//
+// Old roles are empty on create; new roles are empty on delete.
+type AuditEntry struct {
+	ID           int64
+	Namespace    string
+	Action       string
+	OldReadRole  string
+	OldWriteRole string
+	NewReadRole  string
+	NewWriteRole string
+	Actor        string
+	At           time.Time
+}
+
 // BackupService defines the interface for triggering database backups.
 type BackupService interface {
 	TriggerAsync()
@@ -70,8 +95,16 @@ type ConfigRepository interface {
 	Create(ns *ConfigNamespace) error
 	UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error
 	UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time) error
-	Delete(name string) error
+	Delete(name, deletedBy string, at time.Time) error
+
+	// ListAudit returns the recorded history for one namespace, oldest
+	// first. Entries survive deletion of the namespace they describe.
+	ListAudit(namespace string) ([]AuditEntry, error)
 }
+
+// Implementations of ConfigRepository must write the audit entry for a
+// mutation in the same transaction as the mutation itself. A trail with
+// gaps is worse than no trail, because it will be believed.
 
 // RoleRank returns the privilege rank of role, and whether role is known
 // at all. Unknown roles are never ranked, so they can never satisfy a

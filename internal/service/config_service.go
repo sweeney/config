@@ -240,7 +240,7 @@ func (s *ConfigService) Delete(caller Caller, name string) error {
 	if !configNameRE.MatchString(name) {
 		return ErrConfigInvalidName
 	}
-	if err := s.repo.Delete(name); err != nil {
+	if err := s.repo.Delete(name, caller.Sub, s.now()); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return ErrConfigNamespaceNotFound
 		}

@@ -153,12 +153,13 @@ func TestConfigStore_Delete(t *testing.T) {
 		Name: "temp", ReadRole: "admin", WriteRole: "admin",
 		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
 	}))
-	require.NoError(t, s.Delete("temp"))
+	require.NoError(t, s.Delete("temp", "deleter", now))
 
 	_, err := s.Get("temp")
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 
-	assert.ErrorIs(t, s.Delete("temp"), domain.ErrNotFound, "second delete must return not-found")
+	assert.ErrorIs(t, s.Delete("temp", "deleter", now), domain.ErrNotFound,
+		"second delete must return not-found")
 }
 
 func TestConfigStore_List_Empty(t *testing.T) {
@@ -184,4 +185,154 @@ func TestConfigStore_List_Ordered(t *testing.T) {
 	assert.Equal(t, "alpha", list[0].Name)
 	assert.Equal(t, "bravo", list[1].Name)
 	assert.Equal(t, "charlie", list[2].Name)
+}
+
+// --- audit trail ---
+
+func seedForAudit(t *testing.T, s *store.ConfigStore, name, readRole, writeRole string, at time.Time) {
+	t.Helper()
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: name, ReadRole: readRole, WriteRole: writeRole,
+		Document: []byte(`{}`), UpdatedAt: at, UpdatedBy: "creator", CreatedAt: at,
+	}))
+}
+
+func TestConfigStore_Create_WritesAuditEntry(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	entries, err := s.ListAudit("prefs")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	e := entries[0]
+	assert.Equal(t, "prefs", e.Namespace)
+	assert.Equal(t, domain.AuditActionCreate, e.Action)
+	assert.Equal(t, "creator", e.Actor)
+	assert.Equal(t, "user", e.NewReadRole)
+	assert.Equal(t, "user", e.NewWriteRole)
+	assert.Empty(t, e.OldReadRole, "create has no previous ACL")
+	assert.Empty(t, e.OldWriteRole)
+	assert.True(t, e.At.Equal(now))
+}
+
+func TestConfigStore_UpdateACL_WritesAuditEntryWithTransition(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "tariffs", "user", "user", now)
+
+	later := now.Add(time.Minute)
+	require.NoError(t, s.UpdateACL("tariffs", "public", "user", "admin-1", later))
+
+	entries, err := s.ListAudit("tariffs")
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "create then acl_change")
+
+	e := entries[1]
+	assert.Equal(t, domain.AuditActionACLChange, e.Action)
+	assert.Equal(t, "admin-1", e.Actor)
+	assert.Equal(t, "user", e.OldReadRole, "the transition is the point of the record")
+	assert.Equal(t, "user", e.OldWriteRole)
+	assert.Equal(t, "public", e.NewReadRole)
+	assert.Equal(t, "user", e.NewWriteRole)
+	assert.True(t, e.At.Equal(later))
+}
+
+// TestConfigStore_Delete_AuditSurvivesTheNamespace is the reason config_audit
+// carries no foreign key: with PRAGMA foreign_keys=ON a reference would
+// either cascade this row away or block the delete, and the deletion is the
+// event most worth keeping.
+func TestConfigStore_Delete_AuditSurvivesTheNamespace(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "temp", "admin", "admin", now)
+
+	later := now.Add(time.Minute)
+	require.NoError(t, s.Delete("temp", "admin-9", later))
+
+	_, err := s.Get("temp")
+	require.ErrorIs(t, err, domain.ErrNotFound, "namespace is gone")
+
+	entries, aerr := s.ListAudit("temp")
+	require.NoError(t, aerr)
+	require.Len(t, entries, 2)
+
+	e := entries[1]
+	assert.Equal(t, domain.AuditActionDelete, e.Action)
+	assert.Equal(t, "admin-9", e.Actor)
+	assert.Equal(t, "admin", e.OldReadRole)
+	assert.Equal(t, "admin", e.OldWriteRole)
+	assert.Empty(t, e.NewReadRole, "a deleted namespace has no resulting ACL")
+	assert.Empty(t, e.NewWriteRole)
+}
+
+// TestConfigStore_UpdateACL_AuditRollsBackWithFailedMutation is the
+// atomicity guard, and the reason the store needed transactions at all. The
+// audit row is written before the mutation, so a mutation that fails must
+// take the audit row with it — otherwise the trail records a change that
+// never happened, which is worse than having no trail because it will be
+// believed.
+//
+// The role CHECK constraint is the failure injector: it is a real database
+// error on the real schema, not a fault simulated by a fake.
+func TestConfigStore_UpdateACL_AuditRollsBackWithFailedMutation(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	err := s.UpdateACL("prefs", "root", "user", "admin-1", now.Add(time.Minute))
+	require.Error(t, err, "an invalid role must be rejected by the CHECK constraint")
+
+	readRole, writeRole, gerr := s.GetACL("prefs")
+	require.NoError(t, gerr)
+	assert.Equal(t, "user", readRole, "the ACL must be unchanged")
+	assert.Equal(t, "user", writeRole)
+
+	entries, aerr := s.ListAudit("prefs")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "only the create — the failed change must leave no audit row")
+}
+
+// TestConfigStore_Create_AuditRollsBackOnConflict is the same guard on the
+// create path: a duplicate name must not leave an orphan audit entry
+// claiming the namespace was created twice.
+func TestConfigStore_Create_AuditRollsBackOnConflict(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "dup", "user", "user", now)
+
+	err := s.Create(&domain.ConfigNamespace{
+		Name: "dup", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "creator2", CreatedAt: now,
+	})
+	require.ErrorIs(t, err, domain.ErrConflict)
+
+	entries, aerr := s.ListAudit("dup")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "the rejected create must leave no audit row")
+}
+
+func TestConfigStore_ListAudit_ScopedAndOrdered(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "alpha", "user", "user", now)
+	seedForAudit(t, s, "beta", "admin", "admin", now)
+	require.NoError(t, s.UpdateACL("alpha", "public", "user", "admin-1", now.Add(time.Minute)))
+	require.NoError(t, s.UpdateACL("alpha", "user", "user", "admin-1", now.Add(2*time.Minute)))
+
+	entries, err := s.ListAudit("alpha")
+	require.NoError(t, err)
+	require.Len(t, entries, 3, "other namespaces must not appear")
+	assert.Equal(t, domain.AuditActionCreate, entries[0].Action)
+	assert.Equal(t, "public", entries[1].NewReadRole)
+	assert.Equal(t, "user", entries[2].NewReadRole)
+	assert.True(t, entries[0].At.Before(entries[2].At), "oldest first")
+}
+
+func TestConfigStore_ListAudit_UnknownNamespaceIsEmpty(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	entries, err := s.ListAudit("nosuchns")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
 }
