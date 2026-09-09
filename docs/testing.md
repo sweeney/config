@@ -20,9 +20,9 @@ are I/O boundaries that can't run in a unit test:
 | R2 backup | `fakeBackup` — implements `domain.BackupService`, counts `TriggerAsync()` calls |
 | Identity JWKS | `testIssuer` — in-process EC signer/verifier (handler tests only) |
 
-The real SQLite store is exercised only in the e2e suite. There are no
-`testify/mock` mocks — everything is a hand-written fake with real
-behaviour.
+The real SQLite store is exercised by the integration layer (layer 3) and
+again end-to-end by `scripts/e2e.sh`. There are no `testify/mock` mocks —
+everything is a hand-written fake with real behaviour.
 
 **Red/green discipline.** Write the failing test first, then make it pass.
 Do not write a test for code that already exists without first confirming
@@ -85,7 +85,32 @@ Key things tested:
 - OpenAPI spec endpoints unauthenticated
 - Error envelope shape — no SQL or stack traces in `message`
 
-### 3. E2e tests (`scripts/e2e.sh`)
+### 3. Integration tests (`db/`, `internal/store/`)
+
+The persistence layer against a real SQLite database. Each test opens a
+fresh database with `db.Open` in a `t.TempDir()`, so there is no shared
+state between tests and nothing to clean up.
+
+Two files:
+
+| File | What it covers |
+|---|---|
+| `db/db_test.go` | `db.Open` — file creation, migrations (including idempotency on reopen), WAL mode, file permissions, foreign keys |
+| `internal/store/config_store_integration_test.go` | `ConfigStore` as a real implementation of `domain.ConfigRepository` — create/get/list/update/delete, ACL reads and writes, duplicate-name conflict, and the role `CHECK` constraint rejecting invalid values |
+
+This is where migration correctness is verified directly: the tests assert
+the `config_namespaces` table exists after `db.Open`, and that opening an
+already-migrated database again is a no-op.
+
+Both files are gated behind `//go:build integration`, so they are invisible
+to a plain `go test ./...` (which reports `[no test files]` for both
+packages). Run them with the build tag:
+
+```bash
+go test -race -count=1 -tags=integration ./...
+```
+
+### 4. E2e tests (`scripts/e2e.sh`)
 
 Runs against live servers. Requires both identity and config running. Gets
 admin and user tokens from identity, then exercises every config endpoint.
@@ -107,9 +132,9 @@ DB_PATH=/tmp/e2e-config.db PORT=8282 IDENTITY_ENV=development \
 
 The e2e suite covers the full integration path including real JWKS
 verification — the config server fetches identity's public key and
-validates every token cryptographically. This is the only layer that
-exercises `internal/store/` (real SQLite) and `internal/config/` (env
-loading).
+validates every token cryptographically. It is the only layer that
+exercises `internal/config/` (env loading) and the wiring in
+`cmd/server/`; the store itself is covered more cheaply by layer 3.
 
 ## Running locally
 
@@ -122,6 +147,9 @@ go test -race -count=1 ./...
 
 # Specific package
 go test -v ./internal/handler/...
+
+# Integration tests (real SQLite — build-tagged, not run by default)
+go test -race -count=1 -tags=integration ./...
 
 # E2e (requires running servers — see above)
 ./scripts/e2e.sh
@@ -139,6 +167,18 @@ every push and PR.
 3. Unit + handler tests with `-race -count=1 -coverprofile`
 4. Test result summary posted to the GitHub Actions step summary (pass/fail counts, coverage by package, slowest tests)
 5. HTML coverage report uploaded as an artifact (retained 30 days)
+
+### `integration` job
+
+Runs the build-tagged integration layer as its own check:
+
+```bash
+go test -race -count=1 -tags=integration ./...
+```
+
+It repeats the `test` job's checkout / `setup-go` / `go mod verify` setup
+but skips the coverage and step-summary machinery — it is a straight
+pass/fail signal that the real SQLite store and migrations still work.
 
 ### `build` job
 
@@ -186,7 +226,6 @@ duplication beats a premature abstraction.
 |---|---|
 | JWT signature verification | `common/auth` (identity repo) |
 | JWKS fetch / key rotation | `common/auth` (identity repo) |
-| SQLite migration correctness | Implicitly by e2e (first-run migration) |
 | R2 backup upload | `common/backup` (identity repo) |
 | Rate limiting | `common/ratelimit` (identity repo) |
 
@@ -201,7 +240,12 @@ For a new endpoint or behaviour:
 2. Run it — confirm it fails for the right reason
 3. Implement the behaviour
 4. Add a handler-layer test (`internal/handler/router_test.go`)
-5. Add an e2e check to `scripts/e2e.sh` if it touches auth wiring or
+5. Add integration coverage if the change touches `internal/store/` or
+   `db/` — a new query, a column, or a migration belongs in
+   `internal/store/config_store_integration_test.go` or `db/db_test.go`.
+   Remember the `//go:build integration` tag and run
+   `go test -race -count=1 -tags=integration ./...`
+6. Add an e2e check to `scripts/e2e.sh` if it touches auth wiring or
    end-to-end data flow (not just for completeness — e2e is slow to run
    against a live stack)
 
