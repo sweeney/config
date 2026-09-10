@@ -899,6 +899,7 @@ var documentedPaths = []string{
 	"/api/v1/config/{ns}",
 	"/api/v1/config/namespaces",
 	"/api/v1/config/namespaces/{ns}",
+	"/api/v1/config/namespaces/{ns}/audit",
 }
 
 // TestOpenAPI_PathCoverage cross-references the spec's paths against the routes

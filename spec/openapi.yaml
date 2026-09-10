@@ -93,6 +93,65 @@ components:
                 - read_role
                 - write_role
             type: object
+        AuditEntry:
+            description: |
+                One recorded change to a namespace's existence or its access
+                rules. Document writes are not audited and document bodies are
+                never recorded: the trail answers "who changed the access
+                rules", not "what was in it".
+            properties:
+                action:
+                    description: |
+                        `create` records a namespace coming into existence,
+                        `acl_change` a change to `read_role` or `write_role`,
+                        and `delete` its removal.
+                    enum:
+                        - create
+                        - acl_change
+                        - delete
+                    type: string
+                actor:
+                    description: |
+                        The `sub` of the admin who made the change — for a
+                        `create`, whoever created the namespace.
+                    example: user_01h8xyz
+                    type: string
+                at:
+                    description: |
+                        When the change was recorded. RFC 3339, UTC, always
+                        with milliseconds.
+                    example: "2024-01-15T09:30:00.000Z"
+                    format: date-time
+                    type: string
+                new_read_role:
+                    allOf:
+                        - $ref: '#/components/schemas/ReadRole'
+                    description: |
+                        Read role after the change. Omitted when there is none:
+                        a `delete` has no resulting ACL.
+                new_write_role:
+                    allOf:
+                        - $ref: '#/components/schemas/WriteRole'
+                    description: |
+                        Write role after the change. Omitted when there is
+                        none: a `delete` has no resulting ACL.
+                old_read_role:
+                    allOf:
+                        - $ref: '#/components/schemas/ReadRole'
+                    description: |
+                        Read role before the change. Omitted when there is
+                        none: a `create` has no previous ACL.
+                old_write_role:
+                    allOf:
+                        - $ref: '#/components/schemas/WriteRole'
+                    description: |
+                        Write role before the change. Omitted when there is
+                        none: a `create` has no previous ACL.
+            required:
+                - action
+                - actor
+                - at
+            type: object
         CreateNamespaceRequest:
             properties:
                 confirm_public:
@@ -372,6 +431,22 @@ paths:
                                 $ref: '#/components/schemas/NamespaceDocument'
                     description: Stored JSON document verbatim
                     headers:
+                        Access-Control-Allow-Origin:
+                            description: |
+                                `*` when the namespace's `read_role` is
+                                `public`. A published document is meant to be
+                                fetchable from anywhere, including a browser on
+                                an origin nobody here has heard of, and
+                                withholding the header protects nothing —
+                                server-to-server callers ignore CORS entirely —
+                                it only breaks the browser half of the
+                                audience.
+
+                                Private namespaces do not get it: they keep
+                                whatever the configured origin allow-list
+                                decides.
+                            schema:
+                                type: string
                         Cache-Control:
                             description: |
                                 `public, max-age=60` when the namespace's
@@ -381,9 +456,11 @@ paths:
                                 type: string
                         Vary:
                             description: |
-                                Always `Authorization`, on both public and
-                                private namespaces, because this URL answers
-                                differently with and without a token.
+                                Always contains `Authorization`, on both public
+                                and private namespaces, because this URL answers
+                                differently with and without a token. It may
+                                also contain `Origin` when the request carried
+                                an `Origin` header.
                             schema:
                                 type: string
                         X-Read-Role:
@@ -542,6 +619,76 @@ paths:
             summary: Update namespace ACL (admin-only)
             tags:
                 - admin
+    /api/v1/config/namespaces/{ns}/audit:
+        get:
+            description: |
+                Returns the namespace's recorded ACL and lifecycle history,
+                oldest first: its creation, every change to `read_role` or
+                `write_role`, and its deletion. Document writes are not
+                audited and document bodies are never recorded — the trail
+                answers "who changed the access rules", not "what was in it".
+
+                Admin-only, **even when the namespace is public**. A document
+                and its history are different things, and publishing the one
+                does not publish the other. Every operation this trail records
+                is admin-only already, so anything weaker here would leak more
+                through the history than through the resource itself. A user
+                token gets 403, and so does a service token
+                (client_credentials `at+jwt`), which is pinned to `user` role.
+                An anonymous request gets 401.
+
+                An unknown or already-deleted namespace answers 200 with an
+                empty array rather than 404. Audit entries outlive the
+                namespace they describe, and "what happened to the one that is
+                no longer here" is precisely what this endpoint answers — so
+                there is no 404 response for this operation.
+            operationId: getNamespaceAudit
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                items:
+                                    $ref: '#/components/schemas/AuditEntry'
+                                type: array
+                    description: |
+                        Recorded history, oldest first. An empty array when the
+                        namespace has no history, never existed, or has been
+                        deleted.
+                    headers:
+                        Cache-Control:
+                            description: |
+                                Always `private, no-store`, on public and
+                                private namespaces alike. The history of a
+                                public namespace is not itself public, so this
+                                response is never shared-cacheable and never
+                                carries a wildcard
+                                `Access-Control-Allow-Origin`.
+                            schema:
+                                type: string
+                "400":
+                    $ref: '#/components/responses/BadRequest'
+                "401":
+                    $ref: '#/components/responses/Unauthorized'
+                "403":
+                    $ref: '#/components/responses/Forbidden'
+                "500":
+                    $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
+            summary: Read namespace ACL history (admin-only)
+            tags:
+                - admin
+        parameters:
+            - description: |
+                Namespace name. Need not currently exist — history outlives the
+                namespace it describes.
+              in: path
+              name: ns
+              required: true
+              schema:
+                pattern: ^[a-z0-9_-]{1,64}$
+                type: string
     /healthz:
         get:
             responses:
