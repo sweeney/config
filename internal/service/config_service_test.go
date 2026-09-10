@@ -805,3 +805,60 @@ func TestUpdateACL_RejectedPublishLeavesNoAuditEntry(t *testing.T) {
 	require.NoError(t, aerr)
 	assert.Len(t, entries, 1, "only the create")
 }
+
+// --- reading the audit trail ---
+
+func TestListAudit_AdminOnly(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	for name, caller := range map[string]service.Caller{"user": user, "anonymous": anon} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.ListAudit(caller, "tariffs")
+			assert.ErrorIs(t, err, service.ErrConfigForbidden,
+				"the trail says who changed what and confirms the namespace exists")
+		})
+	}
+
+	entries, err := svc.ListAudit(admin, "tariffs")
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+}
+
+// TestListAudit_ReadRoleDoesNotGrantIt: a public namespace is world-readable,
+// but its history is not. Read access to a document says nothing about who
+// may see who has been changing its access rules.
+func TestListAudit_ReadRoleDoesNotGrantIt(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	_, err := svc.ListAudit(anon, "tariffs")
+	assert.ErrorIs(t, err, service.ErrConfigForbidden)
+}
+
+// TestListAudit_SurvivesDeletion is the case the trail exists for: "what
+// happened to the namespace that is no longer here". A not-found here would
+// destroy exactly the answer being asked for.
+func TestListAudit_SurvivesDeletion(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "temp", "user", "user")
+	require.NoError(t, svc.Delete(admin, "temp"))
+
+	entries, err := svc.ListAudit(admin, "temp")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	assert.Equal(t, domain.AuditActionDelete, entries[1].Action)
+}
+
+func TestListAudit_UnknownNamespaceIsEmptyNotNotFound(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	entries, err := svc.ListAudit(admin, "nosuchns")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestListAudit_InvalidName(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.ListAudit(admin, "BAD NAME")
+	assert.ErrorIs(t, err, service.ErrConfigInvalidName)
+}

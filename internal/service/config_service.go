@@ -233,6 +233,30 @@ func (s *ConfigService) UpdateACL(caller Caller, name string, in UpdateACLInput)
 	return nil
 }
 
+// ListAudit returns a namespace's recorded history, oldest first.
+//
+// Admin-only, and deliberately not gated by the namespace's read role: the
+// document and its history are different things. A public namespace is
+// world-readable, but who has been changing its access rules, and when it
+// became public, is operational detail — and every operation the trail
+// records is admin-only already, so anything weaker would leak more through
+// the history than through the resource.
+//
+// An unknown namespace returns an empty history rather than not-found.
+// Entries outlive the namespace they describe, so "what happened to the one
+// that is no longer here" is precisely the question this answers, and a
+// not-found would destroy it. Nothing leaks by doing so — the caller is
+// already an admin, who may list every namespace anyway.
+func (s *ConfigService) ListAudit(caller Caller, name string) ([]domain.AuditEntry, error) {
+	if caller.Role != domain.ConfigRoleAdmin {
+		return nil, ErrConfigForbidden
+	}
+	if !configNameRE.MatchString(name) {
+		return nil, ErrConfigInvalidName
+	}
+	return s.repo.ListAudit(name)
+}
+
 func (s *ConfigService) Delete(caller Caller, name string) error {
 	if caller.Role != domain.ConfigRoleAdmin {
 		return ErrConfigForbidden
