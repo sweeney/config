@@ -19,7 +19,7 @@ func Open(path string) (*Database, error) {
 
 	// Schema steps that cannot be expressed as re-runnable SQL migrations.
 	// See schema.go for why this lives here rather than in db/migrations/.
-	if err := ensurePublicReadRole(database.DB()); err != nil {
+	if err := ensurePublicReadRole(database.DB(), path); err != nil {
 		database.Close()
 		return nil, err
 	}

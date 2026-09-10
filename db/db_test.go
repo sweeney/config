@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -311,4 +312,133 @@ func TestOpen_WriteRoleStillRejectsPublic(t *testing.T) {
 	err = insertNamespace(database.DB(), "ns-bad", "admin", "public")
 	require.Error(t, err, "write_role='public' must remain illegal")
 	assert.Contains(t, err.Error(), "CHECK constraint failed")
+}
+
+// --- migration safety ---
+//
+// The rebuild is the one genuinely destructive thing this service does to its
+// own data. These tests are about what happens when it goes wrong, which the
+// happy-path tests above deliberately do not cover.
+
+func snapshotFiles(t *testing.T, dbPath string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(dbPath + ".pre-public-rebuild-*")
+	require.NoError(t, err)
+	return matches
+}
+
+// TestOpen_RebuildWritesRestorableSnapshot: the snapshot has to be a usable
+// database, not just a file that exists. It is written with VACUUM INTO
+// rather than copied because the database is in WAL mode, where a plain file
+// copy can miss committed data still sitting in the write-ahead log.
+func TestOpen_RebuildWritesRestorableSnapshot(t *testing.T) {
+	path := newOldSchemaDB(t)
+	raw := rawOpen(t, path)
+	require.NoError(t, insertNamespace(raw, "houses", "admin", "admin"))
+	require.NoError(t, insertNamespace(raw, "mqtt", "user", "admin"))
+	require.NoError(t, raw.Close())
+
+	database, err := db.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
+
+	snaps := snapshotFiles(t, path)
+	require.Len(t, snaps, 1, "exactly one pre-rebuild snapshot")
+
+	// The snapshot must still be the OLD schema — it is the thing you restore
+	// to undo the migration, so it has to predate it.
+	snap := rawOpen(t, snaps[0])
+	var ddl string
+	require.NoError(t, snap.QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
+	assert.NotContains(t, ddl, "'public'", "the snapshot is the pre-migration schema")
+
+	var names []string
+	rows, err := snap.Query("SELECT name FROM config_namespaces ORDER BY name")
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		require.NoError(t, rows.Scan(&n))
+		names = append(names, n)
+	}
+	assert.Equal(t, []string{"houses", "mqtt"}, names, "every row is in the snapshot")
+}
+
+// TestOpen_FreshDatabaseWritesNoSnapshot: a fresh install rebuilds an empty
+// table, and snapshotting nothing is just litter in the data directory.
+func TestOpen_FreshDatabaseWritesNoSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.db")
+	database, err := db.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
+
+	assert.Empty(t, snapshotFiles(t, path), "nothing to lose, nothing to snapshot")
+}
+
+// TestOpen_AbortsWhenSnapshotCannotBeWritten is the ordering guarantee: if we
+// cannot take the backup, we must not perform the migration. A database left
+// un-migrated is recoverable; one migrated with no way back is not.
+func TestOpen_AbortsWhenSnapshotCannotBeWritten(t *testing.T) {
+	path := newOldSchemaDB(t)
+	raw := rawOpen(t, path)
+	require.NoError(t, insertNamespace(raw, "houses", "admin", "admin"))
+	require.NoError(t, raw.Close())
+
+	// Pin the clock so the snapshot path is predictable, then occupy that
+	// path with a directory so VACUUM INTO cannot create the file.
+	at := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	db.SetSnapshotClock(t, at)
+	blocked := path + ".pre-public-rebuild-" + at.Format("20060102T150405Z")
+	require.NoError(t, os.Mkdir(blocked, 0o755))
+
+	_, err := db.Open(path)
+	require.Error(t, err, "Open must fail rather than migrate without a snapshot")
+	assert.Contains(t, err.Error(), "snapshot")
+
+	// And the database must be exactly as it was.
+	after := rawOpen(t, path)
+	var ddl string
+	require.NoError(t, after.QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
+	assert.NotContains(t, ddl, "'public'", "schema untouched")
+	var n int
+	require.NoError(t, after.QueryRow("SELECT COUNT(*) FROM config_namespaces").Scan(&n))
+	assert.Equal(t, 1, n, "data untouched")
+}
+
+// TestOpen_RebuildRollsBackOnFailure: the whole rebuild runs in one
+// transaction so a failure part-way leaves the database wholly un-migrated
+// rather than half-migrated. The failure is injected with a view occupying
+// the rebuild table's name — DROP TABLE refuses to drop a view — which is an
+// arbitrary fault, but the point is that ANY fault mid-rebuild is survivable.
+func TestOpen_RebuildRollsBackOnFailure(t *testing.T) {
+	path := newOldSchemaDB(t)
+	raw := rawOpen(t, path)
+	require.NoError(t, insertNamespace(raw, "houses", "admin", "admin"))
+	require.NoError(t, insertNamespace(raw, "mqtt", "user", "admin"))
+	_, err := raw.Exec(
+		"CREATE VIEW config_namespaces_rebuild_public AS SELECT 1 AS x")
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	_, err = db.Open(path)
+	require.Error(t, err, "a failed rebuild must surface, not be swallowed")
+
+	after := rawOpen(t, path)
+	var ddl string
+	require.NoError(t, after.QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
+	assert.NotContains(t, ddl, "'public'", "schema rolled back")
+
+	var names []string
+	rows, qerr := after.Query("SELECT name FROM config_namespaces ORDER BY name")
+	require.NoError(t, qerr)
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		require.NoError(t, rows.Scan(&n))
+		names = append(names, n)
+	}
+	assert.Equal(t, []string{"houses", "mqtt"}, names, "no rows lost to the failed rebuild")
 }

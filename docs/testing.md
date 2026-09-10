@@ -128,6 +128,14 @@ It is also the only layer where two guarantees can be tested honestly:
 - **The schema rebuild** in `db/schema.go` — that an old-schema database is
   widened in place, that every column of every pre-existing row survives,
   that the index is recreated, and that a second `Open` does not rebuild.
+- **What the rebuild does when it goes wrong**, which is the part worth
+  having: that the pre-rebuild snapshot is a restorable database carrying
+  the *old* schema and every row; that a snapshot which cannot be written
+  aborts the migration and leaves the database untouched, rather than
+  migrating with no way back; and that a fault injected mid-rebuild rolls
+  back to a wholly un-migrated database with no rows lost. The clock used to
+  name snapshots is pinned through `db/export_test.go` so the failure case
+  can occupy the path in advance.
 - **Audit atomicity** — that a mutation which fails takes its audit row with
   it. The role `CHECK` constraint is the failure injector, so the rollback
   is a real database rollback. A fake cannot assert this: both writes happen
