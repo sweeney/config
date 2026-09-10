@@ -203,6 +203,29 @@ A manual Cloudflare cache purge for the URL is the only way to shorten
 that window at the edge — nothing in the config service does it for you.
 Browser caches you cannot purge at all.
 
+### Public reads carry a wildcard CORS header
+
+A `GET` of a `read_role: public` namespace also answers with
+`Access-Control-Allow-Origin: *`. Nothing else does: private namespaces
+keep the allow-list configured in `CORS_ORIGINS`, and so does every
+write path.
+
+The reasoning is the same as the shared-cache header above. A published
+document is meant to be fetchable from anywhere, including a browser on
+an origin this service has never heard of. Withholding the header
+protects nothing, because a server-to-server caller ignores CORS
+entirely — it only breaks the browser half of the audience, which is
+the half least able to work around it. So the wildcard is scoped
+exactly to what an admin deliberately published, and to nothing else.
+
+The practical consequence is worth stating plainly: a public namespace
+can be fetched straight from front-end JavaScript on any site in the
+world, with no token and without anyone adding that site to
+`CORS_ORIGINS`. That is the intended behaviour — and it is one more
+reason to read [What to publish](#what-to-publish) before you publish
+anything, because "readable by anyone who knows the name" now includes
+"readable by a script on a page you have never seen".
+
 ### Public reads survive an identity outage
 
 An anonymous read verifies no token, so it never touches JWKS. While
@@ -270,8 +293,72 @@ Three deliberate limits, worth knowing before you rely on it:
   deletion, which is the single event most worth keeping — or block the
   delete outright. The trail has to outlive the thing it describes.
 
-There is no API and no SPA view for it yet. Query it with `sqlite3` on
-the host:
+### Reading it over the API
+
+`GET /api/v1/config/namespaces/{ns}/audit` returns one namespace's
+history as a JSON array, oldest first:
+
+```bash
+curl -s https://config.example.com/api/v1/config/namespaces/tariffs/audit \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+[
+  {
+    "action":         "create",
+    "new_read_role":  "user",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-01T09:14:02.113Z"
+  },
+  {
+    "action":         "acl_change",
+    "old_read_role":  "user",
+    "old_write_role": "admin",
+    "new_read_role":  "public",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-04T11:02:47.906Z"
+  }
+]
+```
+
+The old roles are absent on a `create` and the new roles on a `delete`,
+which is the same thing the empty columns say below — absent rather than
+empty, because there was no previous ACL and no resulting one. (The JSON
+keys are `old_read_role` / `new_read_role`; the columns they come from
+are `old_read` / `new_read`.)
+
+**Admin-only, including when the namespace is public.** Publishing a
+document does not publish its history. A document and its history are
+different things, and every operation the trail records — create, ACL
+change, delete — is admin-only already, so anything weaker here would
+leak more through the history than through the resource itself. A `user`
+token gets `403`, a service token gets `403` (service tokens are pinned
+to the `user` role), and no token at all gets `401` — even on a
+namespace anyone in the world can read anonymously.
+
+The response carries `Cache-Control: private, no-store` and no wildcard
+origin, unlike the public document reads it may be describing.
+
+**An unknown or deleted namespace returns `200 []`, not `404`.** This is
+not the no-existence-leak rule bending: the caller is an admin, who can
+list every namespace anyway, so there is nothing here to leak. It is the
+trail outliving the thing it describes, the same reason there is no
+foreign key. *What happened to the namespace that is no longer here* is
+exactly what this endpoint is for, and a `404` would withhold the answer
+for precisely the namespaces where it matters most.
+
+The admin SPA shows the same history in its namespace view, so the
+routine "who published this, and when?" question needs neither a curl
+nor a shell on the host.
+
+### Direct access with `sqlite3`
+
+The table is still queryable on the box, and that is the route to reach
+for when you are already there, when the service is down, or when the
+question spans namespaces — the API answers for one namespace at a time.
 
 ```bash
 sudo -u config sqlite3 -header -column /var/lib/config/config.db \
@@ -288,8 +375,8 @@ at                          action      old_read  new_read  actor
 2026-09-04T11:02:47.906Z    acl_change  user      public    usr_01H8…
 ```
 
-The question this table exists to answer — when did anything become
-public, and who did it:
+The cross-namespace question — when did *anything* become public, and
+who did it — has no API equivalent for that reason:
 
 ```bash
 sudo -u config sqlite3 -header -column /var/lib/config/config.db \

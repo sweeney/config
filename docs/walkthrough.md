@@ -241,7 +241,8 @@ Content-Type: application/json
 X-Read-Role: public
 X-Write-Role: admin
 Cache-Control: public, max-age=60
-Vary: Authorization
+Access-Control-Allow-Origin: *
+Vary: Origin, Authorization
 
 {"standing":0.51,"unit":0.24}
 ```
@@ -251,6 +252,14 @@ document without touching the service — and it is also the revoke
 latency, see section 12. Everything non-public keeps
 `private, no-store`. `Vary: Authorization` is on both, because this URL
 answers differently with and without a token.
+
+`Access-Control-Allow-Origin: *` appears only for a `read_role: public`
+namespace; private ones keep whatever `CORS_ORIGINS` allows. A published
+document is meant to be fetchable from anywhere, and withholding the
+header would protect nothing — a server-to-server caller ignores CORS
+entirely, so the only thing it stops is a browser. This document can
+therefore be fetched from front-end JavaScript on any site, with no
+token and no `CORS_ORIGINS` entry.
 
 A private namespace, anonymously — `mqtt_topics` is `admin`/`admin`
 after section 8:
@@ -345,7 +354,101 @@ curl -s -X PATCH $CFG/api/v1/config/namespaces/tariffs \
 {"error":"invalid_role","message":"read_role must be 'admin', 'user' or 'public'; write_role must be 'admin' or 'user'; and read_role may be no stronger than write_role"}
 ```
 
-## 13. Error shapes
+## 13. Audit trail
+
+`tariffs` has been created (section 10), published (10) and revoked
+(12). The trail has all three, oldest first:
+
+```bash
+curl -s $CFG/api/v1/config/namespaces/tariffs/audit \
+  -H "Authorization: Bearer $ADMIN_TOK"
+```
+
+`HTTP 200`
+
+```json
+[
+  {"action":"create","new_read_role":"user","new_write_role":"admin",
+   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.101Z"},
+  {"action":"acl_change","old_read_role":"user","old_write_role":"admin",
+   "new_read_role":"public","new_write_role":"admin",
+   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.402Z"},
+  {"action":"acl_change","old_read_role":"public","old_write_role":"admin",
+   "new_read_role":"user","new_write_role":"admin",
+   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.688Z"}
+]
+```
+
+The old roles are absent on a `create`, the new roles on a `delete`. The
+document writes in sections 6 and 7 left no rows at all — the trail
+records who changed the rules, never what was in the document.
+
+Admin-only, even though `tariffs` was public a moment ago: publishing a
+document does not publish its history. To see that, you need a non-admin
+token — create a `user` account and log in as it:
+
+```bash
+curl -s -X POST $ID/api/v1/users \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"username":"tourist","password":"touristpassword1","display_name":"tourist","role":"user"}'
+
+USER_TOK=$(curl -s -X POST $ID/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tourist","password":"touristpassword1"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+curl -s $CFG/api/v1/config/namespaces/tariffs/audit \
+  -H "Authorization: Bearer $USER_TOK"
+```
+
+`HTTP 403`
+
+```json
+{"error":"forbidden","message":"insufficient role for this operation"}
+```
+
+`403`, not the usual `404` — this endpoint has no existence to hide,
+because only an admin can reach it and an admin can list everything
+anyway. With no token at all it is `401`, public namespace or not.
+
+`houses` was deleted in section 9, and still has a history:
+
+```bash
+curl -s $CFG/api/v1/config/namespaces/houses/audit \
+  -H "Authorization: Bearer $ADMIN_TOK"
+```
+
+`HTTP 200`
+
+```json
+[
+  {"action":"create","new_read_role":"admin","new_write_role":"admin",
+   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:34.818Z"},
+  {"action":"delete","old_read_role":"admin","old_write_role":"admin",
+   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.002Z"}
+]
+```
+
+A name that never existed is an empty array, not a 404:
+
+```bash
+curl -s $CFG/api/v1/config/namespaces/no_such_thing/audit \
+  -H "Authorization: Bearer $ADMIN_TOK"
+```
+
+`HTTP 200`
+
+```json
+[]
+```
+
+Deliberate: entries outlive the namespace they describe, so *what
+happened to the one that is no longer here* is the question this
+endpoint exists to answer. A `404` for a deleted namespace would refuse
+it in exactly the case that matters. (A name that is not a legal
+namespace name is still `400 invalid_name`.)
+
+## 14. Error shapes
 
 ### Missing auth
 

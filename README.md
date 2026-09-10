@@ -55,9 +55,12 @@ and nothing else. A header that *is* present must still verify: a bad or
 expired token gets `401`, never a silent downgrade to an anonymous read.
 Every other endpoint requires a token.
 
-**Service tokens (client credentials) are rejected.** v1 accepts user tokens
-only. The `requireUserToken` middleware returns `403` if the token's `typ`
-header is `at+jwt` (the OAuth 2.0 service token type).
+**Service tokens (client credentials) are accepted, as `user`.** A token
+whose `typ` header is `at+jwt` (the OAuth 2.0 service token type) is verified
+like any other and pinned to the `user` role, whatever the client is
+otherwise entitled to. So a service token can read and write `user`
+namespaces but can never create, delete, change an ACL, or read an audit
+trail — those are admin-only, and no client-credentials grant reaches them.
 
 ### Token lifetime
 
@@ -147,6 +150,11 @@ normally, `public, max-age=60` for a `read_role: public` namespace so shared
 caches can serve it. `Vary: Authorization` is set either way — the same URL
 answers differently with and without a token, so a cache must never serve one
 response to the other.
+
+A `read_role: public` namespace also answers with
+`Access-Control-Allow-Origin: *`, so it can be fetched from browser JavaScript
+on any origin. Everything else keeps the `CORS_ORIGINS` allow-list. See
+[Client guidance](#client-guidance).
 
 ### Namespace names
 
@@ -251,10 +259,18 @@ Content-Type: application/json
 X-Read-Role: public
 X-Write-Role: admin
 Cache-Control: public, max-age=60
+Access-Control-Allow-Origin: *
 Vary: Authorization
 
 {"standing":0.51,"unit":0.24}
 ```
+
+The wildcard origin is part of publishing: a published document is meant to be
+fetchable from anywhere, including a browser on an origin this service has
+never heard of, and withholding the header would protect nothing because
+server-to-server callers ignore CORS entirely. A public namespace is therefore
+readable from front-end JavaScript on any site, with no token and no
+`CORS_ORIGINS` entry. Private namespaces do not get it.
 
 Anonymously, a private namespace and a namespace that does not exist return
 byte-identical `404`s, so the anonymous path cannot be used to enumerate what
@@ -404,6 +420,68 @@ same PATCH, or the combination is rejected with `400 invalid_role`.
 
 ---
 
+### `GET /api/v1/config/namespaces/{ns}/audit` — namespace history (admin only)
+
+Returns the namespace's recorded lifecycle changes as a JSON array, oldest
+first: one entry per `create`, `acl_change` and `delete`.
+
+```bash
+curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+[
+  {
+    "action":         "create",
+    "new_read_role":  "user",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-01T09:14:02.113Z"
+  },
+  {
+    "action":         "acl_change",
+    "old_read_role":  "user",
+    "old_write_role": "admin",
+    "new_read_role":  "public",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-04T11:02:47.906Z"
+  }
+]
+```
+
+| Field | Notes |
+|---|---|
+| `action` | `create`, `acl_change` or `delete` |
+| `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create` |
+| `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete` |
+| `actor` | Subject of the token that made the change |
+| `at` | RFC 3339 UTC, millisecond precision |
+
+**Admin-only, including when the namespace is `read_role: public`.** Publishing
+a document does not publish its history: every operation the trail records is
+admin-only already, so a weaker rule here would leak more through the history
+than through the resource. A `user` token gets `403`, so does a service token
+(pinned to the `user` role), and a request with no token gets `401` even on a
+public namespace. The response is `Cache-Control: private, no-store` and never
+carries a wildcard origin.
+
+**Document writes are not audited, and document bodies are never stored.** The
+trail answers *who changed the rules, and when* — never *what was in it*.
+
+**An unknown or deleted namespace returns `200 []`, not `404`.** Entries
+outlive the namespace they describe, and "what happened to the one that is no
+longer here" is exactly what this answers. Nothing leaks by doing so — the
+caller is already an admin, who can list every namespace anyway. A name that
+does not match `^[a-z0-9_-]{1,64}$` is still `400 invalid_name`.
+
+The admin SPA shows the same history in its namespace view. For direct
+`sqlite3` access on the host, and for questions that span namespaces, see
+**Audit trail** in `docs/admin.md`.
+
+---
+
 ## Error reference
 
 All errors use the same envelope:
@@ -422,10 +500,10 @@ All errors use the same envelope:
 | 401 | `unauthorized` | Missing `Authorization` header on an endpoint that requires one (everything except `GET /api/v1/config/{ns}`) |
 | 401 | `unauthorized` | Token expired, signature invalid, or wrong issuer — including on a public namespace, where a bad token is never downgraded to an anonymous read |
 | 403 | `account_disabled` | Token valid but the identity account is disabled |
-| 403 | `forbidden` | Service token presented (user token required) |
+| 403 | `forbidden` | Service token used for an admin-only operation — service tokens are pinned to the `user` role |
 | 403 | `forbidden` | Token carries a role the service does not recognise |
 | 403 | `forbidden` | Caller can read the namespace but their role doesn't satisfy `write_role` |
-| 403 | `forbidden` | Operation requires `admin` (create/delete/patch-acl) |
+| 403 | `forbidden` | Operation requires `admin` (create/delete/patch-acl, and reading a namespace's audit trail — which stays admin-only even when the namespace is `read_role: public`) |
 | 404 | `not_found` | Namespace missing, or caller lacks `read_role` — including an anonymous caller on any namespace that isn't `read_role: public` |
 | 409 | `conflict` | `POST /namespaces` with a name that already exists |
 | 413 | `document_too_large` | Stored document would exceed 64 KB |
@@ -471,11 +549,17 @@ readable without a token; nothing is ever anonymously writable.
 | `DELETE /api/v1/config/{ns}` | `admin` (regardless of namespace ACL) |
 | `POST /api/v1/config/namespaces` | `admin` |
 | `PATCH /api/v1/config/namespaces/{ns}` | `admin` |
+| `GET /api/v1/config/namespaces/{ns}/audit` | `admin`, even when the namespace is `read_role: public` |
 
 **No existence leak:** any operation by a caller who fails the `read_role`
 check returns **404**, never 403. Callers who satisfy `read_role` but fail
 `write_role` receive **403** (they already know the namespace exists from the
 GET).
+
+The audit endpoint sits outside that rule in both directions: a non-admin gets
+**403** rather than 404, and an admin asking about a namespace that does not
+exist gets **`200 []`** rather than 404. Neither leaks anything, because only
+admins reach it and admins can list every namespace anyway.
 
 ---
 
@@ -658,8 +742,14 @@ startups that need config often boot in parallel; this budget is intentionally
 higher than identity's 30 req/min to accommodate boot bursts.
 
 **CORS.** `PUT`, `PATCH`, `DELETE`, `POST` and `GET` against `/api/v1/*` paths
-include CORS headers when the request `Origin` is in the allowed list. The SPA
-admin UI (`/`, `/static/*`) has a separate, permissive CSP.
+include CORS headers when the request `Origin` is in the allowed list. The one
+exception is a `GET` of a `read_role: public` namespace, which answers
+`Access-Control-Allow-Origin: *` regardless of the origin — a published
+document is meant to be fetchable from anywhere, and withholding the header
+would only break browser callers, never server-to-server ones. You can fetch a
+public namespace from front-end JavaScript on any site with no token and no
+`CORS_ORIGINS` entry; nothing else is reachable that way. The SPA admin UI
+(`/`, `/static/*`) has a separate, permissive CSP.
 
 ---
 
