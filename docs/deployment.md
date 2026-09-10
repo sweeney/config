@@ -62,23 +62,93 @@ restarting is the whole procedure. What to know about it:
   would silently revert the schema and every public namespace would
   begin failing at the CHECK. Because `Open` re-checks, restores
   self-heal on the next start.
-- **Rolling back to the previous binary is safe, and fails closed.**
-  The old code ignores the widened CHECK — a constraint that permits
-  more than it used to breaks nothing — and its role check does not
-  recognise `public` at all. An unranked role satisfies nothing, so a
-  published namespace becomes admin-only under the old binary rather
-  than staying anonymously readable. Rolling forward again restores it.
+- **It takes its own backup first, and refuses to proceed without
+  one.** Before touching anything, it writes a consistent copy of the
+  database beside it as
+  `<DB_PATH>.pre-public-rebuild-<UTC timestamp>`, using SQLite's
+  `VACUUM INTO` rather than a file copy — the database runs in WAL
+  mode, where committed transactions may still be sitting in the `-wal`
+  file, so copying the main file alone can silently lose them. If the
+  snapshot cannot be written the service fails to start and the
+  database is left untouched: un-migrated is recoverable, migrated with
+  no way back is not. The timestamp means a second attempt can never
+  overwrite the first snapshot. An empty table is not snapshotted —
+  there is nothing to lose — which is why a fresh install leaves no
+  such file.
+- **It counts the rows it copied before dropping anything.** The copy
+  and the verification happen before the old table is dropped, so a
+  mismatch rolls the whole thing back with the original intact.
 
 The `config_audit` table (`db/migrations/002_config_audit.sql`) is an
 ordinary `CREATE TABLE IF NOT EXISTS` and needs no special handling; it
 appears on the first start after the deploy.
 
-Take the usual precaution of confirming a recent backup exists before
-the first deploy that performs the rebuild:
+### What it looks like in the journal
+
+`deploy.sh` tails `journalctl -u config` after restarting, which is
+where you confirm what happened. First start after the deploy:
+
+```
+config db: schema rebuild required for 14 row(s); snapshot written to
+  /var/lib/config/config.db.pre-public-rebuild-20260910T110956Z
+config db: schema rebuild complete — 14 row(s) migrated in 754µs
+```
+
+Every start after that:
+
+```
+config db: schema check — read_role already permits 'public', no rebuild needed
+```
+
+That second line is logged on every boot on purpose. Without it, a
+skipped rebuild and a binary that never checked look identical from the
+journal.
+
+If the rebuild fails, the service does not start: the error surfaces,
+the transaction rolls back, and `deploy.sh`'s `/healthz` gate fails the
+deploy. The database is left wholly un-migrated — not half-migrated —
+and the snapshot is still on disk.
+
+Confirming a recent R2 backup before the first deploy that performs the
+rebuild is still worth doing, since the snapshot is only as good as the
+disk it sits on:
 
 ```bash
 ./bin/config-server --list-backups | head
 ```
+
+### Rolling back
+
+Rolling back to the previous binary is safe and fails closed. This has
+been verified, not assumed — the pre-feature binary was run against a
+migrated, populated database:
+
+- It **starts normally**. The old `.sql` migrations are
+  `CREATE TABLE IF NOT EXISTS`, so re-running them does not revert the
+  widened CHECK.
+- A namespace with `read_role: public` becomes **admin-only**. The old
+  role check does not recognise `public`, and an unrecognised role
+  satisfies nothing, so a `user` token gets `404` and an anonymous
+  request gets `401`. It closes the door rather than opening it.
+- The old binary **refuses to write** `read_role: public` (400), so it
+  cannot create rows its own reader would not understand.
+- `config_audit` is left **untouched** — the old binary simply never
+  looks at it, and its rows are still there afterwards.
+- **Rolling forward again works**, including reading documents the old
+  binary wrote while it was in place.
+
+So the sequence is just: deploy the previous binary, restart, done.
+There is no schema step to undo. Restoring the pre-rebuild snapshot is
+**not** required and generally should not be done — it would discard
+every write made since the migration.
+
+One thing a rollback does cost, which is worth writing down at the
+time: **the audit trail gains a silent gap.** The old binary does not
+write `config_audit` rows, so any namespace created, ACL changed, or
+namespace deleted while rolled back leaves no trace, and nothing marks
+the discontinuity. Someone reading a namespace's history later sees an
+unbroken sequence that quietly omits that window. If you roll back,
+note the start and end times somewhere the next person will find them.
 
 ## First-time install on a new host
 
