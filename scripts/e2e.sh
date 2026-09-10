@@ -313,7 +313,25 @@ check_contains "anonymous read returns the document" "0.24" "$BODY"
 
 HDRS=$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/tariffs")
 check_contains "public namespace is shared-cacheable" "max-age=60" "$HDRS"
-check_contains "Vary: Authorization set on public read" "Vary: Authorization" "$HDRS"
+# Asserted on the header's value, not on the literal line: the CORS
+# middleware sets Vary: Origin before any handler runs, so the real header is
+# "Origin, Authorization" and matching the whole line would miss it. Both
+# values must survive — dropping Origin would let a shared cache serve a
+# response to an origin it was not built for.
+VARY=$(echo "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="vary"{print $2}')
+check_contains "Vary lists Authorization" "Authorization" "$VARY"
+check_contains "Vary still lists Origin from the CORS middleware" "Origin" "$VARY"
+
+# Matched exactly rather than with check_contains: "Origin: *" as a grep
+# pattern means "Origin:" followed by any number of spaces, which would pass
+# whether or not the asterisk were there.
+acao() {
+  curl -s -D - -o /dev/null "$@" | tr -d '\r' \
+    | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}'
+}
+check "public read allows any origin" "*" "$(acao "$CFG_BASE/api/v1/config/tariffs")"
+check "private read does not" "" \
+  "$(acao -H "Authorization: Bearer $ADMIN_TOK" "$CFG_BASE/api/v1/config/houses")"
 
 # A private namespace and a nonexistent one must be indistinguishable, or the
 # 404 becomes an existence oracle for anonymous callers.
@@ -386,12 +404,67 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
   -d '{"read_role":"admin","write_role":"admin"}')
 check "public -> admin read with admin write = 200" "200" "$STATUS"
 
-# ── 12. SPA logout revokes the refresh token ──────────────────────────
+# ── 12. Audit trail ──────────────────────────────────────────────────
+echo
+echo "=== 12. Audit trail ==="
+
+# 'tariffs' was created public and then locked down to admin, so its history
+# is exactly the transition an operator would come here looking for.
+R=$(curl -s "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" \
+  -H "Authorization: Bearer $ADMIN_TOK" -w '\n%{http_code}')
+STATUS=$(echo "$R" | tail -n1)
+BODY=$(echo "$R" | sed '$d')
+check "admin GET audit = 200" "200" "$STATUS"
+check_contains "history records the create" '"action":"create"' "$BODY"
+check_contains "history records the ACL change" '"action":"acl_change"' "$BODY"
+check_contains "history records the role it moved away from" '"old_read_role":"public"' "$BODY"
+check_contains "history records who did it" '"actor"' "$BODY"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" \
+  -H "Authorization: Bearer $USER_TOK")
+check "user GET audit = 403" "403" "$STATUS"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  "$CFG_BASE/api/v1/config/namespaces/tariffs/audit")
+check "anonymous GET audit = 401" "401" "$STATUS"
+
+# Publishing a document does not publish its history: a namespace anyone can
+# read is still admin-only on the trail.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$CFG_BASE/api/v1/config/namespaces" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"pubaudit","read_role":"public","write_role":"admin","document":{"a":1},"confirm_public":"pubaudit"}')
+check "create public 'pubaudit' = 201" "201" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config/pubaudit")
+check "its document reads anonymously = 200" "200" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  "$CFG_BASE/api/v1/config/namespaces/pubaudit/audit")
+check "its history does not = 401" "401" "$STATUS"
+
+# The trail outlives the namespace — that is the whole point of it having no
+# foreign key.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X DELETE "$CFG_BASE/api/v1/config/pubaudit" -H "Authorization: Bearer $ADMIN_TOK")
+check "deleted 'pubaudit' = 204" "204" "$STATUS"
+R=$(curl -s "$CFG_BASE/api/v1/config/namespaces/pubaudit/audit" \
+  -H "Authorization: Bearer $ADMIN_TOK" -w '\n%{http_code}')
+check "history survives the delete = 200" "200" "$(echo "$R" | tail -n1)"
+check_contains "and records the deletion" '"action":"delete"' "$(echo "$R" | sed '$d')"
+
+# A namespace that never existed is an empty history, not a 404 — asking
+# about one that is gone is the reason this endpoint exists.
+R=$(curl -s "$CFG_BASE/api/v1/config/namespaces/neverexisted/audit" \
+  -H "Authorization: Bearer $ADMIN_TOK" -w '\n%{http_code}')
+check "unknown namespace audit = 200" "200" "$(echo "$R" | tail -n1)"
+check "unknown namespace audit is an empty array" "[]" "$(echo "$R" | sed '$d')"
+
+# ── 13. SPA logout revokes the refresh token ──────────────────────────
 # Regression: the SPA used to call /api/v1/auth/logout without an
 # Authorization header — silently 401'd. This test uses the same call
 # shape the SPA now uses and asserts the refresh token is dead server-side.
 echo
-echo "=== 12. SPA logout revokes refresh token ==="
+echo "=== 13. SPA logout revokes refresh token ==="
 LOGOUT_LOGIN=$(curl -s -X POST "$ID_BASE/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}")
@@ -431,9 +504,9 @@ POST_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ID_BASE/api/v1/au
   -d "{\"refresh_token\":\"$LOGOUT_REFRESH\"}")
 check "refresh fails after logout (token revoked)" "401" "$POST_STATUS"
 
-# ── 13. Cleanup ──────────────────────────────────────────────────────
+# ── 14. Cleanup ──────────────────────────────────────────────────────
 echo
-echo "=== 13. Cleanup ==="
+echo "=== 14. Cleanup ==="
 if [ -n "$USER_ID" ]; then
   STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -X DELETE "$ID_BASE/api/v1/users/$USER_ID" \

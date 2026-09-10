@@ -7,7 +7,9 @@ identity-issued JWT tokens. `public` is a read role only: a namespace with
 `read_role: public` is readable with no token at all, but nothing is ever
 anonymously writable, and `GET /api/v1/config` (list) always requires a
 token. Publishing a namespace requires echoing its name back in
-`confirm_public`; see **Public namespaces** in `docs/admin.md`.
+`confirm_public`; see **Public namespaces** in `docs/admin.md`. Namespace
+creates, ACL changes and deletes are recorded in a `config_audit` table,
+readable by admins at `GET /api/v1/config/namespaces/{ns}/audit`.
 
 ## What it does
 

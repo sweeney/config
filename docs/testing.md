@@ -99,6 +99,12 @@ Key things tested:
   `ErrKeysUnavailable`, and a presented token still getting `503`
 - `Cache-Control` following the read role, `Vary: Authorization` on both
 - That no route other than the single-namespace GET became anonymous
+- `Access-Control-Allow-Origin: *` on a public namespace and not on a
+  private one, and that the handler appends to `Vary` rather than replacing
+  the value the CORS middleware set upstream
+- The audit endpoint being admin-only even when the namespace is public,
+  refusing service tokens, and returning an empty array rather than
+  not-found for a namespace that never existed or has been deleted
 
 ### 3. Integration tests (`db/`, `internal/store/`)
 
