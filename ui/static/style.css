@@ -196,6 +196,44 @@ input[type="text"]:focus, select:focus, textarea:focus {
 .publish-confirm label { margin-top: 0.75rem; }
 .publish-confirm input[type="text"] { background: var(--bg); }
 
+/* Audit history — collapsed by default, see auditSection() in app.js. */
+.audit .button-row { margin-top: 0; }
+.audit .button-row .form-help { margin-top: 0; }
+.audit-body { margin-top: 1rem; }
+.audit-body > .form-help { margin-bottom: 0.5rem; }
+.audit-list { list-style: none; }
+.audit-entry {
+    padding: 0.55rem 0.75rem;
+    margin-bottom: 0.4rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+/* A namespace becoming world-readable is the line an operator scanning this
+   list is looking for, so it carries the same amber as the `public` badge and
+   the publish confirmation rather than a colour of its own. */
+.audit-entry.published {
+    background: var(--public-bg);
+    border-color: var(--public);
+}
+.audit-what   { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.audit-change { display: inline-flex; align-items: center; gap: 0.3rem; }
+.audit-field  { font-size: 0.85rem; color: var(--text-muted); }
+.audit-arrow  { color: var(--text-muted); }
+.audit-verb   { font-size: 0.9rem; }
+.audit-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+.audit-meta code { background: none; padding: 0; font-size: 0.95em; color: inherit; }
+.audit-at { cursor: help; }
+
 /* JSON editor */
 .editor-wrap {
     border: 1px solid var(--border);

@@ -17,6 +17,12 @@
   const LOGOUT_BTN = document.getElementById('logout-btn');
   const TOAST      = document.getElementById('toast');
 
+  // The signed-in user's identity record (identity's /api/v1/auth/me), fetched
+  // once during bootstrap — before the first route() — so views can gate on
+  // role without a call of their own. Stays null when that lookup failed;
+  // callers must treat null as "unknown", not as "not an admin".
+  let ME = null;
+
   // ── helpers ────────────────────────────────────────────────────────
   function el(tag, attrs, children) {
     const e = document.createElement(tag);
@@ -51,8 +57,28 @@
     return d.toLocaleString();
   }
 
+  // fmtTime restates a timestamp in the viewer's zone, which is right for
+  // "updated <when>" on the list but wrong for an audit trail that may be read
+  // from another continent while comparing against server logs. Audit rows get
+  // this instead: the wire value, stamped UTC, with the local rendering parked
+  // on a title attribute for anyone who wants it.
+  function fmtUTC(s) {
+    if (!s) return '';
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) +
+      ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' UTC';
+  }
+
   function badge(role) {
     return el('span', { class: 'badge ' + role, text: role });
+  }
+  // Same badge, but tolerant of a role the API omitted (a `create` carries no
+  // old_* roles, a `delete` no new_* ones) so a malformed row renders a dash
+  // instead of the string "undefined" in a role-coloured pill.
+  function roleBadge(role) {
+    return role ? badge(role) : el('span', { class: 'badge', text: '—' });
   }
 
   // The API's own `message` is the right thing to show for most failures.
@@ -220,6 +246,158 @@
     };
   }
 
+  // ── audit history ──────────────────────────────────────────────────
+  //
+  // GET /namespaces/{ns}/audit is admin-only and answers `no-store`, so there
+  // is nothing to cache and nothing most visits want: #/edit/{ns} is opened to
+  // change a document far more often than to read its ACL history. The section
+  // therefore renders collapsed and fetches on first expand, keeping what it
+  // got until an ACL update in this view invalidates it.
+
+  // True only for the *transition* into public — the same distinction
+  // publishGuard makes, and for the same reason. A namespace that was already
+  // public before the change was not published by it, and a revoke is not a
+  // publish. `create` has no old_read_role, so creating straight into public
+  // counts; `delete` has no new_read_role, so it never does.
+  function publishesRead(item) {
+    return item.new_read_role === 'public' && item.old_read_role !== 'public';
+  }
+
+  function roleChange(label, from, to) {
+    return el('span', { class: 'audit-change' }, [
+      el('span', { class: 'audit-field', text: label }),
+      roleBadge(from),
+      el('span', { class: 'audit-arrow', text: '→' }),
+      roleBadge(to),
+    ]);
+  }
+
+  // A row's description, as nodes: what changed, in the operator's words
+  // rather than the wire's field names.
+  function auditWhat(item) {
+    if (item.action === 'create') {
+      return [
+        el('span', { class: 'audit-verb', text: 'created with' }),
+        el('span', { class: 'audit-change' }, [
+          el('span', { class: 'audit-field', text: 'read' }), roleBadge(item.new_read_role),
+        ]),
+        el('span', { class: 'audit-change' }, [
+          el('span', { class: 'audit-field', text: 'write' }), roleBadge(item.new_write_role),
+        ]),
+      ];
+    }
+    if (item.action === 'delete') {
+      return [el('span', { class: 'audit-verb', text: 'deleted' })];
+    }
+    if (item.action === 'acl_change') {
+      const parts = [];
+      // Only the roles that actually moved. A PATCH always sends both roles,
+      // so a write-only edit records an unchanged read role too; listing it
+      // would bury the one line that matters under a restatement.
+      if (item.old_read_role  !== item.new_read_role)  parts.push(roleChange('read role',  item.old_read_role,  item.new_read_role));
+      if (item.old_write_role !== item.new_write_role) parts.push(roleChange('write role', item.old_write_role, item.new_write_role));
+      if (parts.length) return parts;
+      return [el('span', { class: 'audit-verb', text: 'access control re-saved, no role changed' })];
+    }
+    // An action this build does not know about — a newer server, most likely.
+    // Show it rather than dropping the row on the floor.
+    return [el('span', { class: 'audit-verb', text: String(item.action || 'changed') })];
+  }
+
+  function auditRow(item) {
+    const published = publishesRead(item);
+    const what = el('div', { class: 'audit-what' }, auditWhat(item));
+    if (published) what.insertBefore(el('span', { class: 'badge public', text: 'published' }), what.firstChild);
+    const meta = el('div', { class: 'audit-meta' }, [
+      el('code', { class: 'audit-actor', text: item.actor || 'unknown actor' }),
+      el('span', { text: '·' }),
+      el('time', {
+        class:    'audit-at',
+        datetime: item.at || false,
+        title:    item.at ? fmtTime(item.at) + ' local time' : false,
+        text:     fmtUTC(item.at) || 'time unknown',
+      }),
+    ]);
+    return el('li', { class: published ? 'audit-entry published' : 'audit-entry' }, [what, meta]);
+  }
+
+  // Returns null when the section should not exist at all, otherwise
+  // { el, invalidate }.
+  function auditSection(name) {
+    // A known non-admin gets no panel rather than a panel that always 403s:
+    // the endpoint is admin-only whatever the namespace's ACL says, so for a
+    // user-role operator there is no state in which it could ever fill in.
+    // An *unknown* role still gets the panel — /auth/me failing on a network
+    // blip must not quietly hide an admin's audit trail — and falls back to
+    // the 403 note in load() if it turns out not to be an admin after all.
+    if (ME && ME.role !== 'admin') return null;
+
+    const toggle = el('button', { type: 'button', class: 'btn-secondary', text: 'Show history' });
+    const body   = el('div', { class: 'audit-body', hidden: true });
+    const wrap   = el('div', { class: 'card audit' }, [
+      el('div', { class: 'button-row' }, [
+        toggle,
+        el('span', { class: 'form-help', text: 'Who changed this namespace\u2019s access control, and when.' }),
+      ]),
+      body,
+    ]);
+
+    let open = false, loaded = false, loading = false;
+
+    function render(items) {
+      clear(body);
+      if (!items || items.length === 0) {
+        // Also what an unknown or already-deleted namespace looks like: the
+        // API answers `200 []` for those rather than 404.
+        body.appendChild(el('div', { class: 'empty', text: 'No recorded changes for this namespace.' }));
+        return;
+      }
+      body.appendChild(el('p', { class: 'form-help', text: 'Newest first. Times are UTC — hover a timestamp for local time.' }));
+      const ul = el('ul', { class: 'audit-list' });
+      // The API returns oldest-first; an operator opening this is asking
+      // "what happened to this namespace lately", so it reads newest-first.
+      for (let i = items.length - 1; i >= 0; i--) ul.appendChild(auditRow(items[i]));
+      body.appendChild(ul);
+    }
+
+    async function load() {
+      if (loading) return;
+      loading = true;
+      clear(body);
+      body.appendChild(el('div', { class: 'loading', text: 'Loading history…' }));
+      try {
+        const items = await ConfigAPI.audit(name);
+        loaded = true;
+        render(items);
+      } catch (err) {
+        // Deliberately not marked loaded: a 403 here means the role guess
+        // above was wrong, anything else is transient, and both are worth
+        // retrying if the operator collapses and re-expands.
+        clear(body);
+        body.appendChild(el('div', { class: 'empty', text: err.status === 403
+          ? 'History is visible to admins only.'
+          : 'Failed to load history: ' + err.message }));
+      } finally {
+        loading = false;
+      }
+    }
+
+    toggle.addEventListener('click', () => {
+      open = !open;
+      body.hidden = !open;
+      toggle.textContent = open ? 'Hide history' : 'Show history';
+      if (open && !loaded) load();
+    });
+
+    return {
+      el: wrap,
+      // Called after this view changes the ACL: the cached list is now a
+      // change behind. Refetch if the operator is looking, otherwise just
+      // drop it so the next expand goes back to the server.
+      invalidate: () => { loaded = false; if (open) load(); },
+    };
+  }
+
   function viewNew() {
     const root = el('div');
     root.appendChild(el('h1', { text: 'New namespace' }));
@@ -379,6 +557,7 @@
         if (aclGuard.publishing()) acl.confirm_public = aclGuard.value();
         await ConfigAPI.updateACL(name, acl);
         aclGuard.commit();
+        if (audit) audit.invalidate();
         toast('ACL updated');
       } catch (err) {
         aclErr.textContent = errText(err);
@@ -395,6 +574,14 @@
       aclErr,
     ]);
     root.appendChild(aclGrid);
+
+    // ─ History ─
+    // Null for a non-admin, who cannot read the audit endpoint at all.
+    const audit = auditSection(name);
+    if (audit) {
+      root.appendChild(el('h2', { text: 'History' }));
+      root.appendChild(audit.el);
+    }
 
     // ─ Delete ─
     root.appendChild(el('h2', { text: 'Danger zone' }));
@@ -482,6 +669,7 @@
         const meResp = await Auth.authedFetch(cfg.identity_url + '/api/v1/auth/me');
         if (meResp.ok) {
           const me = await meResp.json();
+          ME = me;
           USER_INFO.textContent = me.username + ' (' + me.role + ')';
         }
       } catch (e) {

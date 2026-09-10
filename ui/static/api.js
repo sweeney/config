@@ -58,5 +58,14 @@ window.ConfigAPI = (function () {
     delete:   async (ns) => check(await Auth.authedFetch(api('/' + encodeURIComponent(ns)), {
       method: 'DELETE',
     })),
+    // Admin-only, whatever the namespace's own ACL says — a public namespace
+    // does not have a public history. Non-admins get 403 (401 anonymously),
+    // surfaced here as err.status like any other failure.
+    //
+    // Entries come back oldest-first, and a namespace that never existed (or
+    // has since been deleted) answers `200 []` rather than 404: an empty array
+    // means "nothing recorded", never "no such namespace".
+    audit:    async (ns) => check(await Auth.authedFetch(
+      api('/namespaces/' + encodeURIComponent(ns) + '/audit'))),
   };
 })();
