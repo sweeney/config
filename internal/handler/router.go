@@ -8,6 +8,7 @@
 //	DELETE /api/v1/config/{ns}                 → delete namespace (admin-only)
 //	POST   /api/v1/config/namespaces           → create namespace (admin-only)
 //	PATCH  /api/v1/config/namespaces/{ns}      → update ACL (admin-only)
+//	GET    /api/v1/config/namespaces/{ns}/audit → ACL history (admin-only)
 //	GET    /healthz                            → unauth health probe
 //	GET    /openapi.json                       → OpenAPI spec as JSON
 //	GET    /openapi.yaml                       → OpenAPI spec as YAML
@@ -117,6 +118,9 @@ func NewRouter(d Deps) *Router {
 	mux.Handle("DELETE /api/v1/config/{ns}", authed(deleteHandler(d.Service)))
 	mux.Handle("POST /api/v1/config/namespaces", authed(createHandler(d.Service)))
 	mux.Handle("PATCH /api/v1/config/namespaces/{ns}", authed(updateACLHandler(d.Service)))
+	// Authenticated even for a public namespace: publishing a document does
+	// not publish its history.
+	mux.Handle("GET /api/v1/config/namespaces/{ns}/audit", authed(auditHandler(d.Service)))
 
 	if d.IdentityPublicURL != "" && d.OAuthClientID != "" {
 		mountSPA(mux, d.IdentityPublicURL, d.OAuthClientID)
@@ -280,12 +284,19 @@ func getHandler(svc *service.ConfigService) http.HandlerFunc {
 			// or a browser cache, so anonymous callers keep getting the old
 			// body until it expires. Keep it short.
 			w.Header().Set("Cache-Control", "public, max-age=60")
+			// A published document is meant to be fetched from anywhere,
+			// including a browser on an origin we have never heard of.
+			// Withholding this protects nothing — server-to-server callers
+			// ignore CORS entirely — it only breaks the browser half of the
+			// audience. Scoped to namespaces someone deliberately published;
+			// everything else keeps the configured origin allow-list.
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 		} else {
 			w.Header().Set("Cache-Control", "private, no-store")
 		}
 		// Kept on both: the same URL answers differently with and without a
 		// token, so a cache must not serve one to the other.
-		w.Header().Set("Vary", "Authorization")
+		addVary(w, "Authorization")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(got.Document)
 	}
@@ -406,12 +417,63 @@ func updateACLHandler(svc *service.ConfigService) http.HandlerFunc {
 	}
 }
 
+func auditHandler(svc *service.ConfigService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ns := r.PathValue("ns")
+		caller := callerFromRequest(r)
+		entries, err := svc.ListAudit(caller, ns)
+		if err != nil {
+			translateError(w, err)
+			return
+		}
+		type item struct {
+			Action string `json:"action"`
+			// Omitted rather than sent empty: a create has no previous ACL
+			// and a delete has no resulting one, and "absent" says that more
+			// honestly than an empty string.
+			OldReadRole  string `json:"old_read_role,omitempty"`
+			OldWriteRole string `json:"old_write_role,omitempty"`
+			NewReadRole  string `json:"new_read_role,omitempty"`
+			NewWriteRole string `json:"new_write_role,omitempty"`
+			Actor        string `json:"actor"`
+			At           string `json:"at"`
+		}
+		out := make([]item, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, item{
+				Action:       e.Action,
+				OldReadRole:  e.OldReadRole,
+				OldWriteRole: e.OldWriteRole,
+				NewReadRole:  e.NewReadRole,
+				NewWriteRole: e.NewWriteRole,
+				Actor:        e.Actor,
+				At:           e.At.UTC().Format("2006-01-02T15:04:05.000Z"),
+			})
+		}
+		// The history of a public namespace is not itself public.
+		w.Header().Set("Cache-Control", "private, no-store")
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
 // --- helpers ---
 
 func decodeBody(r *http.Request, into any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	return dec.Decode(into)
+}
+
+// addVary appends to Vary instead of replacing it. The CORS middleware in
+// cmd/server sets Vary: Origin before any handler runs, and a plain Set here
+// dropped it — which, now that public namespaces carry a max-age, could let
+// a shared cache serve a response to an origin it was not built for.
+func addVary(w http.ResponseWriter, value string) {
+	if existing := w.Header().Get("Vary"); existing != "" {
+		w.Header().Set("Vary", existing+", "+value)
+		return
+	}
+	w.Header().Set("Vary", value)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

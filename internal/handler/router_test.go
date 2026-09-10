@@ -185,6 +185,14 @@ func (r *fakeRepo) Create(ns *domain.ConfigNamespace) error {
 	}
 	c := *ns
 	r.data[ns.Name] = &c
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    ns.Name,
+		Action:       domain.AuditActionCreate,
+		NewReadRole:  ns.ReadRole,
+		NewWriteRole: ns.WriteRole,
+		Actor:        ns.UpdatedBy,
+		At:           ns.CreatedAt,
+	})
 	return nil
 }
 func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error {
@@ -242,14 +250,17 @@ func (r *fakeRepo) ListAudit(namespace string) ([]domain.AuditEntry, error) {
 	return r.audit.List(namespace), nil
 }
 
+// seed installs a namespace as if it had been created through the API.
+// It routes through Create rather than writing the map directly so the fake
+// records the same audit entry the real store would — otherwise a seeded
+// namespace has a history the production code path would never produce.
 func (r *fakeRepo) seed(name, readRole, writeRole, document string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now()
-	r.data[name] = &domain.ConfigNamespace{
+	_ = r.Create(&domain.ConfigNamespace{
 		Name: name, ReadRole: readRole, WriteRole: writeRole,
 		Document: []byte(document), CreatedAt: now, UpdatedAt: now,
-	}
+		UpdatedBy: "seed",
+	})
 }
 
 type fakeBackup struct{}
@@ -1232,4 +1243,150 @@ func TestCreate_PublicWriteRole_Returns400(t *testing.T) {
 	var env map[string]string
 	require.NoError(t, json.Unmarshal(body, &env))
 	assert.Equal(t, "invalid_role", env["error"])
+}
+
+// --- CORS on published namespaces ---
+
+// TestGet_PublicNamespaceAllowsAnyOrigin: a published document is meant to be
+// fetched from anywhere. Restricting browser origins on it is friction rather
+// than protection — anything server-side ignores CORS entirely — so a public
+// namespace answers any origin, as /openapi.json already does.
+func TestGet_PublicNamespaceAllowsAnyOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+}
+
+// TestGet_PrivateNamespaceDoesNotAllowAnyOrigin: the wildcard is scoped to
+// what was deliberately published. A private namespace keeps whatever the
+// origin allow-list decided.
+func TestGet_PrivateNamespaceDoesNotAllowAnyOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/internal", h.userTok, nil)
+	assert.NotEqual(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+}
+
+// TestGet_VaryPreservesUpstreamValues: the CORS middleware sets Vary: Origin
+// before the handler runs. The handler used to Set Vary outright, silently
+// dropping it — which with a shared cache and max-age on public namespaces
+// means a cached response could be served to an origin it was not built for.
+func TestGet_VaryPreservesUpstreamValues(t *testing.T) {
+	repo := newFakeRepo()
+	repo.seed("tariffs", "public", "user", `{}`)
+	router := handler.NewRouter(handler.Deps{
+		Service:  service.NewConfigService(repo, fakeBackup{}),
+		Verifier: newTestIssuer(t, "https://test"),
+		Version:  "test",
+	})
+	// Stand in for the securityHeaders middleware in cmd/server.
+	withVary := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "Origin")
+		router.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(withVary)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/api/v1/config/tariffs")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	vary := resp.Header.Values("Vary")
+	joined := strings.Join(vary, ", ")
+	assert.Contains(t, joined, "Origin", "the handler must not drop an upstream Vary")
+	assert.Contains(t, joined, "Authorization")
+}
+
+// --- audit endpoint ---
+
+func auditEntries(t *testing.T, body []byte) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	require.NoError(t, json.Unmarshal(body, &out))
+	return out
+}
+
+func TestAudit_AdminSeesHistory(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user", "confirm_public": "tariffs"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 2, "seeded create, then the publish")
+	assert.Equal(t, "acl_change", entries[1]["action"])
+	assert.Equal(t, "user", entries[1]["old_read_role"])
+	assert.Equal(t, "public", entries[1]["new_read_role"])
+	assert.Equal(t, "admin-1", entries[1]["actor"])
+	assert.NotEmpty(t, entries[1]["at"])
+	assert.NotContains(t, entries[0], "old_read_role", "a create has no previous ACL")
+}
+
+func TestAudit_NotCacheable(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "private, no-store", resp.Header.Get("Cache-Control"),
+		"the history of a public namespace is not itself public")
+	assert.NotEqual(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+}
+
+func TestAudit_RequiresAdmin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.userTok, nil)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestAudit_ServiceTokenForbidden(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", svcTok(h), nil)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"service tokens are pinned to user role and never read the trail")
+}
+
+// TestAudit_AnonymousRejectedEvenForPublicNamespace: publishing a document
+// does not publish its history.
+func TestAudit_AnonymousRejectedEvenForPublicNamespace(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	pub, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, pub.StatusCode, "the document itself is anonymous-readable")
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", "", nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestAudit_DeletedNamespaceKeepsItsHistory(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("temp", "user", "user", `{}`)
+	resp, _ := h.do("DELETE", "/api/v1/config/temp", h.adminTok, nil)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/temp/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 2)
+	assert.Equal(t, "delete", entries[1]["action"])
+	assert.Equal(t, "admin-1", entries[1]["actor"])
+}
+
+func TestAudit_UnknownNamespaceReturnsEmptyArray(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("GET", "/api/v1/config/namespaces/nosuchns/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `[]`, string(body), "never null — clients iterate it")
 }
