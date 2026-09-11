@@ -21,8 +21,22 @@ CREATE TABLE IF NOT EXISTS config_audit (
     new_write   TEXT,
     actor       TEXT NOT NULL,
     at          TEXT NOT NULL,
-    CHECK (action IN ('create', 'acl_change', 'delete'))
+    CHECK (action IN ('create', 'acl_change', 'delete')),
+    -- The role columns are constrained to the same values config_namespaces
+    -- allows. This is the artefact you reach for when reconstructing how a
+    -- namespace came to be public, so it is the last place that should be
+    -- able to hold a role the live table could not. NULL is permitted
+    -- throughout: a create has no previous ACL and a delete no resulting one.
+    CHECK (old_read  IS NULL OR old_read  IN ('admin', 'user', 'public')),
+    CHECK (new_read  IS NULL OR new_read  IN ('admin', 'user', 'public')),
+    CHECK (old_write IS NULL OR old_write IN ('admin', 'user')),
+    CHECK (new_write IS NULL OR new_write IN ('admin', 'user'))
 );
 
+-- (namespace, id) rather than (namespace, at): ListAudit filters on
+-- namespace and orders by id, so this lets the index supply the ordering
+-- instead of filtering with it and then sorting. id is also the column the
+-- ordering deliberately uses, because entries written within the same clock
+-- tick must keep their true order.
 CREATE INDEX IF NOT EXISTS idx_config_audit_namespace
-    ON config_audit(namespace, at);
+    ON config_audit(namespace, id);
