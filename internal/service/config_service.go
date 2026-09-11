@@ -207,25 +207,24 @@ func (s *ConfigService) UpdateACL(caller Caller, name string, in UpdateACLInput)
 		return ErrConfigInvalidRole
 	}
 
-	// Read the current ACL before deciding: the confirmation guards the
-	// transition into public, not the state of being public. Fetching it
-	// first also means a missing namespace reports as not-found rather than
-	// as a confirmation failure, so the guard is not an existence oracle.
-	oldReadRole, _, err := s.repo.GetACL(name)
-	if err != nil {
+	// The publish guard is evaluated by the repository, inside the same
+	// transaction as the write and against the row being overwritten.
+	// Deciding it here from a separately-read snapshot left a window: a
+	// concurrent revoke between the read and the write made a genuine publish
+	// look like an edit to an already-public namespace, and the confirmation
+	// was skipped on a request that did in fact publish.
+	//
+	// Not-found still beats the confirmation error, because the repository
+	// reads the row before it judges the transition — so the guard is not an
+	// existence oracle. It also costs one query fewer than it used to.
+	if err := s.repo.UpdateACL(
+		name, in.ReadRole, in.WriteRole, caller.Sub, s.now(), in.ConfirmPublic == name,
+	); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return ErrConfigNamespaceNotFound
 		}
-		return err
-	}
-	publishing := in.ReadRole == domain.ConfigRolePublic && oldReadRole != domain.ConfigRolePublic
-	if publishing && in.ConfirmPublic != name {
-		return ErrConfigPublicConfirmRequired
-	}
-
-	if err := s.repo.UpdateACL(name, in.ReadRole, in.WriteRole, caller.Sub, s.now()); err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return ErrConfigNamespaceNotFound
+		if errors.Is(err, domain.ErrPublishNotConfirmed) {
+			return ErrConfigPublicConfirmRequired
 		}
 		return err
 	}

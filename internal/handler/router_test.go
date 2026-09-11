@@ -207,12 +207,17 @@ func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string
 	ns.UpdatedAt = at
 	return nil
 }
-func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time) error {
+func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
 		return domain.ErrNotFound
+	}
+	// The same guard the real store applies, decided against the stored row.
+	if rRole == domain.ConfigRolePublic &&
+		ns.ReadRole != domain.ConfigRolePublic && !publishConfirmed {
+		return domain.ErrPublishNotConfirmed
 	}
 	r.audit.Record(domain.AuditEntry{
 		Namespace:    name,
@@ -1390,4 +1395,74 @@ func TestAudit_UnknownNamespaceReturnsEmptyArray(t *testing.T) {
 	resp, body := h.do("GET", "/api/v1/config/namespaces/nosuchns/audit", h.adminTok, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.JSONEq(t, `[]`, string(body), "never null — clients iterate it")
+}
+
+// --- review follow-ups: caching and disclosure on the namespace GET ---
+
+// TestGet_NotFoundCarriesCacheHeaders: 404 is heuristically cacheable
+// (RFC 9111 §4.2.2), and it is the only answer an anonymous caller ever gets
+// for a private namespace. Without these headers a shared cache can key the
+// anonymous 404 without regard to Authorization and replay it to a user who
+// can actually read that namespace.
+func TestGet_NotFoundCarriesCacheHeaders(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	for name, path := range map[string]string{
+		"private": "/api/v1/config/internal",
+		"missing": "/api/v1/config/nosuchns",
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp, _ := h.do("GET", path, "", nil)
+			require.Equal(t, http.StatusNotFound, resp.StatusCode)
+			assert.Equal(t, "private, no-store", resp.Header.Get("Cache-Control"),
+				"a cacheable 404 on a route that answers differently per token is a poisoning vector")
+			assert.Contains(t, resp.Header.Get("Vary"), "Authorization")
+		})
+	}
+}
+
+// TestGet_SharedCacheOnlyForAnonymousReads: Vary keeps a token-bearing read
+// of a public namespace correct, but marking it shared-cacheable stores a
+// copy per distinct token and hands a shared cache a response served to an
+// identified principal. Only the genuinely anonymous answer earns that.
+func TestGet_SharedCacheOnlyForAnonymousReads(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "public, max-age=60", anon.Header.Get("Cache-Control"))
+
+	authed, _ := h.do("GET", "/api/v1/config/tariffs", h.userTok, nil)
+	assert.Equal(t, "private, no-store", authed.Header.Get("Cache-Control"),
+		"an authenticated read is not shared-cacheable, even of a public namespace")
+}
+
+// TestGet_AnonymousIsNotToldTheWriteRole: that a plain user token suffices to
+// write is a nudge toward where to point a stolen one, and nobody without a
+// token can act on it. The read role is self-evident from the read having
+// succeeded.
+func TestGet_AnonymousIsNotToldTheWriteRole(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "public", anon.Header.Get("X-Read-Role"))
+	assert.Empty(t, anon.Header.Get("X-Write-Role"), "not disclosed to an anonymous caller")
+
+	authed, _ := h.do("GET", "/api/v1/config/tariffs", h.userTok, nil)
+	assert.Equal(t, "user", authed.Header.Get("X-Write-Role"), "still sent to an authenticated caller")
+}
+
+// TestGet_PublicExposesRoleHeadersCrossOrigin: the CORS middleware only sends
+// Access-Control-Expose-Headers to allow-listed origins, so without this the
+// role headers are unreadable from JS for exactly the wildcard audience.
+func TestGet_PublicExposesRoleHeadersCrossOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+	assert.Contains(t, resp.Header.Get("Access-Control-Expose-Headers"), "X-Read-Role",
+		"a wildcard origin that cannot read the headers it is sent is only half a wildcard")
 }

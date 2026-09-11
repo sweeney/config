@@ -130,7 +130,7 @@ func TestConfigStore_UpdateACL(t *testing.T) {
 	}))
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateACL("prefs", "user", "admin", "admin-2", later))
+	require.NoError(t, s.UpdateACL("prefs", "user", "admin", "admin-2", later, true))
 
 	got, err := s.Get("prefs")
 	require.NoError(t, err)
@@ -142,7 +142,7 @@ func TestConfigStore_UpdateACL(t *testing.T) {
 
 func TestConfigStore_UpdateACL_NotFound(t *testing.T) {
 	s := store.NewConfigStore(openTestDB(t))
-	err := s.UpdateACL("missing", "user", "admin", "admin-1", time.Now().UTC())
+	err := s.UpdateACL("missing", "user", "admin", "admin-1", time.Now().UTC(), true)
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
@@ -223,7 +223,7 @@ func TestConfigStore_UpdateACL_WritesAuditEntryWithTransition(t *testing.T) {
 	seedForAudit(t, s, "tariffs", "user", "user", now)
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateACL("tariffs", "public", "user", "admin-1", later))
+	require.NoError(t, s.UpdateACL("tariffs", "public", "user", "admin-1", later, true))
 
 	entries, err := s.ListAudit("tariffs")
 	require.NoError(t, err)
@@ -281,7 +281,7 @@ func TestConfigStore_UpdateACL_AuditRollsBackWithFailedMutation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "prefs", "user", "user", now)
 
-	err := s.UpdateACL("prefs", "root", "user", "admin-1", now.Add(time.Minute))
+	err := s.UpdateACL("prefs", "root", "user", "admin-1", now.Add(time.Minute), true)
 	require.Error(t, err, "an invalid role must be rejected by the CHECK constraint")
 
 	readRole, writeRole, gerr := s.GetACL("prefs")
@@ -318,8 +318,8 @@ func TestConfigStore_ListAudit_ScopedAndOrdered(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "alpha", "user", "user", now)
 	seedForAudit(t, s, "beta", "admin", "admin", now)
-	require.NoError(t, s.UpdateACL("alpha", "public", "user", "admin-1", now.Add(time.Minute)))
-	require.NoError(t, s.UpdateACL("alpha", "user", "user", "admin-1", now.Add(2*time.Minute)))
+	require.NoError(t, s.UpdateACL("alpha", "public", "user", "admin-1", now.Add(time.Minute), true))
+	require.NoError(t, s.UpdateACL("alpha", "user", "user", "admin-1", now.Add(2*time.Minute), true))
 
 	entries, err := s.ListAudit("alpha")
 	require.NoError(t, err)
@@ -335,4 +335,68 @@ func TestConfigStore_ListAudit_UnknownNamespaceIsEmpty(t *testing.T) {
 	entries, err := s.ListAudit("nosuchns")
 	require.NoError(t, err)
 	assert.Empty(t, entries)
+}
+
+// TestConfigStore_UpdateACL_RefusesUnconfirmedPublish: the publish guard is
+// evaluated here, against the row the transaction is about to overwrite,
+// rather than from an ACL the service read in an earlier round trip. That
+// earlier arrangement left a window in which a concurrent revoke made a
+// genuine publish look like an edit to something already public.
+func TestConfigStore_UpdateACL_RefusesUnconfirmedPublish(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "tariffs", "user", "user", now)
+
+	err := s.UpdateACL("tariffs", "public", "user", "admin-1", now.Add(time.Minute), false)
+	require.ErrorIs(t, err, domain.ErrPublishNotConfirmed)
+
+	readRole, _, gerr := s.GetACL("tariffs")
+	require.NoError(t, gerr)
+	assert.Equal(t, "user", readRole, "the refused publish must not have written")
+
+	entries, aerr := s.ListAudit("tariffs")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "and must leave no audit row")
+}
+
+// TestConfigStore_UpdateACL_AlreadyPublicNeedsNoConfirmation: the guard is on
+// the transition, so an unrelated edit to a namespace that is already public
+// goes through without one.
+func TestConfigStore_UpdateACL_AlreadyPublicNeedsNoConfirmation(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "tariffs", "public", "user", now)
+
+	require.NoError(t, s.UpdateACL("tariffs", "public", "admin", "admin-1", now.Add(time.Minute), false))
+	_, writeRole, err := s.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "admin", writeRole)
+}
+
+// TestConfigStore_Audit_RejectsRolesTheLiveTableCouldNotHold: config_audit is
+// the record you consult to reconstruct how a namespace became public, so it
+// should not be able to hold a role config_namespaces would refuse.
+func TestConfigStore_Audit_RejectsRolesTheLiveTableCouldNotHold(t *testing.T) {
+	database := openTestDB(t)
+	cases := map[string]string{
+		"unknown read role": `INSERT INTO config_audit (namespace, action, new_read, actor, at) VALUES ('n','create','root','a','t')`,
+		"public write role": `INSERT INTO config_audit (namespace, action, new_write, actor, at) VALUES ('n','create','public','a','t')`,
+		"unknown old role":  `INSERT INTO config_audit (namespace, action, old_read, actor, at) VALUES ('n','delete','root','a','t')`,
+	}
+	for name, stmt := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := database.DB().Exec(stmt)
+			assert.Error(t, err, "the trail must not accept a role the live table would reject")
+		})
+	}
+
+	// NULL stays legal: a create has no previous ACL, a delete no resulting one.
+	_, err := database.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, new_read, new_write, actor, at)
+		 VALUES ('n','create','public','user','a','t')`)
+	assert.NoError(t, err)
+	_, err = database.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, old_read, old_write, actor, at)
+		 VALUES ('n','delete','admin','admin','a','t')`)
+	assert.NoError(t, err)
 }

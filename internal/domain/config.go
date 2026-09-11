@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"time"
 
 	commonapierr "github.com/sweeney/identity/common/apierr"
@@ -9,6 +10,17 @@ import (
 var (
 	ErrNotFound = commonapierr.ErrNotFound
 	ErrConflict = commonapierr.ErrConflict
+
+	// ErrPublishNotConfirmed is returned by a repository when an ACL update
+	// would move read access to public but the caller did not confirm it.
+	//
+	// The decision lives in the repository rather than the service because it
+	// depends on the namespace's current read role, and only the repository
+	// can read that in the same transaction as the write. Deciding it from a
+	// separately-read snapshot leaves a window in which a concurrent revoke
+	// makes an unrelated edit look like "already public", and the guard is
+	// skipped on a request that does in fact publish.
+	ErrPublishNotConfirmed = errors.New("publishing this namespace was not confirmed")
 )
 
 const (
@@ -94,7 +106,12 @@ type ConfigRepository interface {
 	Get(name string) (*ConfigNamespace, error)
 	Create(ns *ConfigNamespace) error
 	UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error
-	UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time) error
+	// UpdateACL replaces the ACL. publishConfirmed reports whether the caller
+	// supplied a valid confirmation; implementations must compare the
+	// incoming read role against the stored one inside the write transaction
+	// and return ErrPublishNotConfirmed when an unconfirmed publish would
+	// result.
+	UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error
 	Delete(name, deletedBy string, at time.Time) error
 
 	// ListAudit returns the recorded history for one namespace, oldest

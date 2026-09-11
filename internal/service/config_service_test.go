@@ -28,6 +28,10 @@ type fakeConfigRepo struct {
 	// Audit recording is shared with the other suite's fake so the two
 	// cannot disagree about what gets recorded; see internal/testutil.
 	audit testutil.AuditLog
+
+	// getACLCalls counts reads of the ACL, so a test can prove the publish
+	// guard is not decided from a separately-read snapshot.
+	getACLCalls int
 }
 
 func newFakeConfigRepo() *fakeConfigRepo {
@@ -57,6 +61,7 @@ func (r *fakeConfigRepo) GetACL(name string) (string, string, error) {
 	if !ok {
 		return "", "", domain.ErrNotFound
 	}
+	r.getACLCalls++
 	return ns.ReadRole, ns.WriteRole, nil
 }
 
@@ -103,12 +108,17 @@ func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, updatedBy 
 	return nil
 }
 
-func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time) error {
+func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
 		return domain.ErrNotFound
+	}
+	// The same guard the real store applies, decided against the stored row.
+	if readRole == domain.ConfigRolePublic &&
+		ns.ReadRole != domain.ConfigRolePublic && !publishConfirmed {
+		return domain.ErrPublishNotConfirmed
 	}
 	r.audit.Record(domain.AuditEntry{
 		Namespace:    name,
@@ -861,4 +871,52 @@ func TestListAudit_InvalidName(t *testing.T) {
 	svc, _, _ := newConfigSvc(t)
 	_, err := svc.ListAudit(admin, "BAD NAME")
 	assert.ErrorIs(t, err, service.ErrConfigInvalidName)
+}
+
+// TestUpdateACL_GuardIsDecidedAgainstStoredState is the regression test for a
+// check-then-act race.
+//
+// Deciding "is this a publish?" from a snapshot read in one round trip and
+// then writing in another leaves a window. Admin A revokes public -> user;
+// admin B, holding a stale form, re-sends read_role=public as part of an
+// unrelated write-role edit. If B's read landed before A's write, B was
+// judged not to be publishing, skipped the guard, and then republished the
+// namespace with no confirmation — the exact failure the guard exists to
+// prevent, reached by interleaving rather than by a stale field.
+//
+// The window is closed by not having one: the repository compares the
+// incoming read role against the stored row inside the write transaction. So
+// what this asserts is structural — the service must not read the ACL
+// separately first. Reintroducing that read reopens the race, and trips this.
+func TestUpdateACL_GuardIsDecidedAgainstStoredState(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	repo.mu.Lock()
+	repo.getACLCalls = 0
+	repo.mu.Unlock()
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user", ConfirmPublic: "tariffs",
+	}))
+
+	repo.mu.Lock()
+	calls := repo.getACLCalls
+	repo.mu.Unlock()
+	assert.Zero(t, calls,
+		"the guard must be evaluated inside the write, not against a snapshot read beforehand")
+}
+
+// TestUpdateACL_RepositoryRefusesUnconfirmedPublish: the decision now lives
+// behind the repository contract, so it is the repository that must refuse.
+func TestUpdateACL_RepositoryRefusesUnconfirmedPublish(t *testing.T) {
+	_, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := repo.UpdateACL("tariffs", "public", "user", "admin-1", time.Now().UTC(), false)
+	assert.ErrorIs(t, err, domain.ErrPublishNotConfirmed)
+
+	readRole, _, gerr := repo.GetACL("tariffs")
+	require.NoError(t, gerr)
+	assert.Equal(t, "user", readRole, "and must not have written")
 }

@@ -44,7 +44,12 @@ func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 		sum.CreatedAt = parseTime(createdAt)
 		out = append(out, sum)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		// Never hand back a partial trail alongside an error. The whole point
+		// of this table is that it can be believed.
+		return nil, fmt.Errorf("iterate config audit: %w", err)
+	}
+	return out, nil
 }
 
 func (s *ConfigStore) GetACL(name string) (string, string, error) {
@@ -89,6 +94,17 @@ func (s *ConfigStore) Get(name string) (*domain.ConfigNamespace, error) {
 // withTx runs fn inside a single transaction, rolling back if it returns an
 // error. Every mutation that also writes an audit row goes through here: a
 // trail with gaps is worse than no trail, because it will be believed.
+//
+// fn must issue every statement on the tx it is handed. common/db pins the
+// pool to a single connection (SetMaxOpenConns(1)), so reaching for
+// s.db.DB() inside fn deadlocks rather than erroring — the transaction is
+// holding the only connection, and the wait is silent. Neither the race
+// detector nor a unit test will catch it.
+//
+// That same single connection is why the deferred transaction Begin() opens
+// is safe here despite UpdateACL and Delete reading before they write: two
+// writers serialise rather than racing to upgrade a shared lock. The safety
+// comes from a dependency's pool setting, not from anything visible here.
 func (s *ConfigStore) withTx(fn func(*sql.Tx) error) error {
 	tx, err := s.db.DB().Begin()
 	if err != nil {
@@ -211,11 +227,18 @@ func (s *ConfigStore) UpdateDocument(name string, document []byte, updatedBy str
 	return nil
 }
 
-func (s *ConfigStore) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time) error {
+func (s *ConfigStore) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		oldRead, oldWrite, err := readACLTx(tx, name)
 		if err != nil {
 			return err
+		}
+		// Evaluated here, against the row this transaction is about to
+		// overwrite, so a concurrent revoke cannot make a publish look like
+		// an edit to something already public.
+		if readRole == domain.ConfigRolePublic &&
+			oldRead != domain.ConfigRolePublic && !publishConfirmed {
+			return domain.ErrPublishNotConfirmed
 		}
 		if err := insertAudit(tx, domain.AuditEntry{
 			Namespace:    name,
@@ -314,7 +337,12 @@ func (s *ConfigStore) ListAudit(namespace string) ([]domain.AuditEntry, error) {
 		e.At = parseTime(at)
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		// Never hand back a partial trail alongside an error. The whole point
+		// of this table is that it can be believed.
+		return nil, fmt.Errorf("iterate config audit: %w", err)
+	}
+	return out, nil
 }
 
 func formatTime(t time.Time) string {
