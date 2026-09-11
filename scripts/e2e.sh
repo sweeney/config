@@ -330,6 +330,48 @@ acao() {
     | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}'
 }
 check "public read allows any origin" "*" "$(acao "$CFG_BASE/api/v1/config/tariffs")"
+
+# A preflight must also succeed, or the wildcard only holds for simple GETs
+# and any client sending Content-Type is refused before the read happens.
+PF=$(curl -s -D - -o /dev/null -X OPTIONS "$CFG_BASE/api/v1/config/tariffs" \
+  -H 'Origin: https://unknown.example' -H 'Access-Control-Request-Method: GET' \
+  -H 'Access-Control-Request-Headers: content-type' | tr -d '\r')
+check "preflight from an unknown origin allows any origin" "*" \
+  "$(echo "$PF" | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')"
+check_contains "preflight allows Content-Type" "Content-Type" \
+  "$(echo "$PF" | awk -F': ' 'tolower($1)=="access-control-allow-headers"{print $2}')"
+check_contains "preflight exposes the role headers" "X-Read-Role" \
+  "$(echo "$PF" | awk -F': ' 'tolower($1)=="access-control-expose-headers"{print $2}')"
+
+# The wildcard is for anonymous reads; a token-bearing cross-origin request
+# still goes through CORS_ORIGINS.
+ACH=$(echo "$PF" | awk -F': ' 'tolower($1)=="access-control-allow-headers"{print $2}')
+if echo "$ACH" | grep -qi "authorization"; then
+  check "preflight does not advertise Authorization" "absent" "present"
+else
+  check "preflight does not advertise Authorization" "absent" "absent"
+fi
+
+# A 404 is cacheable by default and is the only answer an anonymous caller
+# gets for a private namespace, so it must not be storable without regard to
+# Authorization.
+NF=$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/houses" | tr -d '\r')
+check "anonymous 404 is not cacheable" "private, no-store" \
+  "$(echo "$NF" | awk -F': ' 'tolower($1)=="cache-control"{print $2}')"
+check_contains "anonymous 404 varies on Authorization" "Authorization" \
+  "$(echo "$NF" | awk -F': ' 'tolower($1)=="vary"{print $2}')"
+
+# Only the answer that actually was anonymous is shared-cacheable.
+AUTHPUB=$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" | tr -d '\r')
+check "authenticated read of a public namespace is not shared-cacheable" "private, no-store" \
+  "$(echo "$AUTHPUB" | awk -F': ' 'tolower($1)=="cache-control"{print $2}')"
+
+# The write role is not disclosed to callers who cannot act on it.
+check "anonymous read is not told the write role" "" \
+  "$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/tariffs" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-write-role"{print $2}')"
+check "authenticated read still gets the write role" "user" \
+  "$(echo "$AUTHPUB" | awk -F': ' 'tolower($1)=="x-write-role"{print $2}')"
 check "private read does not" "" \
   "$(acao -H "Authorization: Bearer $ADMIN_TOK" "$CFG_BASE/api/v1/config/houses")"
 
