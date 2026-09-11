@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -24,6 +26,25 @@ import (
 // Note the asymmetry: write_role deliberately does NOT gain 'public'. A
 // namespace may be readable without a token; nothing is ever anonymously
 // writable.
+
+// schemaVersionPublicReadRole is written to PRAGMA user_version once the
+// table is known to accept read_role='public'.
+//
+// Recording it matters more than it looks. Without it the answer is
+// re-derived from scratch on every Open, which means a probe that fails for
+// some unrelated reason sends a perfectly healthy database into a
+// destructive rebuild — repeatedly, writing a fresh full-size snapshot each
+// boot. With it, the question is asked once.
+const schemaVersionPublicReadRole = 1
+
+// expectedNamespaceColumns is the exact column set the rebuild knows how to
+// carry across. Anything else and it must refuse: newNamespacesDDL is
+// hard-coded and the copy names these columns explicitly, so an unrecognised
+// column would be dropped silently — and the row-count check cannot see it,
+// because the counts still match.
+var expectedNamespaceColumns = []string{
+	"created_at", "document", "name", "read_role", "updated_at", "updated_by", "write_role",
+}
 
 const (
 	namespacesTable = "config_namespaces"
@@ -75,6 +96,14 @@ func snapshotBeforeRebuild(sqlDB *sql.DB, dbPath string) (string, error) {
 // CHECK permits 'public'. It is a no-op when the table is absent (migrations
 // own creating it) or already wide enough, so it is safe to call on every Open.
 func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
+	var recorded int
+	if err := sqlDB.QueryRow("PRAGMA user_version").Scan(&recorded); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if recorded >= schemaVersionPublicReadRole {
+		return nil
+	}
+
 	var existingDDL string
 	err := sqlDB.QueryRow(
 		"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", namespacesTable,
@@ -92,11 +121,14 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 		return err
 	}
 	if permitted {
-		// Logged on every boot, deliberately: without it, "did the rebuild
-		// run?" is unanswerable from the journal, because a silent skip and
-		// a version that never checked look identical.
 		log.Printf("config db: schema check — read_role already permits 'public', no rebuild needed")
-		return nil
+		return recordSchemaVersion(sqlDB)
+	}
+
+	// The rebuild flattens the table to expectedNamespaceColumns. If this
+	// database carries anything else, refuse rather than amputate it.
+	if err := assertNoUnexpectedColumns(sqlDB); err != nil {
+		return err
 	}
 
 	var rows int
@@ -125,8 +157,66 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 	if err := rebuildNamespacesTable(sqlDB, rows); err != nil {
 		return err
 	}
+	// Confirm the rebuild actually achieved what it was for. If the probe had
+	// misdiagnosed something, this turns a silent amputation into one failed
+	// start.
+	permitted, err = permitsPublicReadRole(sqlDB)
+	if err != nil {
+		return err
+	}
+	if !permitted {
+		return fmt.Errorf(
+			"rebuilt %s but it still rejects read_role='public' — refusing to continue",
+			namespacesTable)
+	}
+
 	log.Printf("config db: schema rebuild complete — %d row(s) migrated in %s",
 		rows, time.Since(started).Round(time.Microsecond))
+	return recordSchemaVersion(sqlDB)
+}
+
+// recordSchemaVersion marks the public-read-role migration as settled.
+func recordSchemaVersion(sqlDB *sql.DB) error {
+	// PRAGMA does not accept a bound parameter, and the value is a constant.
+	stmt := fmt.Sprintf("PRAGMA user_version = %d", schemaVersionPublicReadRole)
+	if _, err := sqlDB.Exec(stmt); err != nil {
+		return fmt.Errorf("record schema version: %w", err)
+	}
+	return nil
+}
+
+// assertNoUnexpectedColumns refuses to rebuild a table whose shape this code
+// does not recognise.
+func assertNoUnexpectedColumns(sqlDB *sql.DB) error {
+	rows, err := sqlDB.Query("SELECT name FROM pragma_table_info(?)", namespacesTable)
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", namespacesTable, err)
+	}
+	defer rows.Close()
+
+	var unexpected []string
+	known := make(map[string]bool, len(expectedNamespaceColumns))
+	for _, c := range expectedNamespaceColumns {
+		known[c] = true
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("scan %s columns: %w", namespacesTable, err)
+		}
+		if !known[name] {
+			unexpected = append(unexpected, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect %s columns: %w", namespacesTable, err)
+	}
+	if len(unexpected) > 0 {
+		sort.Strings(unexpected)
+		return fmt.Errorf(
+			"refusing to rebuild %s: unrecognised column(s) %s would be dropped by the rebuild",
+			namespacesTable, strings.Join(unexpected, ", "))
+	}
 	return nil
 }
 
@@ -158,7 +248,29 @@ func permitsPublicReadRole(sqlDB *sql.DB) (bool, error) {
 		 VALUES (?, 'public', 'admin', '{}', '', '', '')`,
 		probeNamespace,
 	)
-	return err == nil, nil
+	if err == nil {
+		return true, nil
+	}
+	// Only the read_role CHECK rejecting the row means "not wide enough".
+	// Every other failure — a NOT NULL column some later migration adds, a
+	// unique index the probe row happens to collide with, a busy database
+	// during a restart — says nothing about the constraint, and treating it
+	// as "needs rebuilding" would send a healthy database into a destructive,
+	// shape-flattening rebuild.
+	if isReadRoleCheckViolation(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf(
+		"read_role probe on %s failed for an unrelated reason (not a CHECK violation): %w",
+		namespacesTable, err)
+}
+
+func isReadRoleCheckViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "CHECK constraint failed") && strings.Contains(msg, "read_role")
 }
 
 // rebuildNamespacesTable performs the SQLite table-rebuild dance in one
