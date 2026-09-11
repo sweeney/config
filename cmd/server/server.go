@@ -295,12 +295,48 @@ func securityHeaders(next http.Handler, corsOrigins []string, identityURL string
 				w.Header().Set("Access-Control-Max-Age", "86400")
 			}
 			if r.Method == http.MethodOptions {
+				// A published namespace answers any origin, but this handler
+				// intercepts OPTIONS before the router runs and cannot know
+				// the namespace's read role without a lookup. Answering the
+				// preflight permissively for this one route is safe anyway:
+				// it says only which method and headers may be attempted, and
+				// the GET itself still enforces the ACL — a namespace the
+				// caller may not read still answers 404.
+				//
+				// Without this, the wildcard held only for simple requests: a
+				// client setting Content-Type on the GET, or sending any
+				// custom header, preflights and is refused.
+				//
+				// Authorization is deliberately not advertised here. The
+				// wildcard exists for anonymous reads; a cross-origin request
+				// carrying a token still goes through CORS_ORIGINS.
+				if origin != "" && !originAllowed(origin, allowed, devMode) && isNamespaceGetPath(r.URL.Path) {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+					w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+					w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+					w.Header().Set("Access-Control-Expose-Headers", "X-Read-Role, X-Write-Role")
+					w.Header().Set("Access-Control-Max-Age", "86400")
+				}
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isNamespaceGetPath reports whether p addresses a single namespace document
+// — the one route that may be read without a token, and so the only one whose
+// preflight is answered for an arbitrary origin. Exactly one path segment
+// after /api/v1/config/, which excludes the list route and everything under
+// /namespaces/.
+func isNamespaceGetPath(p string) bool {
+	const prefix = "/api/v1/config/"
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(p, prefix)
+	return rest != "" && !strings.Contains(rest, "/")
 }
 
 func isSPAPath(p string) bool {
