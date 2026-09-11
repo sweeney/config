@@ -341,6 +341,23 @@ info:
         anonymous. Listing (`GET /api/v1/config`) still requires a token and
         never advertises public namespaces to anonymous callers.
 
+        An anonymous read is told less about the namespace than an
+        authenticated one: it gets `X-Read-Role`, which the successful read
+        already implies, but not `X-Write-Role`.
+
+        ## Caching and CORS
+        Shared caching is keyed on the caller, not just the namespace. Only a
+        genuinely anonymous read of a `public` namespace is
+        `public, max-age=60`; every other answer — an authenticated read of
+        that same namespace included — is `private, no-store`, and 404s carry
+        those headers too. See `GET /api/v1/config/{ns}`.
+
+        A `public` namespace answers `Access-Control-Allow-Origin: *` so it can
+        be fetched from a browser on any origin, and its preflight
+        (`OPTIONS /api/v1/config/{ns}`) is answered for any origin so that a
+        non-simple GET works too. Every other route, and every cross-origin
+        request carrying a token, goes through the `CORS_ORIGINS` allow-list.
+
         ## No existence leak
         Callers who lack `read_role` receive 404 (not 403) on any operation
         against a namespace, so they cannot probe namespace existence. This
@@ -447,11 +464,33 @@ paths:
                                 decides.
                             schema:
                                 type: string
+                        Access-Control-Expose-Headers:
+                            description: |
+                                `X-Read-Role, X-Write-Role`, sent alongside the
+                                wildcard origin on a `public` namespace. The
+                                CORS middleware only sends this header to
+                                allow-listed origins, so without it the role
+                                headers are unreadable from JavaScript for
+                                exactly the audience the wildcard exists for.
+                            schema:
+                                type: string
                         Cache-Control:
                             description: |
-                                `public, max-age=60` when the namespace's
-                                `read_role` is `public`, otherwise
-                                `private, no-store`.
+                                `public, max-age=60` only when the namespace's
+                                `read_role` is `public` **and** the request
+                                carried no `Authorization` header. Every other
+                                200 — including an authenticated read of a
+                                public namespace — is `private, no-store`.
+
+                                Caching is keyed on the caller, not just the
+                                namespace. `Vary` would keep a token-bearing
+                                copy correct, but it would also store one copy
+                                per distinct token and mark a response served
+                                to an identified principal as shared-cacheable.
+                                Keying on the caller also confines the
+                                revoke-latency window to the anonymous copies,
+                                which are the only ones a revoke cannot reach
+                                anyway.
                             schema:
                                 type: string
                         Vary:
@@ -464,11 +503,23 @@ paths:
                             schema:
                                 type: string
                         X-Read-Role:
-                            description: Role required to read this namespace
+                            description: |
+                                Role required to read this namespace. Always
+                                sent, to anonymous and authenticated callers
+                                alike — the read having succeeded already
+                                implies it.
                             schema:
                                 $ref: '#/components/schemas/ReadRole'
                         X-Write-Role:
-                            description: Role required to write this namespace
+                            description: |
+                                Role required to write this namespace. Sent
+                                only to a caller that presented a token; an
+                                anonymous read of a public namespace gets
+                                `X-Read-Role` alone.
+
+                                That a plain `user` token suffices to write is
+                                a nudge toward where to point a stolen one, and
+                                nobody without a token can act on it.
                             schema:
                                 $ref: '#/components/schemas/WriteRole'
                 "400":
@@ -476,7 +527,32 @@ paths:
                 "401":
                     $ref: '#/components/responses/Unauthorized'
                 "404":
-                    $ref: '#/components/responses/NotFound'
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Error'
+                    description: |
+                        Namespace missing **or** caller lacks read role. Both
+                        cases use 404 so namespace existence is not leaked.
+                    headers:
+                        Cache-Control:
+                            description: |
+                                Always `private, no-store`. Set before the
+                                lookup so the 404 carries it too: a 404 is
+                                heuristically cacheable (RFC 9111 §4.2.2) and
+                                is the only answer an anonymous caller gets for
+                                a private namespace, so without it a shared
+                                cache could key the anonymous 404 without
+                                regard to `Authorization` and replay it to a
+                                caller who *can* read that namespace.
+                            schema:
+                                type: string
+                        Vary:
+                            description: |
+                                Contains `Authorization`, for the same reason
+                                as `Cache-Control` above.
+                            schema:
+                                type: string
                 "500":
                     $ref: '#/components/responses/InternalServerError'
                 "503":
@@ -485,6 +561,65 @@ paths:
                 - bearerAuth: []
                 - {}
             summary: Fetch a namespace document
+            tags:
+                - config
+        options:
+            description: |
+                CORS preflight. Answered before the router runs, so it never
+                looks up the namespace.
+
+                An `Origin` on the configured allow-list gets the usual
+                allow-list headers, as it does on every route. An origin that
+                is *not* allow-listed gets a wildcard preflight — but only on
+                this path, the single-namespace document, which is the one
+                route readable without a token:
+
+                    Access-Control-Allow-Origin: *
+                    Access-Control-Allow-Methods: GET, OPTIONS
+                    Access-Control-Allow-Headers: Content-Type
+                    Access-Control-Expose-Headers: X-Read-Role, X-Write-Role
+                    Access-Control-Max-Age: 86400
+
+                Without it the wildcard on the GET only ever covered *simple*
+                requests: a client setting `Content-Type` on the GET, or
+                sending any custom header, triggers a preflight and is
+                refused.
+
+                This is safe because a preflight says only which method and
+                headers may be attempted — the GET itself still enforces the
+                ACL, and a namespace the caller may not read still answers
+                404.
+
+                `Authorization` is deliberately **not** advertised on the
+                wildcard preflight. The wildcard exists for anonymous reads; a
+                cross-origin request carrying a token still goes through the
+                `CORS_ORIGINS` allow-list. Every other route keeps allow-list
+                behaviour unchanged.
+            operationId: preflightNamespace
+            responses:
+                "204":
+                    description: |
+                        Preflight answer. Carries CORS headers when the request
+                        had an `Origin`; the body is always empty.
+                    headers:
+                        Access-Control-Allow-Headers:
+                            description: '`Content-Type` on the wildcard preflight; `Authorization, Content-Type` for an allow-listed origin.'
+                            schema:
+                                type: string
+                        Access-Control-Allow-Methods:
+                            description: '`GET, OPTIONS` on the wildcard preflight; the full method set for an allow-listed origin.'
+                            schema:
+                                type: string
+                        Access-Control-Allow-Origin:
+                            description: '`*` for a non-allow-listed origin, or the echoed origin when it is allow-listed.'
+                            schema:
+                                type: string
+                        Access-Control-Max-Age:
+                            description: '`86400`. How long the preflight result may be reused.'
+                            schema:
+                                type: integer
+            security: []
+            summary: CORS preflight for a namespace document
             tags:
                 - config
         parameters:

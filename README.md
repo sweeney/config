@@ -143,18 +143,26 @@ this namespace without needing a second request:
 | Header | Value | Meaning |
 |---|---|---|
 | `X-Read-Role` | `admin`, `user` or `public` | Role required to read |
-| `X-Write-Role` | `admin` or `user` | Role required to write |
+| `X-Write-Role` | `admin` or `user` | Role required to write. Sent only to a caller that presented a token |
 
-`Cache-Control` follows the read role: `private, no-store` for everything
-normally, `public, max-age=60` for a `read_role: public` namespace so shared
-caches can serve it. `Vary: Authorization` is set either way — the same URL
-answers differently with and without a token, so a cache must never serve one
-response to the other.
+`X-Write-Role` is withheld from anonymous callers: that a plain `user` token
+suffices to write is a nudge toward where to point a stolen one, and nobody
+without a token can act on it. `X-Read-Role` stays, because a successful read
+already implies it.
+
+`Cache-Control` follows the *caller*, not just the read role: `public,
+max-age=60` only for an anonymous read of a `read_role: public` namespace, so
+shared caches can serve it; `private, no-store` for everything else, an
+authenticated read of that same public namespace included. `Vary:
+Authorization` is set either way — the same URL answers differently with and
+without a token, so a cache must never serve one response to the other. Both
+headers are set before the namespace lookup, so a `404` carries them too.
 
 A `read_role: public` namespace also answers with
-`Access-Control-Allow-Origin: *`, so it can be fetched from browser JavaScript
-on any origin. Everything else keeps the `CORS_ORIGINS` allow-list. See
-[Client guidance](#client-guidance).
+`Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers:
+X-Read-Role, X-Write-Role`, so it can be fetched — and its role headers read —
+from browser JavaScript on any origin. Everything else keeps the
+`CORS_ORIGINS` allow-list. See [Client guidance](#client-guidance).
 
 ### Namespace names
 
@@ -257,13 +265,21 @@ curl -i https://config.example.com/api/v1/config/tariffs
 HTTP/1.1 200 OK
 Content-Type: application/json
 X-Read-Role: public
-X-Write-Role: admin
 Cache-Control: public, max-age=60
 Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: X-Read-Role, X-Write-Role
 Vary: Authorization
 
 {"standing":0.51,"unit":0.24}
 ```
+
+Note what is missing: **no `X-Write-Role`**. An authenticated read of this same
+namespace gets it; an anonymous one does not. And **`public, max-age=60` is the
+anonymous answer only** — read the same namespace with a token and you get
+`private, no-store`, like every other authenticated read. Caching is keyed on
+the caller, not the namespace: `Vary` would keep a token-bearing copy correct,
+but it would also store one copy per distinct token and mark a response served
+to an identified principal as shared-cacheable.
 
 The wildcard origin is part of publishing: a published document is meant to be
 fetchable from anywhere, including a browser on an origin this service has
@@ -271,11 +287,22 @@ never heard of, and withholding the header would protect nothing because
 server-to-server callers ignore CORS entirely. A public namespace is therefore
 readable from front-end JavaScript on any site, with no token and no
 `CORS_ORIGINS` entry. Private namespaces do not get it.
+`Access-Control-Expose-Headers` rides along because the CORS middleware only
+sends it to allow-listed origins — without it the role headers would be
+unreadable from JS for exactly the audience the wildcard serves.
+
+The **preflight** is answered for any origin too, but only on this path. See
+[CORS](#client-guidance).
 
 Anonymously, a private namespace and a namespace that does not exist return
 byte-identical `404`s, so the anonymous path cannot be used to enumerate what
-exists. A header that is present but carries a bad or expired token is `401`
-even on a public namespace — it is never downgraded to an anonymous read.
+exists. Those `404`s carry `Cache-Control: private, no-store` and
+`Vary: Authorization` as well — a `404` is heuristically cacheable, and it is
+the only answer an anonymous caller gets for a private namespace, so without
+them a shared cache could key it without regard to `Authorization` and replay
+it to someone who *can* read that namespace. A header that is present but
+carries a bad or expired token is `401` even on a public namespace — it is
+never downgraded to an anonymous read.
 
 Because an anonymous read verifies no token, it needs no JWKS and therefore
 keeps working while identity is unreachable, when authenticated requests are
@@ -711,12 +738,16 @@ waiting for a 401. Identity returns `expires_in` alongside the token if you
 need to compute the deadline.
 
 **Config caching.** The config service sets `Cache-Control: private, no-store`
-on document responses, except for `read_role: public` namespaces, which get
-`public, max-age=60` so shared caches can serve them. Cache on the client side
-with your own TTL. A reasonable default for most config is 1–5 minutes; shorter
-for anything the service needs to react to quickly. Note that the 60-second TTL
-on a public namespace is also its revoke latency — un-publishing does not purge
-edge or browser caches.
+on document responses, with one exception: an *anonymous* read of a
+`read_role: public` namespace gets `public, max-age=60` so shared caches can
+serve it. Send a token to that same namespace and you are back to
+`private, no-store` — the decision follows the caller, not the namespace.
+Cache on the client side with your own TTL. A reasonable default for most
+config is 1–5 minutes; shorter for anything the service needs to react to
+quickly. Note that the 60-second TTL on a public namespace is also its revoke
+latency — un-publishing does not purge edge or browser caches. That window now
+applies only to the anonymous copies, which are the only ones a revoke could
+never have reached anyway.
 
 **404 is authoritative.** If the namespace doesn't exist or your token can't
 read it, you get 404. Don't retry 404s in a loop. Check your role and whether
@@ -746,10 +777,34 @@ include CORS headers when the request `Origin` is in the allowed list. The one
 exception is a `GET` of a `read_role: public` namespace, which answers
 `Access-Control-Allow-Origin: *` regardless of the origin — a published
 document is meant to be fetchable from anywhere, and withholding the header
-would only break browser callers, never server-to-server ones. You can fetch a
-public namespace from front-end JavaScript on any site with no token and no
-`CORS_ORIGINS` entry; nothing else is reachable that way. The SPA admin UI
-(`/`, `/static/*`) has a separate, permissive CSP.
+would only break browser callers, never server-to-server ones. It also carries
+`Access-Control-Expose-Headers: X-Read-Role, X-Write-Role`, so those headers
+are readable from JS on any origin rather than only allow-listed ones.
+
+An `OPTIONS` **preflight** from a non-allow-listed origin is answered too, but
+only for a single-namespace path (`/api/v1/config/{ns}` — exactly one segment
+after `/api/v1/config/`):
+
+```http
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, OPTIONS
+Access-Control-Allow-Headers: Content-Type
+Access-Control-Expose-Headers: X-Read-Role, X-Write-Role
+Access-Control-Max-Age: 86400
+```
+
+Without it the wildcard covered only *simple* requests: set `Content-Type` on
+the GET, or send any custom header, and the browser preflights and is refused.
+Answering it is safe because a preflight says only which method and headers may
+be *attempted* — the GET still enforces the ACL, and a namespace you cannot
+read still answers `404`. `Authorization` is deliberately not on that list: the
+wildcard is for anonymous reads, and a cross-origin request carrying a token
+still needs a `CORS_ORIGINS` entry.
+
+So you can fetch a public namespace from front-end JavaScript on any site with
+no token and no `CORS_ORIGINS` entry; nothing else is reachable that way, and
+every other route keeps allow-list behaviour unchanged. The SPA admin UI (`/`,
+`/static/*`) has a separate, permissive CSP.
 
 ---
 

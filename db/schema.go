@@ -101,6 +101,12 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 		return fmt.Errorf("read schema version: %w", err)
 	}
 	if recorded >= schemaVersionPublicReadRole {
+		// Logged on every boot, deliberately. The fast path makes this a true
+		// no-op, but silence would leave "checked and settled" and "a binary
+		// that never checked" looking identical in the journal, which is the
+		// question an operator actually has after a deploy.
+		log.Printf("config db: schema check — public read role settled (schema version %d), nothing to do",
+			recorded)
 		return nil
 	}
 

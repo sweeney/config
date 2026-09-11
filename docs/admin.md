@@ -97,7 +97,7 @@ does not recognise is unranked and satisfies nothing, so a malformed
 `role` claim in a token fails closed rather than falling through to
 public.
 
-Two things anonymous callers deliberately do **not** get:
+Three things anonymous callers deliberately do **not** get:
 
 - **Discovery.** `GET /api/v1/config` is unchanged: it still requires a
   token, still answers `401` without one, and never lists public
@@ -107,6 +107,12 @@ Two things anonymous callers deliberately do **not** get:
   and an anonymous `GET` of a namespace that does not exist return
   byte-identical `404`s. The public read path cannot be turned into an
   enumeration oracle.
+- **The write role.** An authenticated read carries both `X-Read-Role`
+  and `X-Write-Role`; an anonymous read carries `X-Read-Role` only.
+  That a plain `user` token suffices to write a given namespace is a
+  nudge toward where a stolen token would be worth pointing, and nobody
+  without a token can act on it. The read role is kept because the read
+  having succeeded already implies it.
 
 A token that is *present* but invalid or expired still gets `401`. It is
 never quietly downgraded to an anonymous read: a client holding a stale
@@ -181,10 +187,19 @@ you got right.
 
 ### Revoke latency is the cache TTL, not the PATCH
 
-A public namespace is served with `Cache-Control: public, max-age=60`.
-Everything else keeps `private, no-store`. Both carry
-`Vary: Authorization`, because the same URL answers differently with and
-without a token and no cache may serve one response to the other.
+`Cache-Control: public, max-age=60` is served to an **anonymous read of
+a public namespace**, and to nothing else. An authenticated read of that
+same namespace gets `private, no-store`, like every other authenticated
+read. All of them carry `Vary: Authorization`, because the same URL
+answers differently with and without a token and no cache may serve one
+response to the other.
+
+Note that the caching decision is keyed on the *caller*, not just the
+namespace. `Vary` alone would keep a token-bearing copy correct, but it
+would also store one copy per distinct token, and it would mark a
+response served to an identified principal as shared-cacheable. Keying
+on the caller also confines the window below to the anonymous copies,
+which are the only ones a revoke cannot reach anyway.
 
 The shared-cache header is most of the point of publishing: Cloudflare's
 edge, and every browser behind it, can serve the document without
@@ -203,7 +218,16 @@ A manual Cloudflare cache purge for the URL is the only way to shorten
 that window at the edge — nothing in the config service does it for you.
 Browser caches you cannot purge at all.
 
-### Public reads carry a wildcard CORS header
+The `404` is cached deliberately too — as `private, no-store`. Those
+headers are set *before* the namespace lookup, so a miss carries them as
+well as a hit. A `404` is heuristically cacheable under RFC 9111 §4.2.2,
+and it is the only answer an anonymous caller gets for a private
+namespace; without the headers a shared cache could key that anonymous
+`404` without regard to `Authorization` and replay it to a user who can
+actually read the namespace. Production sits behind Cloudflare, so this
+was not a hypothetical.
+
+### Public reads carry wildcard CORS headers
 
 A `GET` of a `read_role: public` namespace also answers with
 `Access-Control-Allow-Origin: *`. Nothing else does: private namespaces
@@ -217,6 +241,33 @@ protects nothing, because a server-to-server caller ignores CORS
 entirely — it only breaks the browser half of the audience, which is
 the half least able to work around it. So the wildcard is scoped
 exactly to what an admin deliberately published, and to nothing else.
+
+Two headers travel with that wildcard and are easy to miss.
+
+`Access-Control-Expose-Headers: X-Read-Role, X-Write-Role` goes out
+alongside it. The CORS middleware only sends that header to allow-listed
+origins, so without it the role headers on the response were present on
+the wire but unreadable from JavaScript — for exactly the audience the
+wildcard exists to serve.
+
+And the **preflight** is answered for any origin, but only on the
+single-namespace path (`/api/v1/config/{ns}` — exactly one path segment
+after `/api/v1/config/`). A non-allow-listed `OPTIONS` there gets
+`Access-Control-Allow-Origin: *`, `Allow-Methods: GET, OPTIONS`,
+`Allow-Headers: Content-Type`, the expose-headers above, and
+`Max-Age: 86400`. Previously every `OPTIONS` under `/api/` was answered
+by the security-headers middleware, which emits CORS headers only for
+allow-listed origins — so the wildcard held for *simple* GETs and
+nothing else, and a client that set `Content-Type` on the GET, or sent
+any custom header, preflighted and was refused.
+
+Answering it permissively is safe because a preflight says only which
+method and headers may be *attempted*. The GET still enforces the ACL,
+and a namespace the caller may not read still answers `404`. Note what
+is **not** on that list: `Authorization`. The wildcard exists for
+anonymous reads; a cross-origin request carrying a token still goes
+through `CORS_ORIGINS`. Every other route keeps allow-list behaviour
+unchanged.
 
 The practical consequence is worth stating plainly: a public namespace
 can be fetched straight from front-end JavaScript on any site in the

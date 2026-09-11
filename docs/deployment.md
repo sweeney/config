@@ -56,6 +56,20 @@ restarting is the whole procedure. What to know about it:
   rather than pattern-matching the stored DDL text, so whitespace or
   quoting differences cannot fool it. It is also a no-op when the table
   does not exist yet — the `.sql` migrations still own creating it.
+- **Once settled, the answer is recorded in `PRAGMA user_version`** and
+  the probe is not repeated. That turns later boots into a genuine
+  no-op rather than an inference re-derived from scratch every time —
+  and it matters more than it looks: without it, a probe that failed
+  for some unrelated reason would send a perfectly healthy database
+  into a destructive rebuild, repeatedly, writing a fresh full-size
+  snapshot each boot.
+- **A brand-new database never takes the rebuild path at all.**
+  `db/migrations/001_init.sql` now creates `config_namespaces` already
+  accepting `read_role='public'`, so a fresh install is born at the
+  right shape. Widening that statement is safe with the ledger-less
+  runner precisely because it is `CREATE TABLE IF NOT EXISTS`: a
+  database that already has the table does not re-run it, and so still
+  reaches the rebuild.
 - **Running on every open is what makes `--restore-backup` safe.**
   A restore drops an older SQLite file from R2 into `DB_PATH`. Without
   the rebuild happening at startup, restoring a pre-migration backup
@@ -73,8 +87,8 @@ restarting is the whole procedure. What to know about it:
   database is left untouched: un-migrated is recoverable, migrated with
   no way back is not. The timestamp means a second attempt can never
   overwrite the first snapshot. An empty table is not snapshotted —
-  there is nothing to lose — which is why a fresh install leaves no
-  such file.
+  there is nothing to lose — and a fresh install leaves no such file
+  anyway, having never rebuilt.
 - **It counts the rows it copied before dropping anything.** The copy
   and the verification happen before the old table is dropped, so a
   mismatch rolls the whole thing back with the original intact.
@@ -86,7 +100,10 @@ appears on the first start after the deploy.
 ### What it looks like in the journal
 
 `deploy.sh` tails `journalctl -u config` after restarting, which is
-where you confirm what happened. First start after the deploy:
+where you confirm what happened.
+
+**Upgrading an existing host** — this is what garibaldi shows. First
+start after the deploy:
 
 ```
 config db: schema rebuild required for 14 row(s); snapshot written to
@@ -94,15 +111,36 @@ config db: schema rebuild required for 14 row(s); snapshot written to
 config db: schema rebuild complete — 14 row(s) migrated in 754µs
 ```
 
-Every start after that:
+**Bringing up a new host** — no rebuild at all, just the skip line, on
+the first start:
 
 ```
 config db: schema check — read_role already permits 'public', no rebuild needed
 ```
 
-That second line is logged on every boot on purpose. Without it, a
-skipped rebuild and a binary that never checked look identical from the
-journal.
+`001_init.sql` creates `config_namespaces` already accepting
+`read_role='public'`, so the probe finds nothing to do and there is no
+snapshot file, no migration to wait on, and no rebuild lines. If you
+are watching a new host's first boot for the rebuild output above, you
+will not see it, and that is correct — its absence is the point.
+
+**Every start after that, on either host**, logs the settled line:
+
+```
+config db: schema check — public read role settled (schema version 1), nothing to do
+```
+
+The run that rebuilt, or found nothing to rebuild, also recorded
+`PRAGMA user_version`, so later boots short-circuit on that without
+probing the database at all. They still say so, deliberately: silence
+would leave "checked and settled" and "a binary that never checked"
+looking identical, and which of those you are looking at is the whole
+question after a deploy.
+
+`--restore-backup` re-opens it. An older SQLite file dropped into
+`DB_PATH` carries its own `user_version`, so the next start asks the
+question again from scratch — which is exactly what makes a restore of
+a pre-migration backup self-healing.
 
 If the rebuild fails, the service does not start: the error surfaces,
 the transaction rolls back, and `deploy.sh`'s `/healthz` gate fails the
