@@ -269,34 +269,59 @@ func getHandler(svc *service.ConfigService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ns := r.PathValue("ns")
 		caller := callerFromRequest(r)
+
+		// Set before the lookup so every exit carries them, the 404 included.
+		// A 404 is heuristically cacheable (RFC 9111 4.2.2) and is the only
+		// answer an anonymous caller ever gets for a private namespace, so
+		// without these a shared cache can key it without regard to
+		// Authorization and replay it to someone who can actually read that
+		// namespace. The public branch below relaxes Cache-Control on its way
+		// out; nothing else needs to think about it.
+		w.Header().Set("Cache-Control", "private, no-store")
+		addVary(w, "Authorization")
+
 		got, err := svc.Get(caller, ns)
 		if err != nil {
 			translateError(w, err)
 			return
 		}
+		anonymous := caller.Role == domain.ConfigRolePublic
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Read-Role", got.ReadRole)
-		w.Header().Set("X-Write-Role", got.WriteRole)
+		// The write role is withheld from anonymous callers. That a plain user
+		// token suffices to write is a nudge toward where to point a stolen
+		// one, and nobody without a token can act on it; the read role is
+		// self-evident from the read having succeeded at all.
+		if !anonymous {
+			w.Header().Set("X-Write-Role", got.WriteRole)
+		}
+
 		if got.ReadRole == domain.ConfigRolePublic {
-			// Cacheable by shared caches — the point of publishing is usually
-			// that something else can serve it. The TTL is also the revoke
-			// latency: flipping read_role back to user does not purge a CDN
-			// or a browser cache, so anonymous callers keep getting the old
-			// body until it expires. Keep it short.
-			w.Header().Set("Cache-Control", "public, max-age=60")
 			// A published document is meant to be fetched from anywhere,
 			// including a browser on an origin we have never heard of.
 			// Withholding this protects nothing — server-to-server callers
 			// ignore CORS entirely — it only breaks the browser half of the
-			// audience. Scoped to namespaces someone deliberately published;
-			// everything else keeps the configured origin allow-list.
+			// audience. Expose-Headers goes with it: the CORS middleware only
+			// sends that to allow-listed origins, so without it the header
+			// set just above is unreadable from JS for exactly the audience
+			// the wildcard exists for.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-		} else {
-			w.Header().Set("Cache-Control", "private, no-store")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Read-Role, X-Write-Role")
 		}
-		// Kept on both: the same URL answers differently with and without a
-		// token, so a cache must not serve one to the other.
-		addVary(w, "Authorization")
+		if got.ReadRole == domain.ConfigRolePublic && anonymous {
+			// Only the answer that actually was anonymous is shared-cacheable.
+			// Vary would keep a token-bearing copy correct, but it would also
+			// store one per distinct token and mark a response served to an
+			// identified principal as shared-cacheable. Keying on the caller
+			// also confines the revoke-latency window to the anonymous copies,
+			// which are the only ones a revoke cannot reach anyway.
+			//
+			// The TTL is that window: flipping read_role back does not purge a
+			// CDN or a browser cache, so keep it short.
+			w.Header().Set("Cache-Control", "public, max-age=60")
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(got.Document)
 	}
