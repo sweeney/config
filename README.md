@@ -206,24 +206,58 @@ curl https://config.example.com/api/v1/config \
 ```json
 [
   {
-    "name":       "mqtt_topics",
-    "read_role":  "user",
-    "write_role": "admin",
-    "updated_at": "2026-05-01T10:00:00.000Z",
-    "created_at": "2026-04-01T09:00:00.000Z"
+    "name":                "mqtt_topics",
+    "read_role":           "user",
+    "write_role":          "admin",
+    "updated_at":          "2026-05-01T10:00:00.000Z",
+    "updated_by":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "updated_by_username": "sweeney",
+    "created_at":          "2026-04-01T09:00:00.000Z"
   },
   {
-    "name":       "houses",
-    "read_role":  "admin",
-    "write_role": "admin",
-    "updated_at": "2026-04-15T14:22:00.000Z",
-    "created_at": "2026-04-15T14:22:00.000Z"
+    "name":                "houses",
+    "read_role":           "admin",
+    "write_role":          "admin",
+    "updated_at":          "2026-04-15T14:22:00.000Z",
+    "updated_by":          "provisioner",
+    "created_at":          "2026-04-15T14:22:00.000Z"
   }
 ]
 ```
 
+`houses` was last written by a service token, which has no user behind it, so
+it carries no `updated_by_username` at all.
+
+| Field | Notes |
+|---|---|
+| `name` | Namespace name |
+| `read_role` | `admin`, `user` or `public` |
+| `write_role` | `admin` or `user` |
+| `updated_at` | Last write to the document *or* the ACL. RFC 3339 UTC, millisecond precision |
+| `updated_by` | Subject of the token that made that write; always present, and the stable key |
+| `updated_by_username` | That writer's username at the time of the write; omitted when none was recorded |
+| `created_at` | RFC 3339 UTC, millisecond precision |
+
 If the caller has the `user` role, `houses` would not appear in this list at
 all (not even as a tombstone).
+
+**`updated_by` is the key, `updated_by_username` is the label.** The username
+is recorded as it stood when the write was made and is stored at write time,
+never resolved at read time — the same reasoning as `actor_username` on an
+audit entry. It is omitted — absent, not empty — when none was recorded,
+because a service token has no user behind it and rows written before the
+field existed do not know one. Fall back to `updated_by`.
+
+**This is the only record of who last edited a namespace's contents.**
+Document writes are deliberately not audited: the trail carries `create`,
+`acl_change` and `delete` only, so it cannot answer "who last changed what is
+*in* this namespace". These two fields can.
+
+**Deliberately here and not on `GET /api/v1/config/{ns}`.** That endpoint may
+be answered anonymously when the namespace is `read_role: public`, and
+publishing a document should not publish who edits it. The list always
+requires a token. Within the list both fields are visible to any caller whose
+role lets them see the namespace at all — they are not admin-only.
 
 ---
 

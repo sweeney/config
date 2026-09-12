@@ -102,7 +102,10 @@ Three things anonymous callers deliberately do **not** get:
 - **Discovery.** `GET /api/v1/config` is unchanged: it still requires a
   token, still answers `401` without one, and never lists public
   namespaces to an anonymous caller. Knowing the name is the price of
-  reading it anonymously; nothing advertises the names.
+  reading it anonymously; nothing advertises the names. That list is
+  also where `updated_by` is disclosed, and keeping it token-only is
+  what stops publishing a document from publishing who edits it — see
+  [Who last wrote a namespace](#who-last-wrote-a-namespace).
 - **A distinguishable miss.** An anonymous `GET` of a private namespace
   and an anonymous `GET` of a namespace that does not exist return
   byte-identical `404`s. The public read path cannot be turned into an
@@ -318,6 +321,71 @@ Never:
 - Per-user data of any kind. A namespace is a single shared document;
   there is no per-caller view of it, public or otherwise.
 
+## Who last wrote a namespace
+
+Every namespace row carries the subject of whoever last wrote it —
+its document *or* its ACL — and, where one was recorded, the username
+that subject went by at the time. `GET /api/v1/config` returns both, as
+`updated_by` and `updated_by_username` alongside `updated_at`:
+
+```bash
+curl -s https://config.example.com/api/v1/config \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+[
+  {
+    "name":                "tariffs",
+    "read_role":           "public",
+    "write_role":          "admin",
+    "updated_at":          "2026-09-11T15:34:40.364Z",
+    "updated_by":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "updated_by_username": "sweeney",
+    "created_at":          "2026-06-08T14:58:35.786Z"
+  }
+]
+```
+
+**This is the only record of who edited a namespace's contents.** The
+audit trail below records `create`, `acl_change` and `delete` — document
+writes are deliberately not among them, for the reasons given there. So
+"who last changed what is *in* `tariffs`" has no answer in the trail,
+and `updated_by` is where to look for it. The flip side is that it is
+only ever the *last* writer: one row, overwritten by the next write,
+with no history behind it.
+
+`updated_by` is the identity `sub`, always present, and the stable key —
+it is what you match on. `updated_by_username` is the human label,
+stored when the write happens rather than resolved when the row is read,
+which is the same design as `actor_username` on an audit row and for the
+same two reasons: it should stay legible when identity is unreachable,
+and it should not change meaning because someone was later renamed or
+their account deleted.
+
+It is **absent rather than empty** when none was recorded, and there are
+two ways that happens: a service token has no user behind it, and rows
+written before the column existed do not know one. Fall back to
+`updated_by`.
+
+### Why the list and not the document GET
+
+Both fields are on `GET /api/v1/config`, which always requires a token,
+and on nothing else. In particular they are **not** on
+`GET /api/v1/config/{ns}`, which is the one endpoint that can be
+answered anonymously — for a namespace at `read_role: public`, with no
+token at all.
+
+That is the whole reason for the split. Publishing a document is a
+decision to make the *contents* world-readable; it is not a decision to
+tell the world which of your admins edits it, and how recently. Putting
+the writer's name on the anonymous path would have bundled the two
+together, with no way to have one without the other.
+
+Within the list there is no further restriction: the list is already
+filtered by the caller's role, so a caller sees these fields for exactly
+the namespaces they could already see. They are not admin-only.
+
 ## Audit trail
 
 Namespace lifecycle changes are recorded in a `config_audit` table: one
@@ -333,7 +401,9 @@ Three deliberate limits, worth knowing before you rely on it:
   stored.** Every write already ships the whole database to R2, so
   auditing 64KB bodies would inflate both the database and every backup
   without bound. The table answers *who changed the rules, and when* —
-  not *what was in it*.
+  not *what was in it*. For who last changed the contents, see [Who last
+  wrote a namespace](#who-last-wrote-a-namespace) above — that field is
+  the only record of it.
 - **The audit row is written in the same transaction as the mutation.**
   A mutation that fails leaves no audit row behind, and a row that is
   present always describes a change that really happened. A trail with

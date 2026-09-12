@@ -85,14 +85,30 @@ curl -s $CFG/api/v1/config -H "Authorization: Bearer $ADMIN_TOK"
 ```json
 [
   {"name":"houses","read_role":"admin","write_role":"admin",
-   "updated_at":"2026-04-24T17:06:34.818Z","created_at":"2026-04-24T17:06:34.818Z"},
+   "updated_at":"2026-04-24T17:06:34.818Z",
+   "updated_by":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","updated_by_username":"sweeney",
+   "created_at":"2026-04-24T17:06:34.818Z"},
   {"name":"mqtt_topics","read_role":"user","write_role":"admin",
-   "updated_at":"2026-04-24T17:06:34.828Z","created_at":"2026-04-24T17:06:34.828Z"}
+   "updated_at":"2026-04-24T17:06:34.828Z",
+   "updated_by":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","updated_by_username":"sweeney",
+   "created_at":"2026-04-24T17:06:34.828Z"}
 ]
 ```
 
 A non-admin token sees only `mqtt_topics` (and an empty list if no
 user-readable namespaces exist).
+
+`updated_by` is the subject of whoever last wrote the namespace — its
+document or its ACL — and is always present; `updated_by_username` is the
+name that subject went by at the time, recorded at write time rather than
+looked up now, and omitted where none was recorded (a service token has no
+user behind it). Both move when the document moves: after the PUT in section
+6 they name whoever made it, which is the only place that is recorded at all
+— document writes leave no audit row, as section 13 notes.
+
+They appear here and not on the single-namespace `GET` of section 5, which
+can be answered anonymously for a public namespace (section 11). Publishing a
+document does not publish who edits it; listing always needs a token.
 
 ## 5. Fetch a document
 

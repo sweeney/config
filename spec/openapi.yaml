@@ -254,7 +254,9 @@ components:
                 - write_role
             type: object
         NamespaceSummary:
-            description: Namespace identity, ACL roles, and timestamps. Returned by list.
+            description: |
+                Namespace identity, ACL roles, timestamps, and who last wrote
+                it. Returned by list.
             properties:
                 created_at:
                     example: "2024-01-15T09:30:00.000Z"
@@ -270,6 +272,37 @@ components:
                     example: "2024-01-15T09:30:00.000Z"
                     format: date-time
                     type: string
+                updated_by:
+                    description: |
+                        The `sub` of whoever last wrote this namespace —
+                        either its document or its ACL. Always present, and
+                        the stable key: it identifies the writer even when
+                        `updated_by_username` is absent or names someone since
+                        renamed.
+
+                        Document writes are deliberately not recorded in the
+                        audit trail, which covers `create`, `acl_change` and
+                        `delete` only. This field is therefore the only record
+                        of who last changed a namespace's contents.
+                    example: adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9
+                    type: string
+                updated_by_username:
+                    description: |
+                        That writer's username as it stood at the time of the
+                        write, taken from the token that made it.
+
+                        Stored when the write happens, never resolved at read
+                        time — the same reasoning as `actor_username` on an
+                        audit entry. It stays legible when identity is
+                        unreachable, and does not change meaning because
+                        someone was later renamed or their account deleted.
+
+                        Omitted when no username was recorded: a service token
+                        has no user behind it, and rows written before this
+                        field existed do not know one. Fall back to
+                        `updated_by`, which is always present.
+                    example: sweeney
+                    type: string
                 write_role:
                     $ref: '#/components/schemas/WriteRole'
             required:
@@ -277,6 +310,7 @@ components:
                 - read_role
                 - write_role
                 - updated_at
+                - updated_by
                 - created_at
             type: object
         PutResult:
@@ -405,6 +439,17 @@ paths:
                 same as being handed an inventory of what exists. Anonymous
                 callers get 401 here, and reach public namespaces only by
                 fetching one by name.
+
+                Each summary also names whoever last wrote the namespace:
+                `updated_by`, and `updated_by_username` where one was
+                recorded. That is disclosed here and deliberately **not** on
+                `GET /api/v1/config/{ns}`, which may be answered anonymously
+                when `read_role` is `public` — publishing a document should
+                not publish who edits it. Because this route always requires a
+                token, the disclosure is bounded by the same role filter that
+                decides which namespaces appear at all: both fields are
+                visible to any caller who can see the namespace in the list,
+                not to admins only.
             responses:
                 "200":
                     content:
