@@ -85,12 +85,10 @@ curl -s $CFG/api/v1/config -H "Authorization: Bearer $ADMIN_TOK"
 ```json
 [
   {"name":"houses","read_role":"admin","write_role":"admin",
-   "updated_at":"2026-04-24T17:06:34.818Z",
-   "updated_by":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","updated_by_username":"sweeney",
+   "updated_at":"2026-04-24T17:06:34.818Z","updated_by_username":"sweeney",
    "created_at":"2026-04-24T17:06:34.818Z"},
   {"name":"mqtt_topics","read_role":"user","write_role":"admin",
-   "updated_at":"2026-04-24T17:06:34.828Z",
-   "updated_by":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","updated_by_username":"sweeney",
+   "updated_at":"2026-04-24T17:06:34.828Z","updated_by_username":"sweeney",
    "created_at":"2026-04-24T17:06:34.828Z"}
 ]
 ```
@@ -98,18 +96,26 @@ curl -s $CFG/api/v1/config -H "Authorization: Bearer $ADMIN_TOK"
 A non-admin token sees only `mqtt_topics` (and an empty list if no
 user-readable namespaces exist).
 
-`updated_by` is the subject of whoever last wrote the namespace — its
-document or its ACL — and is always present; `updated_by_username` is the
-name that subject went by at the time, recorded at write time rather than
+`updated_by_username` is the name whoever last wrote the namespace — its
+document or its ACL — went by at the time, recorded at write time rather than
 looked up now, and omitted where none was recorded (a service token has no
-user behind it). Both move when the document moves: after the PUT in section
-6 they name whoever made it. That write also leaves a `document_write` row in
-the audit trail of section 13 — these fields are the same answer without
-reading the history.
+user behind it). The writer's identity subject is not returned here at all: it
+answers "who" no better than the name does, and it is the half that correlates
+across services. Admins who want subjects have `actor` in the audit trail of
+section 13.
 
-They appear here and not on the single-namespace `GET` of section 5, which
-can be answered anonymously for a public namespace (section 11). Publishing a
-document does not publish who edits it; listing always needs a token.
+The name moves when the document moves: after the PUT in section 6 it names
+whoever made it. That write also leaves a `document_write` row in the trail —
+this field is the same answer without an admin token and without reading a
+history.
+
+It appears here and not on the single-namespace `GET` of section 5, which can
+be answered anonymously for a public namespace (section 11): publishing a
+document must not publish who edits it, and listing always needs a token.
+Within the list there is no further restriction — any caller who can see a
+namespace sees who last touched it. The trail of section 13 stays admin-only
+for a different reason: it shows a pattern over time rather than one current
+fact.
 
 ## 5. Fetch a document
 
@@ -157,8 +163,11 @@ curl -s -X PUT $CFG/api/v1/config/houses \
 
 `changed:false` means the server detected byte-identical content after
 JSON compaction, skipped the write, did not trigger a backup, and wrote
-no audit row. Scripts can idempotently re-apply configuration without
-cost, and every `document_write` in the trail is a real change.
+no audit row. The comparison happens inside the write transaction,
+against the row being overwritten, so two callers submitting the same new
+content at once cannot both be told they changed something. Scripts can
+idempotently re-apply configuration without cost, and every
+`document_write` in the trail is a real change.
 
 ## 8. Update ACL
 
@@ -257,13 +266,18 @@ curl -si $CFG/api/v1/config/tariffs
 ```http
 Content-Type: application/json
 X-Read-Role: public
-X-Write-Role: admin
 Cache-Control: public, max-age=60
 Access-Control-Allow-Origin: *
 Vary: Origin, Authorization
 
 {"standing":0.51,"unit":0.24}
 ```
+
+Note what is absent: **no `X-Write-Role`**. An authenticated read of this
+same namespace carries it; an anonymous one does not. That a plain `user`
+token suffices to write is a nudge toward where to point a stolen one, and
+nobody without a token can act on it. `X-Read-Role` stays, because the read
+having succeeded already implies it.
 
 `Cache-Control: public, max-age=60` is what lets a CDN serve the
 document without touching the service — and it is also the revoke

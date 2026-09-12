@@ -210,7 +210,6 @@ curl https://config.example.com/api/v1/config \
     "read_role":           "user",
     "write_role":          "admin",
     "updated_at":          "2026-05-01T10:00:00.000Z",
-    "updated_by":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
     "updated_by_username": "sweeney",
     "created_at":          "2026-04-01T09:00:00.000Z"
   },
@@ -219,7 +218,6 @@ curl https://config.example.com/api/v1/config \
     "read_role":           "admin",
     "write_role":          "admin",
     "updated_at":          "2026-04-15T14:22:00.000Z",
-    "updated_by":          "provisioner",
     "created_at":          "2026-04-15T14:22:00.000Z"
   }
 ]
@@ -234,31 +232,37 @@ it carries no `updated_by_username` at all.
 | `read_role` | `admin`, `user` or `public` |
 | `write_role` | `admin` or `user` |
 | `updated_at` | Last write to the document *or* the ACL. RFC 3339 UTC, millisecond precision |
-| `updated_by` | Subject of the token that made that write; always present, and the stable key |
-| `updated_by_username` | That writer's username at the time of the write; omitted when none was recorded |
+| `updated_by_username` | That writer's username at the time of the write; omitted when none was recorded. The only writer field on this route — the identity `sub` is not returned here |
 | `created_at` | RFC 3339 UTC, millisecond precision |
 
 If the caller has the `user` role, `houses` would not appear in this list at
 all (not even as a tombstone).
 
-**`updated_by` is the key, `updated_by_username` is the label.** The username
-is recorded as it stood when the write was made and is stored at write time,
-never resolved at read time — the same reasoning as `actor_username` on an
-audit entry. It is omitted — absent, not empty — when none was recorded,
-because a service token has no user behind it and rows written before the
-field existed do not know one. Fall back to `updated_by`.
+**The name, and not the subject.** `updated_by_username` is recorded as it
+stood when the write was made and is stored at write time, never resolved at
+read time — the same reasoning as `actor_username` on an audit entry. It is
+omitted — absent, not empty — when none was recorded, because a service token
+has no user behind it and rows written before the field existed do not know
+one, and there is no fallback field here: the writer's identity `sub` is not
+returned on this route at all. It would answer "who" no better than the name
+does, and it is the half that correlates across every service trusting the
+same JWKS. Admins who need subjects have `actor` on the audit endpoint below.
 
 **The quickest answer to "who last edited this namespace's contents".** The
 audit trail carries a `document_write` entry for every change to a document,
-so it answers that question too — but only *that* the contents changed, by
-whom and when, never what they said. These two fields say the same about the
-most recent write without reading the history at all.
+so it answers that question too — *that* the contents changed, by whom and
+when, never what they said. What this field adds is the same answer without an
+admin token and without reading a whole history. It is only ever the last
+writer, though; the trail is what keeps the history.
 
 **Deliberately here and not on `GET /api/v1/config/{ns}`.** That endpoint may
 be answered anonymously when the namespace is `read_role: public`, and
-publishing a document should not publish who edits it. The list always
-requires a token. Within the list both fields are visible to any caller whose
-role lets them see the namespace at all — they are not admin-only.
+publishing a document must not publish who edits it. The list always requires
+a token. Within the list there is no further restriction — any caller whose
+role lets them see the namespace sees who last touched it, which is what every
+collaborative system shows, so it is not admin-only. The audit endpoint is
+admin-only for a different reason: it discloses a pattern over time — everyone
+who ever acted, and when — rather than one current fact.
 
 ---
 
@@ -363,7 +367,10 @@ curl -X PUT https://config.example.com/api/v1/config/mqtt_topics \
 `changed: true` means the document was different and a write occurred.
 `changed: false` means the submitted document was byte-identical (after JSON
 compaction) to what was stored. No database write occurs, no backup is
-triggered. Safe to call in an idempotent loop.
+triggered. Safe to call in an idempotent loop. The comparison is made inside
+the write transaction, against the row being overwritten, so two callers
+submitting the same new content concurrently cannot both be told they changed
+something.
 
 A write that does change the document records a `document_write` entry in the
 namespace's audit trail (below) — that it changed, by whom and when, never the
@@ -547,18 +554,22 @@ a document does not publish its history: the history names everyone who has
 acted on the namespace and when, which the document itself tells nobody. That
 holds for the one recorded operation that is not itself admin-only — a
 `document_write` on a `write_role: user` namespace — because what is withheld
-here is the record of who acted, not the act. A `user` token gets `403`, so
-does a service token (pinned to the `user` role), and a request with no token
-gets `401` even on a public namespace. The response is
-`Cache-Control: private, no-store` and never carries a wildcard origin.
+here is the record of who acted, not the act. That the list above names the
+last writer to any caller who can see the namespace is not in tension with
+this: one current fact is not a pattern over time, and the list gives the name
+without the subject. A `user` token gets `403`, so does a service token
+(pinned to the `user` role), and a request with no token gets `401` even on a
+public namespace. The response is `Cache-Control: private, no-store` and never
+carries a wildcard origin.
 
 **Document bodies are never stored.** A `document_write` records that the
 contents changed, by whom and when — never a byte of what they said. Every
 write already ships the whole database to R2, so keeping 64 KB bodies would
 inflate the database and every backup without bound; to see what a document
 used to hold, restore the R2 backup from around that timestamp. A `PUT` that
-changes nothing is answered `changed: false` and records nothing at all, so
-every `document_write` in the trail is a real change.
+changes nothing is answered `changed: false` and records nothing at all — the
+comparison being made inside the write transaction — so every `document_write`
+in the trail is a real change.
 
 **An unknown or deleted namespace returns `200 []`, not `404`.** Entries
 outlive the namespace they describe, and "what happened to the one that is no
