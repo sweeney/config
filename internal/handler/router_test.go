@@ -152,7 +152,8 @@ func (r *fakeRepo) List() ([]domain.ConfigNamespaceSummary, error) {
 	for _, ns := range r.data {
 		out = append(out, domain.ConfigNamespaceSummary{
 			Name: ns.Name, ReadRole: ns.ReadRole, WriteRole: ns.WriteRole,
-			UpdatedAt: ns.UpdatedAt, CreatedAt: ns.CreatedAt,
+			UpdatedAt: ns.UpdatedAt, UpdatedBy: ns.UpdatedBy,
+			UpdatedByUsername: ns.UpdatedByUsername, CreatedAt: ns.CreatedAt,
 		})
 	}
 	return out, nil
@@ -184,6 +185,8 @@ func (r *fakeRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) error 
 		return domain.ErrConflict
 	}
 	c := *ns
+	c.UpdatedBy = actor.Sub
+	c.UpdatedByUsername = actor.Username
 	r.data[ns.Name] = &c
 	r.audit.Record(domain.AuditEntry{
 		Namespace:     ns.Name,
@@ -196,7 +199,7 @@ func (r *fakeRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) error 
 	})
 	return nil
 }
-func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error {
+func (r *fakeRepo) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
@@ -204,7 +207,8 @@ func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string
 		return domain.ErrNotFound
 	}
 	ns.Document = append(ns.Document[:0], document...)
-	ns.UpdatedBy = updatedBy
+	ns.UpdatedBy = actor.Sub
+	ns.UpdatedByUsername = actor.Username
 	ns.UpdatedAt = at
 	return nil
 }
@@ -232,6 +236,7 @@ func (r *fakeRepo) UpdateACL(name, rRole, wRole string, actor domain.Actor, at t
 		At:            at,
 	})
 	ns.ReadRole, ns.WriteRole, ns.UpdatedBy, ns.UpdatedAt = rRole, wRole, actor.Sub, at
+	ns.UpdatedByUsername = actor.Username
 	return nil
 }
 func (r *fakeRepo) Delete(name string, actor domain.Actor, at time.Time) error {
@@ -1506,4 +1511,54 @@ func TestAudit_UsernameOmittedWhenUnknown(t *testing.T) {
 	require.Len(t, entries, 1)
 	assert.Equal(t, "seed", entries[0]["actor"])
 	assert.NotContains(t, entries[0], "actor_username", "absent, not empty")
+}
+
+// TestList_ShowsWhoLastWrote: document writes are not audited, so without
+// this the question "who last changed this namespace" is unanswerable from
+// the API at all — updated_by was stored but never returned.
+func TestList_ShowsWhoLastWrote(t *testing.T) {
+	h := newHarness(t)
+	resp, _ := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "prefs", "read_role": "user", "write_role": "user",
+		"document": map[string]any{},
+	})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var list []map[string]any
+	require.NoError(t, json.Unmarshal(body, &list))
+	require.Len(t, list, 1)
+
+	assert.Equal(t, "admin-1", list[0]["updated_by"], "the subject is the stable key")
+	assert.Equal(t, "name-of-admin-1", list[0]["updated_by_username"])
+}
+
+// TestList_UsernameOmittedWhenUnknown: absent rather than empty, so clients
+// fall back to the subject.
+func TestList_UsernameOmittedWhenUnknown(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("prefs", "user", "user", `{}`)
+
+	_, body := h.do("GET", "/api/v1/config", h.adminTok, nil)
+	var list []map[string]any
+	require.NoError(t, json.Unmarshal(body, &list))
+	require.Len(t, list, 1)
+	assert.Equal(t, "seed", list[0]["updated_by"])
+	assert.NotContains(t, list[0], "updated_by_username", "absent, not empty")
+}
+
+// TestList_StillRequiresAToken: this is where a username is now disclosed,
+// so it matters that the route never became anonymous. A public namespace's
+// document is world-readable; who edits it is not.
+func TestList_StillRequiresAToken(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	pub, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, pub.StatusCode, "the document reads anonymously")
+
+	resp, _ := h.do("GET", "/api/v1/config", "", nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"but who wrote it is not disclosed without a token")
 }

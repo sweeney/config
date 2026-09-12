@@ -71,6 +71,25 @@
       ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' UTC';
   }
 
+  // "updated <when> by <who>". The username is the label where one was
+  // recorded, with the identity subject on hover — the same convention the
+  // audit panel uses. Falls back to the bare subject when no username was
+  // recorded (a service token wrote it, or the row predates the column), and
+  // omits the "by" clause entirely if neither is known.
+  //
+  // Document writes are not in the audit trail by design, so this is the only
+  // place the SPA can say who last changed a namespace's contents.
+  function nsUpdatedMeta(ns) {
+    const subject  = ns.updated_by || '';
+    const username = ns.updated_by_username || '';
+    const who      = username || subject;
+    return el('div', {
+      class: 'meta',
+      title: (username && subject) ? subject : false,
+      text:  'updated ' + fmtTime(ns.updated_at) + (who ? ' by ' + who : ''),
+    });
+  }
+
   function badge(role) {
     return el('span', { class: 'badge ' + role, text: role });
   }
@@ -126,7 +145,7 @@
       for (const ns of items) {
         const left = el('div', null, [
           el('a', { class: 'name', href: '#/edit/' + encodeURIComponent(ns.name), text: ns.name }),
-          el('div', { class: 'meta', text: 'updated ' + fmtTime(ns.updated_at) }),
+          nsUpdatedMeta(ns),
         ]);
         const right = el('div', { class: 'badges' }, [
           el('span', { class: 'meta', text: 'read' }), badge(ns.read_role),

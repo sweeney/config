@@ -253,16 +253,28 @@ func listHandler(svc *service.ConfigService) http.HandlerFunc {
 			ReadRole  string `json:"read_role"`
 			WriteRole string `json:"write_role"`
 			UpdatedAt string `json:"updated_at"`
-			CreatedAt string `json:"created_at"`
+			UpdatedBy string `json:"updated_by"`
+			// Omitted when not recorded: service tokens have no username, and
+			// rows predating the column do not know one. Clients fall back to
+			// updated_by.
+			//
+			// This is disclosed on the authenticated list rather than on the
+			// namespace GET deliberately. The GET may be anonymous for a
+			// public namespace, and publishing a document should not publish
+			// who edits it.
+			UpdatedByUsername string `json:"updated_by_username,omitempty"`
+			CreatedAt         string `json:"created_at"`
 		}
 		out := make([]item, 0, len(list))
 		for _, ns := range list {
 			out = append(out, item{
-				Name:      ns.Name,
-				ReadRole:  ns.ReadRole,
-				WriteRole: ns.WriteRole,
-				UpdatedAt: ns.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-				CreatedAt: ns.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+				Name:              ns.Name,
+				ReadRole:          ns.ReadRole,
+				WriteRole:         ns.WriteRole,
+				UpdatedAt:         ns.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+				UpdatedBy:         ns.UpdatedBy,
+				UpdatedByUsername: ns.UpdatedByUsername,
+				CreatedAt:         ns.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			})
 		}
 		writeJSON(w, http.StatusOK, out)

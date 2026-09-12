@@ -218,6 +218,16 @@ echo
 echo "=== 8. List visibility ==="
 ADMIN_LIST=$(curl -s -H "Authorization: Bearer $ADMIN_TOK" "$CFG_BASE/api/v1/config")
 USER_LIST=$(curl -s -H "Authorization: Bearer $USER_TOK" "$CFG_BASE/api/v1/config")
+# Document writes are not audited, so updated_by is the only record of who
+# last changed a namespace's contents — and until now it was stored but never
+# returned by any endpoint.
+check_contains "list says who last wrote each namespace" '"updated_by"' "$ADMIN_LIST"
+check_contains "and names them, not just their id" "\"updated_by_username\":\"$ADMIN_USER\"" "$ADMIN_LIST"
+# Deliberately on the authenticated list and not on the namespace GET, which
+# may be anonymous for a public namespace.
+check "who wrote it is not disclosed anonymously" "401" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config")"
+
 check_contains "admin sees 'houses'" "houses" "$ADMIN_LIST"
 check_contains "admin sees 'mqtt'" "mqtt" "$ADMIN_LIST"
 check_contains "user sees 'mqtt'" "mqtt" "$USER_LIST"

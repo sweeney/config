@@ -190,7 +190,7 @@ func (s *ConfigService) PutDocument(caller Caller, name string, document []byte)
 		return false, nil
 	}
 
-	if err := s.repo.UpdateDocument(name, normalizedDoc, caller.Sub, s.now()); err != nil {
+	if err := s.repo.UpdateDocument(name, normalizedDoc, caller.actor(), s.now()); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return false, ErrConfigNamespaceNotFound
 		}

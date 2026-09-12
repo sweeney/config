@@ -103,15 +103,23 @@ type ConfigNamespace struct {
 	UpdatedAt time.Time
 	UpdatedBy string
 	CreatedAt time.Time
+
+	// UpdatedByUsername is who last wrote this namespace, by name as it stood
+	// then. Empty for callers without one — service tokens — and for rows
+	// written before the column existed. Document writes are not audited, so
+	// this is the only record of who last changed the contents.
+	UpdatedByUsername string
 }
 
 // ConfigNamespaceSummary is returned by List — no document body.
 type ConfigNamespaceSummary struct {
-	Name      string
-	ReadRole  string
-	WriteRole string
-	UpdatedAt time.Time
-	CreatedAt time.Time
+	Name              string
+	ReadRole          string
+	WriteRole         string
+	UpdatedAt         time.Time
+	UpdatedBy         string
+	UpdatedByUsername string
+	CreatedAt         time.Time
 }
 
 // ConfigRepository is the persistence contract for config namespaces.
@@ -120,7 +128,7 @@ type ConfigRepository interface {
 	GetACL(name string) (readRole, writeRole string, err error)
 	Get(name string) (*ConfigNamespace, error)
 	Create(ns *ConfigNamespace, actor Actor) error
-	UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error
+	UpdateDocument(name string, document []byte, actor Actor, at time.Time) error
 	// UpdateACL replaces the ACL. publishConfirmed reports whether the caller
 	// supplied a valid confirmation; implementations must compare the
 	// incoming read role against the stored one inside the write transaction

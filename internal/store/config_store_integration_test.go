@@ -105,7 +105,7 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 	}, domain.Actor{Sub: "u1"}))
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), "u2", later))
+	require.NoError(t, s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), domain.Actor{Sub: "u2"}, later))
 
 	got, err := s.Get("mqtt")
 	require.NoError(t, err)
@@ -117,7 +117,7 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 
 func TestConfigStore_UpdateDocument_NotFound(t *testing.T) {
 	s := store.NewConfigStore(openTestDB(t))
-	err := s.UpdateDocument("missing", []byte(`{}`), "u", time.Now().UTC())
+	err := s.UpdateDocument("missing", []byte(`{}`), domain.Actor{Sub: "u"}, time.Now().UTC())
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
@@ -473,4 +473,70 @@ func TestConfigStore_Audit_UsernameSurvivesReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "alice", entries[0].ActorUsername, "the recorded username survives a reopen")
+}
+
+// --- who last wrote the document ---
+
+// TestConfigStore_RecordsWhoLastWroteTheDocument: document writes are not
+// audited by design, so this column is the only record of who last edited a
+// namespace's contents. It must follow every write path, not just create.
+func TestConfigStore_RecordsWhoLastWroteTheDocument(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "prefs", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+
+	got, err := s.Get("prefs")
+	require.NoError(t, err)
+	assert.Equal(t, "sub-1", got.UpdatedBy)
+	assert.Equal(t, "alice", got.UpdatedByUsername, "create records the writer")
+
+	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":1}`),
+		domain.Actor{Sub: "sub-2", Username: "bob"}, now.Add(time.Minute)))
+	got, err = s.Get("prefs")
+	require.NoError(t, err)
+	assert.Equal(t, "sub-2", got.UpdatedBy)
+	assert.Equal(t, "bob", got.UpdatedByUsername, "a document write moves it on")
+
+	require.NoError(t, s.UpdateACL("prefs", "public", "user",
+		domain.Actor{Sub: "sub-3", Username: "carol"}, now.Add(2*time.Minute), true))
+	got, err = s.Get("prefs")
+	require.NoError(t, err)
+	assert.Equal(t, "carol", got.UpdatedByUsername, "so does an ACL change")
+}
+
+// TestConfigStore_List_CarriesWhoLastWrote: the list is where this is
+// surfaced, so the summary has to carry it.
+func TestConfigStore_List_CarriesWhoLastWrote(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "prefs", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+
+	list, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "sub-1", list[0].UpdatedBy)
+	assert.Equal(t, "alice", list[0].UpdatedByUsername)
+}
+
+// TestConfigStore_UsernameOptionalOnNamespaces: a caller with no username —
+// a service token writing a document — leaves it unset rather than blank.
+func TestConfigStore_UsernameOptionalOnNamespaces(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "svc", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "client-abc"}))
+
+	got, err := s.Get("svc")
+	require.NoError(t, err)
+	assert.Equal(t, "client-abc", got.UpdatedBy)
+	assert.Empty(t, got.UpdatedByUsername)
 }

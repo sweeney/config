@@ -42,8 +42,16 @@ const schemaVersionPublicReadRole = 1
 // hard-coded and the copy names these columns explicitly, so an unrecognised
 // column would be dropped silently — and the row-count check cannot see it,
 // because the counts still match.
+//
+// Adding a column to config_namespaces therefore means changing three things
+// here as well as writing the migration: this list, newNamespacesDDL, and the
+// INSERT/SELECT in rebuildNamespacesTable. Migrations run before this code,
+// so a column added without them fails startup closed rather than quietly
+// losing data — which is the right way round, but is a startup outage on any
+// host that had not yet migrated.
 var expectedNamespaceColumns = []string{
-	"created_at", "document", "name", "read_role", "updated_at", "updated_by", "write_role",
+	"created_at", "document", "name", "read_role", "updated_at", "updated_by",
+	"updated_by_username", "write_role",
 }
 
 const (
@@ -66,6 +74,7 @@ const newNamespacesDDL = `CREATE TABLE %s (
     updated_at  TEXT NOT NULL,
     updated_by  TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    updated_by_username TEXT,
     CHECK (read_role IN ('admin', 'user', 'public')),
     CHECK (write_role IN ('admin', 'user'))
 )`
@@ -316,8 +325,10 @@ func rebuildNamespacesTable(sqlDB *sql.DB, expectedRows int) error {
 		"DROP TABLE IF EXISTS " + rebuildTable,
 		fmt.Sprintf(newNamespacesDDL, rebuildTable),
 		"INSERT INTO " + rebuildTable + `
-		   (name, read_role, write_role, document, updated_at, updated_by, created_at)
-		 SELECT name, read_role, write_role, document, updated_at, updated_by, created_at
+		   (name, read_role, write_role, document, updated_at, updated_by, created_at,
+		    updated_by_username)
+		 SELECT name, read_role, write_role, document, updated_at, updated_by, created_at,
+		        updated_by_username
 		   FROM ` + namespacesTable,
 	}
 	for _, stmt := range copyStmts {

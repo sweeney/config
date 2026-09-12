@@ -589,3 +589,71 @@ CREATE TABLE config_namespaces (
 	require.NoError(t, insertNamespace(database.DB(), "open", "public", "admin"))
 	assert.Equal(t, 1, userVersion(t, database.DB()))
 }
+
+// TestOpen_RebuildCarriesUpdatedByUsername is the coupling test between
+// db/migrations and the rebuild in schema.go.
+//
+// Migrations run before ensurePublicReadRole, so on a host that has not yet
+// migrated, a migration adding a column to config_namespaces lands first and
+// the rebuild then sees a column it did not create. If the rebuild does not
+// know about it, assertNoUnexpectedColumns refuses to boot — and if it were
+// taught to tolerate it without also copying it, the column would be
+// silently dropped instead. Both failure modes are exercised here: this
+// database has the narrow read_role CHECK (so the rebuild definitely runs)
+// and the new column already populated.
+func TestOpen_RebuildCarriesUpdatedByUsername(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.db")
+	raw := rawOpen(t, path)
+	_, err := raw.Exec(oldSchemaDDL)
+	require.NoError(t, err)
+	// As migration 004 leaves it, before the rebuild gets a look in.
+	_, err = raw.Exec(`ALTER TABLE config_namespaces ADD COLUMN updated_by_username TEXT`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`INSERT INTO config_namespaces
+	  (name, read_role, write_role, document, updated_at, updated_by, created_at, updated_by_username)
+	  VALUES ('houses','admin','admin','{"a":1}','t','sub-1','t','alice')`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	database, err := db.Open(path)
+	require.NoError(t, err, "the rebuild must accept a column its own migrations added")
+	defer database.Close()
+
+	var ddl string
+	require.NoError(t, database.DB().QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
+	assert.Contains(t, ddl, "'public'", "the rebuild ran")
+
+	var n int
+	require.NoError(t, database.DB().QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('config_namespaces') WHERE name='updated_by_username'").Scan(&n))
+	assert.Equal(t, 1, n, "the column survived the rebuild")
+
+	var sub, username, doc string
+	require.NoError(t, database.DB().QueryRow(
+		`SELECT updated_by, updated_by_username, document FROM config_namespaces WHERE name='houses'`,
+	).Scan(&sub, &username, &doc))
+	assert.Equal(t, "sub-1", sub)
+	assert.Equal(t, "alice", username, "and its value was carried across, not dropped")
+	assert.JSONEq(t, `{"a":1}`, doc)
+}
+
+// TestOpen_FreshInstallHasUpdatedByUsername: a new database reaches the same
+// shape by a different route — 001 creates the table, 004 adds the column,
+// and no rebuild runs at all.
+func TestOpen_FreshInstallHasUpdatedByUsername(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.db")
+	database, err := db.Open(path)
+	require.NoError(t, err)
+	defer database.Close()
+
+	var n int
+	require.NoError(t, database.DB().QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('config_namespaces') WHERE name='updated_by_username'").Scan(&n))
+	assert.Equal(t, 1, n)
+
+	var ddl string
+	require.NoError(t, database.DB().QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
+	assert.NotContains(t, ddl, `"config_namespaces"`, "a fresh install still does not rebuild")
+}

@@ -23,7 +23,8 @@ func NewConfigStore(database *db.Database) *ConfigStore {
 
 func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 	rows, err := s.db.DB().Query(
-		`SELECT name, read_role, write_role, updated_at, created_at
+		`SELECT name, read_role, write_role, updated_at, updated_by,
+		        updated_by_username, created_at
 		 FROM config_namespaces ORDER BY name ASC`,
 	)
 	if err != nil {
@@ -35,11 +36,14 @@ func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 	for rows.Next() {
 		var (
 			sum                  domain.ConfigNamespaceSummary
+			updatedByUsername    sql.NullString
 			updatedAt, createdAt string
 		)
-		if err := rows.Scan(&sum.Name, &sum.ReadRole, &sum.WriteRole, &updatedAt, &createdAt); err != nil {
+		if err := rows.Scan(&sum.Name, &sum.ReadRole, &sum.WriteRole, &updatedAt,
+			&sum.UpdatedBy, &updatedByUsername, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan config namespace: %w", err)
 		}
+		sum.UpdatedByUsername = updatedByUsername.String
 		sum.UpdatedAt = parseTime(updatedAt)
 		sum.CreatedAt = parseTime(createdAt)
 		out = append(out, sum)
@@ -68,22 +72,26 @@ func (s *ConfigStore) GetACL(name string) (string, string, error) {
 
 func (s *ConfigStore) Get(name string) (*domain.ConfigNamespace, error) {
 	row := s.db.DB().QueryRow(
-		`SELECT name, read_role, write_role, document, updated_at, updated_by, created_at
+		`SELECT name, read_role, write_role, document, updated_at, updated_by,
+		        updated_by_username, created_at
 		 FROM config_namespaces WHERE name = ?`,
 		name,
 	)
 	var (
 		ns                   domain.ConfigNamespace
 		document             string
+		updatedByUsername    sql.NullString
 		updatedAt, createdAt string
 	)
-	err := row.Scan(&ns.Name, &ns.ReadRole, &ns.WriteRole, &document, &updatedAt, &ns.UpdatedBy, &createdAt)
+	err := row.Scan(&ns.Name, &ns.ReadRole, &ns.WriteRole, &document, &updatedAt,
+		&ns.UpdatedBy, &updatedByUsername, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNotFound
 		}
 		return nil, fmt.Errorf("get config namespace: %w", err)
 	}
+	ns.UpdatedByUsername = updatedByUsername.String
 	ns.Document = []byte(document)
 	ns.UpdatedAt = parseTime(updatedAt)
 	ns.CreatedAt = parseTime(createdAt)
@@ -189,8 +197,9 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 
 		_, err := tx.Exec(
 			`INSERT INTO config_namespaces
-			   (name, read_role, write_role, document, updated_at, updated_by, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			   (name, read_role, write_role, document, updated_at, updated_by,
+			    created_at, updated_by_username)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			ns.Name,
 			ns.ReadRole,
 			ns.WriteRole,
@@ -198,6 +207,7 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 			formatTime(ns.UpdatedAt),
 			actor.Sub,
 			formatTime(ns.CreatedAt),
+			nullableRole(actor.Username),
 		)
 		if err != nil {
 			if isUniqueConstraint(err) {
@@ -209,14 +219,15 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 	})
 }
 
-func (s *ConfigStore) UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error {
+func (s *ConfigStore) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) error {
 	res, err := s.db.DB().Exec(
 		`UPDATE config_namespaces
-		 SET document = ?, updated_at = ?, updated_by = ?
+		 SET document = ?, updated_at = ?, updated_by = ?, updated_by_username = ?
 		 WHERE name = ?`,
 		string(document),
 		formatTime(at),
-		updatedBy,
+		actor.Sub,
+		nullableRole(actor.Username),
 		name,
 	)
 	if err != nil {
@@ -258,12 +269,14 @@ func (s *ConfigStore) UpdateACL(name, readRole, writeRole string, actor domain.A
 
 		res, err := tx.Exec(
 			`UPDATE config_namespaces
-			 SET read_role = ?, write_role = ?, updated_at = ?, updated_by = ?
+			 SET read_role = ?, write_role = ?, updated_at = ?, updated_by = ?,
+			     updated_by_username = ?
 			 WHERE name = ?`,
 			readRole,
 			writeRole,
 			formatTime(at),
 			actor.Sub,
+			nullableRole(actor.Username),
 			name,
 		)
 		if err != nil {

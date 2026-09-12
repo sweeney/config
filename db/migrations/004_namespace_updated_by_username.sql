@@ -1,0 +1,20 @@
+-- Record who last wrote a namespace's document, by name as well as by
+-- identity subject.
+--
+-- The subject stays authoritative. The username is the human label as it
+-- stood at the time, stored rather than resolved later for the same reasons
+-- as config_audit.actor_username. This one matters on its own account
+-- because document writes are deliberately not audited, so the audit trail
+-- cannot answer "who last edited this" and this column is the only thing
+-- that can.
+--
+-- Nullable and not backfilled. Rows written before this column existed do
+-- not know the username, and asking identity for the current name of that
+-- subject would record a present-day fact as a historical one.
+--
+-- Note for whoever adds the next one of these. The rebuild in db/schema.go
+-- carries a hard-coded column list, so a column added here must also be
+-- added in three places there, or startup fails closed with "unrecognised
+-- column". Note also that this file must contain no semicolon outside a
+-- statement, comments included. See sweeney/identity#44.
+ALTER TABLE config_namespaces ADD COLUMN updated_by_username TEXT;
