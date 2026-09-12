@@ -1,4 +1,4 @@
--- Audit trail for namespace lifecycle and ACL changes.
+-- Audit trail for namespace lifecycle, access and content changes.
 --
 -- There is deliberately NO foreign key to config_namespaces. PRAGMA
 -- foreign_keys is ON, so a foreign key here would either cascade these rows
@@ -6,11 +6,18 @@
 -- which is the single event most worth keeping -- or block the delete
 -- outright. The trail has to outlive the thing it describes.
 --
--- Document writes are not recorded and document bodies are never stored.
--- Every write already triggers a full-database upload to R2, so auditing
--- 64KB bodies would inflate both the database and every backup without
--- bound. This table records who changed a namespace's existence or its
--- access rules, not what was in it.
+-- Document bodies are never stored. A document write is recorded as an event
+-- -- who wrote, and when -- but not what was written: every write already
+-- ships the whole database to R2, so keeping 64KB bodies here would inflate
+-- both the database and every backup without bound. To see what a document
+-- used to contain, restore the backup from around that timestamp.
+--
+-- The action CHECK below lists document_write, but only new databases get it
+-- from here: CREATE TABLE IF NOT EXISTS means a database that already has the
+-- table does not re-run this statement. Those go through widenAuditActions in
+-- db/schema.go, which rebuilds the table because SQLite cannot ALTER a CHECK.
+-- Same split, and same reason, as the read_role widening in 001_init.sql.
+--
 CREATE TABLE IF NOT EXISTS config_audit (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace   TEXT NOT NULL,
@@ -21,7 +28,7 @@ CREATE TABLE IF NOT EXISTS config_audit (
     new_write   TEXT,
     actor       TEXT NOT NULL,
     at          TEXT NOT NULL,
-    CHECK (action IN ('create', 'acl_change', 'delete')),
+    CHECK (action IN ('create', 'acl_change', 'delete', 'document_write')),
     -- The role columns are constrained to the same values config_namespaces
     -- allows. This is the artefact you reach for when reconstructing how a
     -- namespace came to be public, so it is the last place that should be

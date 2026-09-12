@@ -48,6 +48,13 @@ const (
 	AuditActionCreate    = "create"
 	AuditActionACLChange = "acl_change"
 	AuditActionDelete    = "delete"
+
+	// AuditActionDocumentWrite records that a namespace's contents changed.
+	// The event only — never the body. Every write already ships the whole
+	// database to R2, so keeping documents here would inflate both the
+	// database and every backup without bound. To see what a document used
+	// to contain, restore the backup from around that timestamp.
+	AuditActionDocumentWrite = "document_write"
 )
 
 // Actor is who performed a change: the identity subject, which is the stable
@@ -64,12 +71,12 @@ type Actor struct {
 	Username string
 }
 
-// AuditEntry is one recorded change to a namespace's existence or its access
-// rules. Document writes are not audited and document bodies are never
-// recorded — this answers "who changed the rules, and when", not "what was
-// in it".
+// AuditEntry is one recorded change to a namespace: its creation, its access
+// rules, its contents, or its deletion. Document bodies are never recorded —
+// this answers "who changed it, and when", not "what it said".
 //
-// Old roles are empty on create; new roles are empty on delete.
+// Old roles are empty on create, new roles on delete, and both on a document
+// write, which moves no roles.
 type AuditEntry struct {
 	ID            int64
 	Namespace     string
@@ -103,6 +110,17 @@ type ConfigNamespace struct {
 	UpdatedAt time.Time
 	UpdatedBy string
 	CreatedAt time.Time
+
+	// UpdatedByUsername is who last modified this namespace — its document or
+	// its ACL, since UpdateACL writes this too — by name as it stood then.
+	// NULL in the database, so empty here, for callers without a username
+	// (service tokens) and for rows written before the column existed;
+	// UpdatedBy is always present.
+	//
+	// The same change is also in the audit trail, as a document_write or an
+	// acl_change. This field is that answer without an admin token and
+	// without reading a whole history.
+	UpdatedByUsername string
 }
 
 // ConfigNamespaceSummary is returned by List — no document body.
@@ -111,7 +129,14 @@ type ConfigNamespaceSummary struct {
 	ReadRole  string
 	WriteRole string
 	UpdatedAt time.Time
-	CreatedAt time.Time
+
+	// UpdatedByUsername only: the identity subject is deliberately not
+	// carried here. The decision was to withhold it from the list, and a
+	// populated field one line from the handler is an invitation to put it
+	// back on the grounds that it is already there. ConfigNamespace keeps
+	// UpdatedBy — the column is still written, and Get still returns it.
+	UpdatedByUsername string
+	CreatedAt         time.Time
 }
 
 // ConfigRepository is the persistence contract for config namespaces.
@@ -120,7 +145,12 @@ type ConfigRepository interface {
 	GetACL(name string) (readRole, writeRole string, err error)
 	Get(name string) (*ConfigNamespace, error)
 	Create(ns *ConfigNamespace, actor Actor) error
-	UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error
+	// UpdateDocument replaces the document and reports whether anything
+	// changed. The comparison happens inside the write transaction: doing it
+	// in a separate read let two concurrent writers of the same new content
+	// both observe a difference, and the loser then recorded a document_write
+	// for a change that did not happen.
+	UpdateDocument(name string, document []byte, actor Actor, at time.Time) (changed bool, err error)
 	// UpdateACL replaces the ACL. publishConfirmed reports whether the caller
 	// supplied a valid confirmation; implementations must compare the
 	// incoming read role against the stored one inside the write transaction

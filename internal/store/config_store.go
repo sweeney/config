@@ -23,7 +23,8 @@ func NewConfigStore(database *db.Database) *ConfigStore {
 
 func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 	rows, err := s.db.DB().Query(
-		`SELECT name, read_role, write_role, updated_at, created_at
+		`SELECT name, read_role, write_role, updated_at,
+		        updated_by_username, created_at
 		 FROM config_namespaces ORDER BY name ASC`,
 	)
 	if err != nil {
@@ -35,11 +36,14 @@ func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 	for rows.Next() {
 		var (
 			sum                  domain.ConfigNamespaceSummary
+			updatedByUsername    sql.NullString
 			updatedAt, createdAt string
 		)
-		if err := rows.Scan(&sum.Name, &sum.ReadRole, &sum.WriteRole, &updatedAt, &createdAt); err != nil {
+		if err := rows.Scan(&sum.Name, &sum.ReadRole, &sum.WriteRole, &updatedAt,
+			&updatedByUsername, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan config namespace: %w", err)
 		}
+		sum.UpdatedByUsername = updatedByUsername.String
 		sum.UpdatedAt = parseTime(updatedAt)
 		sum.CreatedAt = parseTime(createdAt)
 		out = append(out, sum)
@@ -68,22 +72,26 @@ func (s *ConfigStore) GetACL(name string) (string, string, error) {
 
 func (s *ConfigStore) Get(name string) (*domain.ConfigNamespace, error) {
 	row := s.db.DB().QueryRow(
-		`SELECT name, read_role, write_role, document, updated_at, updated_by, created_at
+		`SELECT name, read_role, write_role, document, updated_at, updated_by,
+		        updated_by_username, created_at
 		 FROM config_namespaces WHERE name = ?`,
 		name,
 	)
 	var (
 		ns                   domain.ConfigNamespace
 		document             string
+		updatedByUsername    sql.NullString
 		updatedAt, createdAt string
 	)
-	err := row.Scan(&ns.Name, &ns.ReadRole, &ns.WriteRole, &document, &updatedAt, &ns.UpdatedBy, &createdAt)
+	err := row.Scan(&ns.Name, &ns.ReadRole, &ns.WriteRole, &document, &updatedAt,
+		&ns.UpdatedBy, &updatedByUsername, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNotFound
 		}
 		return nil, fmt.Errorf("get config namespace: %w", err)
 	}
+	ns.UpdatedByUsername = updatedByUsername.String
 	ns.Document = []byte(document)
 	ns.UpdatedAt = parseTime(updatedAt)
 	ns.CreatedAt = parseTime(createdAt)
@@ -121,15 +129,15 @@ func (s *ConfigStore) withTx(fn func(*sql.Tx) error) error {
 	return nil
 }
 
-// nullableRole maps an inapplicable value to NULL rather than to the empty
-// string: "this event had no previous ACL" is different from "the previous
-// ACL was blank". Also used for the actor username, where NULL means "not
-// recorded" rather than "named the empty string".
-func nullableRole(role string) any {
-	if role == "" {
+// nullIfEmpty stores an absent value as NULL rather than as the empty string.
+// "This event had no previous ACL" is a different fact from "the previous ACL
+// was blank", and the same distinction applies to a username that was never
+// recorded.
+func nullIfEmpty(v string) any {
+	if v == "" {
 		return nil
 	}
-	return role
+	return v
 }
 
 // insertAudit appends one audit row. It is always called BEFORE the mutation
@@ -142,12 +150,12 @@ func insertAudit(tx *sql.Tx, e domain.AuditEntry) error {
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Namespace,
 		e.Action,
-		nullableRole(e.OldReadRole),
-		nullableRole(e.OldWriteRole),
-		nullableRole(e.NewReadRole),
-		nullableRole(e.NewWriteRole),
+		nullIfEmpty(e.OldReadRole),
+		nullIfEmpty(e.OldWriteRole),
+		nullIfEmpty(e.NewReadRole),
+		nullIfEmpty(e.NewWriteRole),
 		e.Actor,
-		nullableRole(e.ActorUsername),
+		nullIfEmpty(e.ActorUsername),
 		formatTime(e.At),
 	)
 	if err != nil {
@@ -189,8 +197,9 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 
 		_, err := tx.Exec(
 			`INSERT INTO config_namespaces
-			   (name, read_role, write_role, document, updated_at, updated_by, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			   (name, read_role, write_role, document, updated_at, updated_by,
+			    created_at, updated_by_username)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			ns.Name,
 			ns.ReadRole,
 			ns.WriteRole,
@@ -198,6 +207,7 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 			formatTime(ns.UpdatedAt),
 			actor.Sub,
 			formatTime(ns.CreatedAt),
+			nullIfEmpty(actor.Username),
 		)
 		if err != nil {
 			if isUniqueConstraint(err) {
@@ -209,24 +219,56 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 	})
 }
 
-func (s *ConfigStore) UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error {
-	res, err := s.db.DB().Exec(
-		`UPDATE config_namespaces
-		 SET document = ?, updated_at = ?, updated_by = ?
-		 WHERE name = ?`,
-		string(document),
-		formatTime(at),
-		updatedBy,
-		name,
-	)
-	if err != nil {
-		return fmt.Errorf("update config document: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+func (s *ConfigStore) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) (bool, error) {
+	changed := false
+	err := s.withTx(func(tx *sql.Tx) error {
+		// Read the stored document inside the transaction and compare here.
+		// Comparing in a separate read beforehand left a window: two writers
+		// of the same new content both saw a difference, and the second wrote
+		// bytes identical to what was already there — recording a
+		// document_write for a change that did not happen. Deciding against
+		// the row being overwritten makes "every document_write is a real
+		// change" true rather than nearly true.
+		var stored string
+		err := tx.QueryRow(
+			`SELECT document FROM config_namespaces WHERE name = ?`, name,
+		).Scan(&stored)
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("read config document: %w", err)
+		}
+		if stored == string(document) {
+			return nil
+		}
+		changed = true
+		if err := insertAudit(tx, domain.AuditEntry{
+			Namespace:     name,
+			Action:        domain.AuditActionDocumentWrite,
+			Actor:         actor.Sub,
+			ActorUsername: actor.Username,
+			At:            at,
+		}); err != nil {
+			return err
+		}
+
+		// The row was read above, so it exists: no RowsAffected check needed.
+		if _, err := tx.Exec(
+			`UPDATE config_namespaces
+			 SET document = ?, updated_at = ?, updated_by = ?, updated_by_username = ?
+			 WHERE name = ?`,
+			string(document),
+			formatTime(at),
+			actor.Sub,
+			nullIfEmpty(actor.Username),
+			name,
+		); err != nil {
+			return fmt.Errorf("update config document: %w", err)
+		}
+		return nil
+	})
+	return changed, err
 }
 
 func (s *ConfigStore) UpdateACL(name, readRole, writeRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
@@ -258,12 +300,14 @@ func (s *ConfigStore) UpdateACL(name, readRole, writeRole string, actor domain.A
 
 		res, err := tx.Exec(
 			`UPDATE config_namespaces
-			 SET read_role = ?, write_role = ?, updated_at = ?, updated_by = ?
+			 SET read_role = ?, write_role = ?, updated_at = ?, updated_by = ?,
+			     updated_by_username = ?
 			 WHERE name = ?`,
 			readRole,
 			writeRole,
 			formatTime(at),
 			actor.Sub,
+			nullIfEmpty(actor.Username),
 			name,
 		)
 		if err != nil {

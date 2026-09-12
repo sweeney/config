@@ -27,23 +27,79 @@ import (
 // namespace may be readable without a token; nothing is ever anonymously
 // writable.
 
-// schemaVersionPublicReadRole is written to PRAGMA user_version once the
-// table is known to accept read_role='public'.
+// currentSchemaVersion is the number of schema steps this binary knows about.
+// It is recorded in PRAGMA user_version, which acts as the ledger the
+// migration runner in common/db does not have: steps below the recorded
+// version are skipped outright rather than re-derived.
 //
-// Recording it matters more than it looks. Without it the answer is
-// re-derived from scratch on every Open, which means a probe that fails for
-// some unrelated reason sends a perfectly healthy database into a
+// Recording it matters more than it looks. Without it each step's "has this
+// been done?" question is re-answered on every Open, and a probe that fails
+// for some unrelated reason sends a perfectly healthy database into a
 // destructive rebuild — repeatedly, writing a fresh full-size snapshot each
-// boot. With it, the question is asked once.
-const schemaVersionPublicReadRole = 1
+// boot.
+//
+//  1. config_namespaces.read_role accepts 'public'
+//  2. config_audit.action accepts 'document_write'
+const currentSchemaVersion = 2
+
+// auditTable and its rebuild twin, for step 2.
+// domainActionDocumentWrite mirrors domain.AuditActionDocumentWrite. Spelled
+// out rather than imported so db/ stays free of domain dependencies, exactly
+// as ConfigRolePublicLiteral does.
+const domainActionDocumentWrite = "document_write"
+
+const (
+	auditTable        = "config_audit"
+	auditRebuildTable = "config_audit_rebuild_actions"
+	auditIndex        = "idx_config_audit_namespace"
+)
+
+// expectedAuditColumns is to config_audit what expectedNamespaceColumns is to
+// config_namespaces: the exact set the rebuild knows how to carry across.
+// The same ordering hazard applies — migrations run before applySchemaSteps,
+// so a later migration adding a column here lands before this code sees the
+// table, and a hard-coded copy list would drop it silently while the
+// row-count check still passed.
+var expectedAuditColumns = []string{
+	"action", "actor", "actor_username", "at", "id", "namespace",
+	"new_read", "new_write", "old_read", "old_write",
+}
+
+// newAuditDDL is the target shape for config_audit. %s is the table name so
+// the same text serves the rebuild table and, after RENAME, the real one.
+const newAuditDDL = `CREATE TABLE %s (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace   TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    old_read    TEXT,
+    old_write   TEXT,
+    new_read    TEXT,
+    new_write   TEXT,
+    actor       TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    actor_username TEXT,
+    CHECK (action IN ('create', 'acl_change', 'delete', 'document_write')),
+    CHECK (old_read  IS NULL OR old_read  IN ('admin', 'user', 'public')),
+    CHECK (new_read  IS NULL OR new_read  IN ('admin', 'user', 'public')),
+    CHECK (old_write IS NULL OR old_write IN ('admin', 'user')),
+    CHECK (new_write IS NULL OR new_write IN ('admin', 'user'))
+)`
 
 // expectedNamespaceColumns is the exact column set the rebuild knows how to
 // carry across. Anything else and it must refuse: newNamespacesDDL is
 // hard-coded and the copy names these columns explicitly, so an unrecognised
 // column would be dropped silently — and the row-count check cannot see it,
 // because the counts still match.
+//
+// Adding a column to config_namespaces therefore means changing three things
+// here as well as writing the migration: this list, newNamespacesDDL, and the
+// INSERT/SELECT in rebuildNamespacesTable. Migrations run before this code,
+// so a column added without them fails startup closed rather than quietly
+// losing data — which is the right way round, but is a startup outage on any
+// host that had not yet migrated.
 var expectedNamespaceColumns = []string{
-	"created_at", "document", "name", "read_role", "updated_at", "updated_by", "write_role",
+	"created_at", "document", "name", "read_role", "updated_at", "updated_by",
+	"updated_by_username", "write_role",
 }
 
 const (
@@ -66,6 +122,7 @@ const newNamespacesDDL = `CREATE TABLE %s (
     updated_at  TEXT NOT NULL,
     updated_by  TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    updated_by_username TEXT,
     CHECK (read_role IN ('admin', 'user', 'public')),
     CHECK (write_role IN ('admin', 'user'))
 )`
@@ -74,7 +131,11 @@ const newNamespacesDDL = `CREATE TABLE %s (
 var snapshotClock = func() time.Time { return time.Now().UTC() }
 
 // snapshotBeforeRebuild writes a consistent copy of the database next to it
-// and returns the path.
+// and returns the path. label distinguishes the step: a database old enough
+// to need two rebuilds takes two snapshots on the same boot, and a name
+// derived from the clock alone collided at whole-second resolution — VACUUM
+// INTO refuses an existing file, so the second step failed the boot outright.
+// The label also tells an operator which snapshot is which.
 //
 // VACUUM INTO rather than a file copy: the database runs in WAL mode, where
 // committed transactions may still be sitting in the -wal file, so copying
@@ -83,9 +144,9 @@ var snapshotClock = func() time.Time { return time.Now().UTC() }
 // The name carries a UTC timestamp so a second attempt can never overwrite
 // the snapshot from the first — the older one is the more original, and
 // clobbering it is exactly the mistake you cannot undo.
-func snapshotBeforeRebuild(sqlDB *sql.DB, dbPath string) (string, error) {
-	target := fmt.Sprintf("%s.pre-public-rebuild-%s",
-		dbPath, snapshotClock().Format("20060102T150405Z"))
+func snapshotBeforeRebuild(sqlDB *sql.DB, dbPath, label string) (string, error) {
+	target := fmt.Sprintf("%s.pre-%s-rebuild-%s",
+		dbPath, label, snapshotClock().Format("20060102T150405Z"))
 	if _, err := sqlDB.Exec("VACUUM INTO ?", target); err != nil {
 		return "", fmt.Errorf("write pre-rebuild snapshot to %s: %w", target, err)
 	}
@@ -95,21 +156,55 @@ func snapshotBeforeRebuild(sqlDB *sql.DB, dbPath string) (string, error) {
 // ensurePublicReadRole brings config_namespaces to a shape whose read_role
 // CHECK permits 'public'. It is a no-op when the table is absent (migrations
 // own creating it) or already wide enough, so it is safe to call on every Open.
-func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
+// applySchemaSteps brings the database up to currentSchemaVersion, running
+// only the steps it has not already recorded.
+func applySchemaSteps(sqlDB *sql.DB, dbPath string) error {
 	var recorded int
 	if err := sqlDB.QueryRow("PRAGMA user_version").Scan(&recorded); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	if recorded >= schemaVersionPublicReadRole {
+	if recorded > currentSchemaVersion {
+		// A database written by a later release than this binary — a rollback,
+		// most likely. Proceeding is right: the steps this binary knows are
+		// all applied, and refusing to start would turn a rollback into an
+		// outage. But saying "settled" here would be a reassuring lie, and
+		// this is exactly the moment someone is trying to work out why the
+		// service is behaving oddly.
+		log.Printf("config db: WARNING schema is at version %d but this binary only knows %d — "+
+			"this database was written by a newer release. Continuing, but expect columns and "+
+			"constraints this build does not know about.", recorded, currentSchemaVersion)
+		return nil
+	}
+	if recorded == currentSchemaVersion {
 		// Logged on every boot, deliberately. The fast path makes this a true
 		// no-op, but silence would leave "checked and settled" and "a binary
 		// that never checked" looking identical in the journal, which is the
 		// question an operator actually has after a deploy.
-		log.Printf("config db: schema check — public read role settled (schema version %d), nothing to do",
-			recorded)
+		log.Printf("config db: schema settled at version %d, nothing to do", recorded)
 		return nil
 	}
 
+	if recorded < 1 {
+		if err := ensurePublicReadRole(sqlDB, dbPath); err != nil {
+			return err
+		}
+		if err := recordSchemaVersion(sqlDB, 1); err != nil {
+			return err
+		}
+	}
+	if recorded < 2 {
+		if err := widenAuditActions(sqlDB, dbPath); err != nil {
+			return err
+		}
+		if err := recordSchemaVersion(sqlDB, 2); err != nil {
+			return err
+		}
+	}
+	log.Printf("config db: schema brought to version %d", currentSchemaVersion)
+	return nil
+}
+
+func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 	var existingDDL string
 	err := sqlDB.QueryRow(
 		"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", namespacesTable,
@@ -127,13 +222,14 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 		return err
 	}
 	if permitted {
+		// The caller records the step; this one simply has nothing to do.
 		log.Printf("config db: schema check — read_role already permits 'public', no rebuild needed")
-		return recordSchemaVersion(sqlDB)
+		return nil
 	}
 
 	// The rebuild flattens the table to expectedNamespaceColumns. If this
 	// database carries anything else, refuse rather than amputate it.
-	if err := assertNoUnexpectedColumns(sqlDB); err != nil {
+	if err := assertNoUnexpectedColumns(sqlDB, namespacesTable, expectedNamespaceColumns); err != nil {
 		return err
 	}
 
@@ -145,7 +241,7 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 	// Snapshot only when there is something to lose. A fresh install rebuilds
 	// an empty table on first boot, and snapshotting nothing is just litter.
 	if rows > 0 {
-		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath)
+		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath, "public")
 		if err != nil {
 			// Deliberately fatal. A database left un-migrated is recoverable;
 			// one migrated with no way back is not.
@@ -178,13 +274,154 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 
 	log.Printf("config db: schema rebuild complete — %d row(s) migrated in %s",
 		rows, time.Since(started).Round(time.Microsecond))
-	return recordSchemaVersion(sqlDB)
+	return nil
 }
 
-// recordSchemaVersion marks the public-read-role migration as settled.
-func recordSchemaVersion(sqlDB *sql.DB) error {
-	// PRAGMA does not accept a bound parameter, and the value is a constant.
-	stmt := fmt.Sprintf("PRAGMA user_version = %d", schemaVersionPublicReadRole)
+// widenAuditActions admits 'document_write' to config_audit.action.
+//
+// SQLite cannot ALTER a CHECK, and this table already exists in production,
+// so the constraint can only be widened by rebuilding. The table is
+// append-only and small, which makes this the gentler of the two rebuilds —
+// but its ids are load-bearing: ListAudit orders by id precisely so entries
+// written within the same clock tick keep their true order, so they are
+// copied rather than regenerated.
+func widenAuditActions(sqlDB *sql.DB, dbPath string) error {
+	var exists int
+	if err := sqlDB.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", auditTable,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("inspect %s: %w", auditTable, err)
+	}
+	if exists == 0 {
+		// Migrations own creating it; nothing to widen.
+		return nil
+	}
+
+	permitted, err := permitsAction(sqlDB, domainActionDocumentWrite)
+	if err != nil {
+		return err
+	}
+	if permitted {
+		// A database created after the migration was widened.
+		return nil
+	}
+
+	// Same guard as the namespaces rebuild, for the same reason: the copy
+	// below names its columns, so anything this code does not know about
+	// would be dropped without the row count noticing.
+	if err := assertNoUnexpectedColumns(sqlDB, auditTable, expectedAuditColumns); err != nil {
+		return err
+	}
+
+	var rows int
+	if err := sqlDB.QueryRow("SELECT COUNT(*) FROM " + auditTable).Scan(&rows); err != nil {
+		return fmt.Errorf("count %s before rebuild: %w", auditTable, err)
+	}
+	// Snapshot before touching the table this codebase calls the one that has
+	// to outlive everything else. The transaction covers a crash or a SQL
+	// error; it does not cover a logic error that commits cleanly, and there
+	// would then be nothing to go back to.
+	if rows > 0 {
+		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath, "audit")
+		if err != nil {
+			return err
+		}
+		log.Printf("config db: widening %s.action for %d row(s); snapshot written to %s",
+			auditTable, rows, snapshot)
+	} else {
+		log.Printf("config db: widening %s.action; table is empty, no snapshot taken", auditTable)
+	}
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin %s rebuild: %w", auditTable, err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	const cols = `id, namespace, action, old_read, old_write, new_read, new_write,
+	              actor, at, actor_username`
+	before := rows
+	for _, stmt := range []string{
+		"DROP TABLE IF EXISTS " + auditRebuildTable,
+		fmt.Sprintf(newAuditDDL, auditRebuildTable),
+		"INSERT INTO " + auditRebuildTable + " (" + cols + ") SELECT " + cols + " FROM " + auditTable,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("rebuild %s: %w", auditTable, err)
+		}
+	}
+	var copied int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM " + auditRebuildTable).Scan(&copied); err != nil {
+		return fmt.Errorf("verify %s rebuild: %w", auditTable, err)
+	}
+	if copied != before {
+		return fmt.Errorf("refusing to complete %s rebuild: copied %d row(s), expected %d",
+			auditTable, copied, before)
+	}
+	for _, stmt := range []string{
+		"DROP TABLE " + auditTable,
+		"ALTER TABLE " + auditRebuildTable + " RENAME TO " + auditTable,
+		"CREATE INDEX IF NOT EXISTS " + auditIndex + " ON " + auditTable + "(namespace, id)",
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("rebuild %s: %w", auditTable, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s rebuild: %w", auditTable, err)
+	}
+
+	// Confirm the rebuild achieved what it was for, so a misdiagnosis costs
+	// one failed start rather than a silent amputation.
+	permitted, err = permitsAction(sqlDB, domainActionDocumentWrite)
+	if err != nil {
+		return err
+	}
+	if !permitted {
+		return fmt.Errorf(
+			"rebuilt %s but it still rejects action=%q — refusing to continue",
+			auditTable, domainActionDocumentWrite)
+	}
+
+	log.Printf("config db: %s widened, %d row(s) carried across", auditTable, copied)
+	return nil
+}
+
+// permitsAction asks whether config_audit accepts an action value, using the
+// same positive-control differential as the read_role probe: a control row
+// with an action valid under both old and new shapes, then the one in
+// question. Both are rolled back. Reading semantics rather than the driver's
+// error text is what keeps this from breaking when a constraint is renamed
+// or a driver rewords its messages.
+func permitsAction(sqlDB *sql.DB, action string) (bool, error) {
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin action probe: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // the probe must never commit
+
+	insert := func(a string) error {
+		_, err := tx.Exec(
+			"INSERT INTO "+auditTable+" (namespace, action, actor, at) VALUES (?, ?, '', '')",
+			probeNamespace, a)
+		return err
+	}
+	if err := insert("create"); err != nil {
+		return false, fmt.Errorf(
+			"action probe control failed on %s: the table rejects a probe row even with an "+
+				"unambiguously valid action, so this says nothing about the CHECK: %w",
+			auditTable, err)
+	}
+	if err := insert(action); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+// recordSchemaVersion marks steps up to and including v as settled.
+func recordSchemaVersion(sqlDB *sql.DB, v int) error {
+	// PRAGMA does not accept a bound parameter, and the value is ours.
+	stmt := fmt.Sprintf("PRAGMA user_version = %d", v)
 	if _, err := sqlDB.Exec(stmt); err != nil {
 		return fmt.Errorf("record schema version: %w", err)
 	}
@@ -193,35 +430,35 @@ func recordSchemaVersion(sqlDB *sql.DB) error {
 
 // assertNoUnexpectedColumns refuses to rebuild a table whose shape this code
 // does not recognise.
-func assertNoUnexpectedColumns(sqlDB *sql.DB) error {
-	rows, err := sqlDB.Query("SELECT name FROM pragma_table_info(?)", namespacesTable)
+func assertNoUnexpectedColumns(sqlDB *sql.DB, table string, expected []string) error {
+	rows, err := sqlDB.Query("SELECT name FROM pragma_table_info(?)", table)
 	if err != nil {
-		return fmt.Errorf("inspect %s columns: %w", namespacesTable, err)
+		return fmt.Errorf("inspect %s columns: %w", table, err)
 	}
 	defer rows.Close()
 
 	var unexpected []string
-	known := make(map[string]bool, len(expectedNamespaceColumns))
-	for _, c := range expectedNamespaceColumns {
+	known := make(map[string]bool, len(expected))
+	for _, c := range expected {
 		known[c] = true
 	}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("scan %s columns: %w", namespacesTable, err)
+			return fmt.Errorf("scan %s columns: %w", table, err)
 		}
 		if !known[name] {
 			unexpected = append(unexpected, name)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect %s columns: %w", namespacesTable, err)
+		return fmt.Errorf("inspect %s columns: %w", table, err)
 	}
 	if len(unexpected) > 0 {
 		sort.Strings(unexpected)
 		return fmt.Errorf(
 			"refusing to rebuild %s: unrecognised column(s) %s would be dropped by the rebuild",
-			namespacesTable, strings.Join(unexpected, ", "))
+			table, strings.Join(unexpected, ", "))
 	}
 	return nil
 }
@@ -316,8 +553,10 @@ func rebuildNamespacesTable(sqlDB *sql.DB, expectedRows int) error {
 		"DROP TABLE IF EXISTS " + rebuildTable,
 		fmt.Sprintf(newNamespacesDDL, rebuildTable),
 		"INSERT INTO " + rebuildTable + `
-		   (name, read_role, write_role, document, updated_at, updated_by, created_at)
-		 SELECT name, read_role, write_role, document, updated_at, updated_by, created_at
+		   (name, read_role, write_role, document, updated_at, updated_by, created_at,
+		    updated_by_username)
+		 SELECT name, read_role, write_role, document, updated_at, updated_by, created_at,
+		        updated_by_username
 		   FROM ` + namespacesTable,
 	}
 	for _, stmt := range copyStmts {

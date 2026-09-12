@@ -218,6 +218,16 @@ echo
 echo "=== 8. List visibility ==="
 ADMIN_LIST=$(curl -s -H "Authorization: Bearer $ADMIN_TOK" "$CFG_BASE/api/v1/config")
 USER_LIST=$(curl -s -H "Authorization: Bearer $USER_TOK" "$CFG_BASE/api/v1/config")
+# The same answer the audit trail gives, without an admin token and without
+# reading a whole history. The identity subject is deliberately not here: it
+# answers "who" no better than the name, and it is the half that correlates
+# across services.
+check_contains "list names who last wrote each namespace" "\"updated_by_username\":\"$ADMIN_USER\"" "$ADMIN_LIST"
+if echo "$ADMIN_LIST" | grep -q '"updated_by"'; then
+  check "list does not disclose the identity subject" "absent" "PRESENT"
+else
+  check "list does not disclose the identity subject" "absent" "absent"
+fi
 check_contains "admin sees 'houses'" "houses" "$ADMIN_LIST"
 check_contains "admin sees 'mqtt'" "mqtt" "$ADMIN_LIST"
 check_contains "user sees 'mqtt'" "mqtt" "$USER_LIST"
@@ -310,6 +320,14 @@ STATUS=$(echo "$R" | tail -n1)
 BODY=$(echo "$R" | sed '$d')
 check "anonymous GET of public namespace = 200" "200" "$STATUS"
 check_contains "anonymous read returns the document" "0.24" "$BODY"
+# The namespace GET may be anonymous, so it must disclose nobody. Checked here
+# rather than in section 8, where tariffs does not yet exist and the 404 body
+# would satisfy it without proving anything.
+if echo "$BODY" | grep -q "updated_by"; then
+  check "a public document does not disclose who edits it" "absent" "PRESENT"
+else
+  check "a public document does not disclose who edits it" "absent" "absent"
+fi
 
 HDRS=$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/tariffs")
 check_contains "public namespace is shared-cacheable" "max-age=60" "$HDRS"
@@ -461,6 +479,25 @@ check_contains "history records the create" '"action":"create"' "$BODY"
 check_contains "history records the ACL change" '"action":"acl_change"' "$BODY"
 check_contains "history records the role it moved away from" '"old_read_role":"public"' "$BODY"
 check_contains "history records who did it" '"actor"' "$BODY"
+# Content changes are recorded too, as events — never the body.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$CFG_BASE/api/v1/config/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"unit":0.99,"note":"e2e-secret-value"}')
+check "document write accepted" "200" "$STATUS"
+R2=$(curl -s "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" -H "Authorization: Bearer $ADMIN_TOK")
+check_contains "history records the document write" '"action":"document_write"' "$R2"
+if echo "$R2" | grep -q "e2e-secret-value"; then
+  check "document bodies are never stored in the trail" "absent" "PRESENT"
+else
+  check "document bodies are never stored in the trail" "absent" "absent"
+fi
+# A write that changes nothing is not an event.
+BEFORE=$(echo "$R2" | grep -o '"action"' | wc -l | tr -d ' ')
+curl -s -o /dev/null -X PUT "$CFG_BASE/api/v1/config/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"unit":0.99,"note":"e2e-secret-value"}'
+AFTER=$(curl -s "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" -H "Authorization: Bearer $ADMIN_TOK" | grep -o '"action"' | wc -l | tr -d ' ')
+check "a no-op write adds no history entry" "$BEFORE" "$AFTER"
 # The username is recorded at write time from the token, so the trail names
 # who acted without a later lookup against identity — which would not work
 # during an outage, nor after a rename.

@@ -1,0 +1,22 @@
+-- Record who last modified a namespace, by name as well as by identity
+-- subject. Either kind of change: UpdateACL writes this column as well as
+-- UpdateDocument, so it means the last modification of any sort.
+--
+-- The subject stays authoritative. The username is the human label as it
+-- stood at the time, stored rather than resolved later for the same reasons
+-- as config_audit.actor_username. The audit trail records these changes too,
+-- so this column is not the only record of them. It earns its place by being
+-- the answer available without an admin token and without reading a whole
+-- history, and it is the only form of that answer a non-admin ever sees.
+--
+-- Nullable and not backfilled. Rows written before this column existed do
+-- not know the username, and asking identity for the current name of that
+-- subject would record a present-day fact as a historical one.
+--
+-- Note for whoever adds the next one of these, to EITHER table. The rebuilds
+-- in db/schema.go carry hard-coded column lists, so a column added here must
+-- also be added to expectedNamespaceColumns (or expectedAuditColumns), the
+-- target DDL, and the INSERT/SELECT, or startup fails closed with
+-- "unrecognised column". Note also that this file must contain no semicolon outside a
+-- statement, comments included. See sweeney/identity#44.
+ALTER TABLE config_namespaces ADD COLUMN updated_by_username TEXT;

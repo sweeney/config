@@ -102,7 +102,11 @@ Three things anonymous callers deliberately do **not** get:
 - **Discovery.** `GET /api/v1/config` is unchanged: it still requires a
   token, still answers `401` without one, and never lists public
   namespaces to an anonymous caller. Knowing the name is the price of
-  reading it anonymously; nothing advertises the names.
+  reading it anonymously; nothing advertises the names. That list is
+  also where `updated_by_username` is disclosed, and keeping it
+  token-only is what stops publishing a document from publishing who
+  edits it — see [Who last wrote a
+  namespace](#who-last-wrote-a-namespace).
 - **A distinguishable miss.** An anonymous `GET` of a private namespace
   and an anonymous `GET` of a namespace that does not exist return
   byte-identical `404`s. The public read path cannot be turned into an
@@ -299,7 +303,7 @@ Publish only what you would be content to see indexed. Anonymous means
 anonymous: no account behind the request, nothing but the per-IP rate
 limit in front of it, and no record of who read it. Reads are not
 audited for anyone, authenticated or not — the audit trail below
-records ACL changes, not access.
+records changes, not access.
 
 Reasonable:
 
@@ -318,22 +322,117 @@ Never:
 - Per-user data of any kind. A namespace is a single shared document;
   there is no per-caller view of it, public or otherwise.
 
+## Who last wrote a namespace
+
+Every namespace row carries the subject of whoever last wrote it — its
+document *or* its ACL — and, where one was recorded, the username that
+subject went by at the time. `GET /api/v1/config` returns the username,
+as `updated_by_username` alongside `updated_at`:
+
+```bash
+curl -s https://config.example.com/api/v1/config \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+[
+  {
+    "name":                "tariffs",
+    "read_role":           "public",
+    "write_role":          "admin",
+    "updated_at":          "2026-09-11T15:34:40.364Z",
+    "updated_by_username": "sweeney",
+    "created_at":          "2026-06-08T14:58:35.786Z"
+  }
+]
+```
+
+**The name, and not the subject.** The list does not return the writer's
+identity `sub`. It would answer "who" no better than the name does, and
+it is the half that travels: the same `sub` identifies that person on
+identity, on config, and on anything else trusting the same JWKS, which
+makes it the piece worth correlating and the piece worth withholding.
+Admins who need it have the audit trail, which returns `actor` alongside
+`actor_username`.
+
+`updated_by_username` is stored when the write happens rather than
+resolved when the row is read, which is the same design as
+`actor_username` on an audit row and for the same two reasons: it should
+stay legible when identity is unreachable, and it should not change
+meaning because someone was later renamed or their account deleted.
+
+It is **absent rather than empty** when none was recorded, and there are
+two ways that happens: a service token has no user behind it, and rows
+written before the column existed do not know one. There is no fallback
+field on this route — a namespace last written by a service carries no
+name here at all, and the audit trail is where you go to find out which
+one it was.
+
+**The shortest answer to "who edited this namespace's contents".** The
+audit trail below records a `document_write` row for every change to a
+document, so it answers that question too — *that* the contents changed,
+by whom and when, never what they said. What `updated_by_username` adds
+is the same answer **without an admin token and without reading a whole
+history**. The flip side is that it is only ever the *last* writer: one
+value, overwritten by the next write, with no history behind it. The
+history is what the trail is for.
+
+### Who sees it, and why the audit trail is stricter
+
+Two separate lines decide that, and they land in different places.
+
+**Anonymous vs authenticated.** The name is on `GET /api/v1/config`,
+which always requires a token, and on nothing else. In particular it is
+**not** on `GET /api/v1/config/{ns}`, the one endpoint that can be
+answered anonymously — for a namespace at `read_role: public`, with no
+token at all. Publishing a document is a decision to make the *contents*
+world-readable; it is not a decision to tell the world which of your
+admins edits it, and how recently. Putting the writer's name on the
+anonymous path would have bundled the two together, with no way to have
+one without the other.
+
+**Admin vs user.** Within the list there is no further restriction. The
+list is already filtered by the caller's role, so a caller sees the name
+for exactly the namespaces they could already see — which is what every
+collaborative system shows: if you can see the thing, you can see who
+touched it last. It is not admin-only.
+
+That the trail below *is* admin-only is not a contradiction, because the
+two answer different kinds of question. `updated_by_username` is a
+single current fact: who touched this namespace last, by name. The trail
+is a pattern over time — everyone who ever acted on it, and when, with
+the identity subjects the list withholds. The pattern is the thing worth
+restricting; one current fact about a namespace the caller can already
+read is not.
+
 ## Audit trail
 
-Namespace lifecycle changes are recorded in a `config_audit` table: one
-row per `create`, `acl_change` and `delete`, carrying the namespace, the
-action, the old and new read/write roles, the actor's subject and —
-where one was recorded — their username, and a timestamp. Old roles are empty on a create; new roles are empty on a
-delete. The table lives in the same SQLite file as the namespaces, so it
-rides along in every R2 backup.
+Changes to a namespace are recorded in a `config_audit` table: one row
+per `create`, `acl_change`, `document_write` and `delete`, carrying the
+namespace, the action, the old and new read/write roles, the actor's
+subject and — where one was recorded — their username, and a timestamp.
+Old roles are empty on a create; new roles are empty on a delete; both
+are empty on a `document_write`, which moves no roles. The table lives
+in the same SQLite file as the namespaces, so it rides along in every R2
+backup.
 
-Three deliberate limits, worth knowing before you rely on it:
+Four deliberate limits, worth knowing before you rely on it:
 
-- **Document writes are not audited, and document bodies are never
-  stored.** Every write already ships the whole database to R2, so
-  auditing 64KB bodies would inflate both the database and every backup
-  without bound. The table answers *who changed the rules, and when* —
-  not *what was in it*.
+- **Document bodies are never stored.** The write is recorded — a
+  `document_write` row says the contents changed, who changed them and
+  when — but not a byte of what they said. Every write already ships the
+  whole database to R2, so keeping 64KB bodies would inflate both the
+  database and every backup without bound. To see what a document used
+  to hold, restore the R2 backup from around that timestamp. For who
+  last wrote a namespace without reading its history, see [Who last
+  wrote a namespace](#who-last-wrote-a-namespace) above.
+- **A `PUT` that changes nothing is not recorded.** Content identical to
+  what is stored is answered `changed: false` without a write, and
+  without an audit row. The comparison is made inside the write
+  transaction, against the row actually being overwritten, so every
+  `document_write` in the table is a real change — there is no window in
+  which two callers submitting the same new content concurrently both
+  record one.
 - **The audit row is written in the same transaction as the mutation.**
   A mutation that fails leaves no audit row behind, and a row that is
   present always describes a change that really happened. A trail with
@@ -373,13 +472,20 @@ curl -s https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
     "actor_username": "sweeney",
     "at":             "2026-09-04T11:02:47.906Z"
+  },
+  {
+    "action":         "document_write",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
+    "at":             "2026-09-12T15:31:00.000Z"
   }
 ]
 ```
 
-The old roles are absent on a `create` and the new roles on a `delete`,
-which is the same thing the empty columns say below — absent rather than
-empty, because there was no previous ACL and no resulting one. (The JSON
+The old roles are absent on a `create`, the new roles on a `delete`, and
+all four on a `document_write` — which is the same thing the empty
+columns say below, absent rather than empty, because there was no
+previous ACL, no resulting one, or no ACL involved at all. (The JSON
 keys are `old_read_role` / `new_read_role`; the columns they come from
 are `old_read` / `new_read`.)
 
@@ -410,12 +516,18 @@ avoids. Clients fall back to `actor`.
 
 **Admin-only, including when the namespace is public.** Publishing a
 document does not publish its history. A document and its history are
-different things, and every operation the trail records — create, ACL
-change, delete — is admin-only already, so anything weaker here would
-leak more through the history than through the resource itself. A `user`
-token gets `403`, a service token gets `403` (service tokens are pinned
-to the `user` role), and no token at all gets `401` — even on a
-namespace anyone in the world can read anonymously.
+different things: the history names everyone who has acted on the
+namespace and when, which the document itself tells nobody. That holds
+even for the one recorded operation that is not admin-only — a
+`document_write` on a `write_role: user` namespace — because the leak
+here is the record of who acted, not the act.
+
+That `GET /api/v1/config` names the last writer to anyone who can see
+the namespace does not undercut that. One current fact is not a pattern
+over time, and the list gives the name without the subject. A `user` token gets `403`,
+a service token gets `403` (service tokens are pinned to the `user`
+role), and no token at all gets `401` — even on a namespace anyone in
+the world can read anonymously.
 
 The response carries `Cache-Control: private, no-store` and no wildcard
 origin, unlike the public document reads it may be describing.
@@ -428,10 +540,11 @@ foreign key. *What happened to the namespace that is no longer here* is
 exactly what this endpoint is for, and a `404` would withhold the answer
 for precisely the namespaces where it matters most.
 
-The admin SPA shows the same history in its namespace view, naming the
-actor by username where one was recorded and keeping the subject to
-hand, so the routine "who published this, and when?" question needs
-neither a curl nor a shell on the host.
+The admin SPA shows the same history in its namespace view — document
+writes alongside ACL changes — naming the actor by username where one
+was recorded and keeping the subject to hand, so the routine "who
+published this, and when?" question needs neither a curl nor a shell on
+the host.
 
 ### Direct access with `sqlite3`
 
@@ -450,10 +563,11 @@ sudo -u config sqlite3 -header -column /var/lib/config/config.db \
 ```
 
 ```
-at                          action      old_read  new_read  actor
---------------------------  ----------  --------  --------  ---------
-2026-09-01T09:14:02.113Z    create                user      adcc1b9d-64f9-…
-2026-09-04T11:02:47.906Z    acl_change  user      public    adcc1b9d-64f9-…
+at                          action          old_read  new_read  actor
+--------------------------  --------------  --------  --------  ---------
+2026-09-01T09:14:02.113Z    create                    user      adcc1b9d-64f9-…
+2026-09-04T11:02:47.906Z    acl_change      user      public    adcc1b9d-64f9-…
+2026-09-12T15:31:00.000Z    document_write                      adcc1b9d-64f9-…
 ```
 
 The cross-namespace question — when did *anything* become public, and

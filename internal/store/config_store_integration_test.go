@@ -105,7 +105,9 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 	}, domain.Actor{Sub: "u1"}))
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), "u2", later))
+	changed, uerr := s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), domain.Actor{Sub: "u2"}, later)
+	require.NoError(t, uerr)
+	assert.True(t, changed)
 
 	got, err := s.Get("mqtt")
 	require.NoError(t, err)
@@ -117,7 +119,7 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 
 func TestConfigStore_UpdateDocument_NotFound(t *testing.T) {
 	s := store.NewConfigStore(openTestDB(t))
-	err := s.UpdateDocument("missing", []byte(`{}`), "u", time.Now().UTC())
+	_, err := s.UpdateDocument("missing", []byte(`{}`), domain.Actor{Sub: "u"}, time.Now().UTC())
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
@@ -473,4 +475,166 @@ func TestConfigStore_Audit_UsernameSurvivesReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "alice", entries[0].ActorUsername, "the recorded username survives a reopen")
+}
+
+// --- who last wrote the document ---
+
+// TestConfigStore_RecordsWhoLastWroteTheDocument: document writes are not
+// audited by design, so this column is the only record of who last edited a
+// namespace's contents. It must follow every write path, not just create.
+func TestConfigStore_RecordsWhoLastWroteTheDocument(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "prefs", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+
+	got, err := s.Get("prefs")
+	require.NoError(t, err)
+	assert.Equal(t, "sub-1", got.UpdatedBy)
+	assert.Equal(t, "alice", got.UpdatedByUsername, "create records the writer")
+
+	_, err = s.UpdateDocument("prefs", []byte(`{"k":1}`),
+		domain.Actor{Sub: "sub-2", Username: "bob"}, now.Add(time.Minute))
+	require.NoError(t, err)
+	got, err = s.Get("prefs")
+	require.NoError(t, err)
+	assert.Equal(t, "sub-2", got.UpdatedBy)
+	assert.Equal(t, "bob", got.UpdatedByUsername, "a document write moves it on")
+
+	require.NoError(t, s.UpdateACL("prefs", "public", "user",
+		domain.Actor{Sub: "sub-3", Username: "carol"}, now.Add(2*time.Minute), true))
+	got, err = s.Get("prefs")
+	require.NoError(t, err)
+	assert.Equal(t, "carol", got.UpdatedByUsername, "so does an ACL change")
+}
+
+// TestConfigStore_List_CarriesWhoLastWrote: the list is where this is
+// surfaced, so the summary carries the name — and only the name. The
+// identity subject is not plumbed through, so it cannot be put back on the
+// response by someone noticing the field is already populated.
+func TestConfigStore_List_CarriesWhoLastWrote(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "prefs", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+
+	list, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "alice", list[0].UpdatedByUsername)
+}
+
+// TestConfigStore_UsernameOptionalOnNamespaces: a caller with no username —
+// a service token writing a document — leaves it unset rather than blank.
+func TestConfigStore_UsernameOptionalOnNamespaces(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "svc", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "client-abc"}))
+
+	got, err := s.Get("svc")
+	require.NoError(t, err)
+	assert.Equal(t, "client-abc", got.UpdatedBy)
+	assert.Empty(t, got.UpdatedByUsername)
+}
+
+// --- document writes in the trail ---
+
+// TestConfigStore_UpdateDocument_RecordsAnEvent: the trail now answers "was
+// this changed, by whom, when" for contents as well as access. It still
+// stores no body — every write already ships the whole database to R2, so
+// keeping 64KB documents here would inflate both.
+func TestConfigStore_UpdateDocument_RecordsAnEvent(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	later := now.Add(time.Minute)
+	changed, uerr := s.UpdateDocument("prefs", []byte(`{"k":2}`),
+		domain.Actor{Sub: "sub-9", Username: "dave"}, later)
+	require.NoError(t, uerr)
+	assert.True(t, changed, "a genuine change reports as changed")
+
+	entries, err := s.ListAudit("prefs")
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "create, then the document write")
+
+	e := entries[1]
+	assert.Equal(t, domain.AuditActionDocumentWrite, e.Action)
+	assert.Equal(t, "sub-9", e.Actor)
+	assert.Equal(t, "dave", e.ActorUsername)
+	assert.True(t, e.At.Equal(later))
+	assert.Empty(t, e.OldReadRole, "a document write moves no roles")
+	assert.Empty(t, e.NewReadRole)
+	assert.Empty(t, e.OldWriteRole)
+	assert.Empty(t, e.NewWriteRole)
+}
+
+// TestConfigStore_UpdateDocument_AuditRollsBackWithFailedWrite: same
+// atomicity guarantee as the other write paths. The audit row goes in before
+// the mutation, so a write that fails takes it with it.
+func TestConfigStore_UpdateDocument_AuditRollsBackWithFailedWrite(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+
+	_, err := s.UpdateDocument("nosuchns", []byte(`{}`), domain.Actor{Sub: "sub-1"}, now)
+	require.ErrorIs(t, err, domain.ErrNotFound)
+
+	entries, aerr := s.ListAudit("nosuchns")
+	require.NoError(t, aerr)
+	assert.Empty(t, entries, "a write that hit nothing must leave no trace")
+}
+
+// TestConfigStore_DocumentWrites_InterleaveWithACLChanges: both kinds of
+// change share one ordered history, which is the point of recording them
+// together rather than in separate places.
+func TestConfigStore_DocumentWrites_InterleaveWithACLChanges(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	_, err := s.UpdateDocument("prefs", []byte(`{"k":1}`),
+		domain.Actor{Sub: "a"}, now.Add(time.Minute))
+	require.NoError(t, err)
+	require.NoError(t, s.UpdateACL("prefs", "public", "user",
+		domain.Actor{Sub: "b"}, now.Add(2*time.Minute), true))
+	_, err = s.UpdateDocument("prefs", []byte(`{"k":2}`),
+		domain.Actor{Sub: "c"}, now.Add(3*time.Minute))
+	require.NoError(t, err)
+
+	entries, err := s.ListAudit("prefs")
+	require.NoError(t, err)
+	require.Len(t, entries, 4)
+	got := []string{entries[0].Action, entries[1].Action, entries[2].Action, entries[3].Action}
+	assert.Equal(t, []string{
+		domain.AuditActionCreate,
+		domain.AuditActionDocumentWrite,
+		domain.AuditActionACLChange,
+		domain.AuditActionDocumentWrite,
+	}, got, "one history, in the order things happened")
+}
+
+// TestConfigStore_UpdateDocument_NoOpIsNotRecorded: the comparison happens
+// inside the write transaction, so "every document_write is a real change"
+// holds even when two writers race with the same new content — the second
+// sees the row the first committed, not a snapshot taken before it.
+func TestConfigStore_UpdateDocument_NoOpIsNotRecorded(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	changed, err := s.UpdateDocument("prefs", []byte(`{}`), domain.Actor{Sub: "a"}, now.Add(time.Minute))
+	require.NoError(t, err)
+	assert.False(t, changed, "identical content is not a change")
+
+	entries, aerr := s.ListAudit("prefs")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "and leaves no entry claiming one happened")
 }

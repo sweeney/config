@@ -8,8 +8,10 @@ identity-issued JWT tokens. `public` is a read role only: a namespace with
 anonymously writable, and `GET /api/v1/config` (list) always requires a
 token. Publishing a namespace requires echoing its name back in
 `confirm_public`; see **Public namespaces** in `docs/admin.md`. Namespace
-creates, ACL changes and deletes are recorded in a `config_audit` table,
-readable by admins at `GET /api/v1/config/namespaces/{ns}/audit`.
+creates, ACL changes, document writes and deletes are recorded in a
+`config_audit` table, readable by admins at
+`GET /api/v1/config/namespaces/{ns}/audit`. It records that a document
+changed and who changed it, never the document itself.
 
 ## What it does
 
@@ -95,9 +97,11 @@ layers, and how to add new tests.
 | `internal/auth/middleware.go` | `RequireAuth` / `OptionalAuth` middleware (thin wrapper over `common/auth`) |
 | `internal/config/config.go` | Env var loading (`ConfigSvcConfig`) |
 | `db/db.go` | Opens SQLite with migrations via `common/db` |
-| `db/schema.go` | Go-side rebuild widening the `read_role` CHECK to accept `public`; idempotent, runs on every `db.Open` |
+| `db/schema.go` | Versioned schema steps run from `db.Open`, tracked in `PRAGMA user_version` — the ledger `common/db` lacks. Currently two table rebuilds SQLite cannot express as `ALTER` |
 | `db/migrations/001_init.sql` | Schema: `config_namespaces` table |
-| `db/migrations/002_config_audit.sql` | Schema: `config_audit` table (create / acl_change / delete) |
+| `db/migrations/002_config_audit.sql` | Schema: `config_audit` table (create / acl_change / document_write / delete) |
+| `db/migrations/003_audit_actor_username.sql` | Adds `config_audit.actor_username` |
+| `db/migrations/004_namespace_updated_by_username.sql` | Adds `config_namespaces.updated_by_username` |
 | `internal/testutil/audit.go` | Shared in-memory audit recorder for the service and handler fakes |
 | `spec/openapi.yaml` | OpenAPI 3.0 spec (served at `/openapi.json` and `/openapi.yaml`) |
 | `ui/embed.go` + `ui/static/` | Embedded admin SPA assets |

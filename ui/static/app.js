@@ -71,6 +71,23 @@
       ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' UTC';
   }
 
+  // "updated <when> by <who>", or just "updated <when>" when no username was
+  // recorded — a service token wrote it, or the row predates the column. The
+  // list carries no identity subject to fall back on: it answers "who" no
+  // better than the name does, and admins who need subjects have the history
+  // panel, which shows them.
+  //
+  // The audit panel records document writes too, but it is admin-only and
+  // collapsed by default, so this line stays the at-a-glance answer to "who
+  // last touched this" — and the only one a non-admin ever gets.
+  function nsUpdatedMeta(ns) {
+    const who = ns.updated_by_username || '';
+    return el('div', {
+      class: 'meta',
+      text:  'updated ' + fmtTime(ns.updated_at) + (who ? ' by ' + who : ''),
+    });
+  }
+
   function badge(role) {
     return el('span', { class: 'badge ' + role, text: role });
   }
@@ -126,7 +143,7 @@
       for (const ns of items) {
         const left = el('div', null, [
           el('a', { class: 'name', href: '#/edit/' + encodeURIComponent(ns.name), text: ns.name }),
-          el('div', { class: 'meta', text: 'updated ' + fmtTime(ns.updated_at) }),
+          nsUpdatedMeta(ns),
         ]);
         const right = el('div', { class: 'badges' }, [
           el('span', { class: 'meta', text: 'read' }), badge(ns.read_role),
@@ -280,15 +297,17 @@
   //
   // GET /namespaces/{ns}/audit is admin-only and answers `no-store`, so there
   // is nothing to cache and nothing most visits want: #/edit/{ns} is opened to
-  // change a document far more often than to read its ACL history. The section
+  // change a document far more often than to read its history. The section
   // therefore renders collapsed and fetches on first expand, keeping what it
-  // got until an ACL update in this view invalidates it.
+  // got until a change made in this view — to the document or to the ACL —
+  // invalidates it.
 
   // True only for the *transition* into public — the same distinction
   // publishGuard makes, and for the same reason. A namespace that was already
   // public before the change was not published by it, and a revoke is not a
   // publish. `create` has no old_read_role, so creating straight into public
-  // counts; `delete` has no new_read_role, so it never does.
+  // counts; `delete` has no new_read_role, so it never does; and
+  // `document_write` carries no role fields at all, so it cannot either.
   function publishesRead(item) {
     return item.new_read_role === 'public' && item.old_read_role !== 'public';
   }
@@ -318,6 +337,13 @@
     }
     if (item.action === 'delete') {
       return [el('span', { class: 'audit-verb', text: 'deleted' })];
+    }
+    // No role fields on this action at all — a document write moves nothing in
+    // the ACL — and the body is deliberately never recorded, so the row can
+    // say that the contents changed and no more. Every one of these was a real
+    // change: a PUT that stores the same document is not recorded.
+    if (item.action === 'document_write') {
+      return [el('span', { class: 'audit-verb', text: 'contents changed' })];
     }
     if (item.action === 'acl_change') {
       const parts = [];
@@ -356,6 +382,12 @@
 
   function auditRow(item) {
     const published = publishesRead(item);
+    // Marked the same way a publish is — a class on the row, so a scan down
+    // the list separates content changes from ACL changes by their edge alone
+    // — but in the ordinary brand accent with no fill behind it. A document
+    // write is routine; it should be findable, not arresting. The two are
+    // mutually exclusive: a document write carries no roles to publish.
+    const contents = item.action === 'document_write';
     const what = el('div', { class: 'audit-what' }, auditWhat(item));
     if (published) what.insertBefore(el('span', { class: 'badge public', text: 'published' }), what.firstChild);
     const meta = el('div', { class: 'audit-meta' }, [
@@ -368,7 +400,9 @@
         text:     fmtUTC(item.at) || 'time unknown',
       }),
     ]);
-    return el('li', { class: published ? 'audit-entry published' : 'audit-entry' }, [what, meta]);
+    return el('li', {
+      class: 'audit-entry' + (published ? ' published' : contents ? ' contents' : ''),
+    }, [what, meta]);
   }
 
   // Returns null when the section should not exist at all, otherwise
@@ -387,7 +421,7 @@
     const wrap   = el('div', { class: 'card audit' }, [
       el('div', { class: 'button-row' }, [
         toggle,
-        el('span', { class: 'form-help', text: 'Who changed this namespace\u2019s access control, and when.' }),
+        el('span', { class: 'form-help', text: 'Who changed this namespace\u2019s contents or access control, and when.' }),
       ]),
       body,
     ]);
@@ -402,7 +436,7 @@
         body.appendChild(el('div', { class: 'empty', text: 'No recorded changes for this namespace.' }));
         return;
       }
-      body.appendChild(el('p', { class: 'form-help', text: 'Newest first. Times are UTC — hover a timestamp for local time, or a name for the identity subject behind it.' }));
+      body.appendChild(el('p', { class: 'form-help', text: 'Newest first. A content change records who and when, never what was written. Times are UTC — hover a timestamp for local time, or a name for the identity subject behind it.' }));
       const ul = el('ul', { class: 'audit-list' });
       // The API returns oldest-first; an operator opening this is asking
       // "what happened to this namespace lately", so it reads newest-first.
@@ -441,9 +475,10 @@
 
     return {
       el: wrap,
-      // Called after this view changes the ACL: the cached list is now a
-      // change behind. Refetch if the operator is looking, otherwise just
-      // drop it so the next expand goes back to the server.
+      // Called after this view changes the ACL or saves a new document: the
+      // cached list is now a change behind. Refetch if the operator is
+      // looking, otherwise just drop it so the next expand goes back to the
+      // server.
       invalidate: () => { loaded = false; if (open) load(); },
     };
   }
@@ -561,7 +596,11 @@
       saveBtn.disabled = true;
       try {
         const r = await ConfigAPI.put(name, parsed.source);
-        toast(r && r.changed === false ? 'No change' : 'Saved');
+        const changed = !(r && r.changed === false);
+        // A write that stored something new is now a row in the history; a
+        // no-op PUT is recorded nowhere, so the cached list is still correct.
+        if (changed && audit) audit.invalidate();
+        toast(changed ? 'Saved' : 'No change');
       } catch (err) {
         docErr.textContent = err.message;
         toast('Save failed: ' + err.message, 'error');

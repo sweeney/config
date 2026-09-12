@@ -31,6 +31,10 @@ CONFIG_PORT="${CONFIG_PORT:-8282}"
 CONFIG_UNIT="${CONFIG_UNIT:-config}"
 STATE_FILE="${STATE_FILE:-/var/tmp/config-migration-preflight.state}"
 
+# The schema step count this script expects afterwards. Bump it alongside
+# currentSchemaVersion in db/schema.go when a step is added.
+EXPECTED_SCHEMA_VERSION="${EXPECTED_SCHEMA_VERSION:-2}"
+
 PASS=0; WARN=0; FAIL=0
 
 trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "${CLEAN_EXIT:-0}" -ne 1 ]; then
@@ -184,9 +188,9 @@ cmd_preflight() {
   info "schema user_version = $uv   namespaces = $total"
 
   if sq "SELECT 1 FROM sqlite_master WHERE type='table' AND name='config_audit';" | grep -q 1; then
-    warn "config_audit already exists — this host may already be running the new binary"
+    info "config_audit already exists — expected on any host running a release since the audit trail landed"
   else
-    ok "config_audit does not exist yet (expected before the deploy)"
+    info "config_audit does not exist yet — this host predates the audit trail"
   fi
 
   head_ "Namespaces"
@@ -268,8 +272,20 @@ cmd_verify() {
     warn "could not confirm the write_role CHECK is still narrow"
   fi
 
-  if [ "$uv" = "1" ]; then ok "schema user_version = 1 (migration recorded)"
-  else bad "schema user_version = $uv, expected 1 — later boots will re-derive the answer"; fi
+  # user_version is a step counter, not a flag: it rises as schema steps are
+  # added. Assert it is at least the step this script knows about rather than
+  # pinning an exact number, which would fail every future deploy.
+  if [ -n "$uv" ] && [ "$uv" -ge "$EXPECTED_SCHEMA_VERSION" ] 2>/dev/null; then
+    ok "schema version = $uv (steps recorded; later boots skip them outright)"
+  else
+    bad "schema version = ${uv:-unknown}, expected at least $EXPECTED_SCHEMA_VERSION — later boots will re-derive the answer"
+  fi
+
+  if sq "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_audit';" | grep -q "document_write"; then
+    ok "config_audit records document writes, not only ACL changes"
+  else
+    bad "config_audit.action does not admit 'document_write' — the trail will not record content changes"
+  fi
 
   if sq "SELECT 1 FROM sqlite_master WHERE type='table' AND name='config_audit';" | grep -q 1; then
     ok "config_audit table present"
@@ -286,6 +302,10 @@ cmd_verify() {
   head_ "Data"
   info "namespaces now = $total"
   if [ -r "$STATE_FILE" ]; then
+    # Say how old it is: preflight is not re-run on every deploy, so a
+    # comparison can silently be against a much earlier state.
+    local taken; taken=$(awk -F= '/^taken=/{print $2}' "$STATE_FILE")
+    info "comparing against preflight state taken $taken"
     local before; before=$(awk -F= '/^total=/{print $2}' "$STATE_FILE")
     if [ "$before" = "$total" ]; then ok "namespace count unchanged since preflight ($before)"
     else bad "namespace count changed: $before before, $total now"; fi
@@ -308,18 +328,36 @@ cmd_verify() {
 
   head_ "Pre-rebuild snapshot"
   local snap
-  snap=$(ls -1t "${CONFIG_DB}".pre-public-rebuild-* 2>/dev/null | head -1 || true)
+  snap=$(ls -1t "${CONFIG_DB}".pre-*-rebuild-* 2>/dev/null | head -1 || true)
   if [ -n "$snap" ]; then
     ok "snapshot present: $(basename "$snap") ($(du -h "$snap" | awk '{print $1}'))"
     if sq_file "$snap" "SELECT 1;" >/dev/null 2>&1; then
       ok "snapshot opens as a valid SQLite database"
       local snaprows
       snaprows=$(sq_file "$snap" "SELECT COUNT(*) FROM config_namespaces;")
-      if sq_file "$snap" "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces';" | grep -q "'public'"; then
-        warn "snapshot already permits 'public' — it may post-date the migration"
-      else
-        ok "snapshot carries the pre-migration schema (it is what you would restore)"
-      fi
+      # Each step names its own snapshot, and "does it predate the change?"
+      # means something different for each. A pre-audit snapshot is taken on a
+      # host that already went through the public step, so it permits 'public'
+      # and should — checking for its absence there reports a false alarm.
+      case "$(basename "$snap")" in
+        *.pre-public-rebuild-*)
+          if sq_file "$snap" "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces';" | grep -q "'public'"; then
+            warn "snapshot already permits 'public' — it may post-date the migration it is named for"
+          else
+            ok "snapshot predates the read_role widening (it is what you would restore)"
+          fi
+          ;;
+        *.pre-audit-rebuild-*)
+          if sq_file "$snap" "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_audit';" | grep -q "document_write"; then
+            warn "snapshot already records document writes — it may post-date the migration it is named for"
+          else
+            ok "snapshot predates the config_audit widening (it is what you would restore)"
+          fi
+          ;;
+        *)
+          info "snapshot $(basename "$snap") is not one this script knows how to date"
+          ;;
+      esac
       info "snapshot holds $snaprows namespace(s)"
       [ "$snaprows" = "$total" ] || warn "snapshot row count ($snaprows) differs from current ($total) — expected if data changed after the deploy"
     else
@@ -421,8 +459,8 @@ cmd_restart_check() {
   while IFS= read -r l; do info "$l"; done <<< "${lines:-(none)}"
 
   local rebuilt=0 settled=0
-  printf '%s' "$lines" | grep -q "schema rebuild required" && rebuilt=1
-  printf '%s' "$lines" | grep -q "settled" && settled=1
+  printf '%s' "$lines" | grep -qE "schema rebuild required|widening .*\.action" && rebuilt=1
+  printf '%s' "$lines" | grep -qE "settled|schema brought to version" && settled=1
 
   if [ "$rebuilt" -eq 1 ]; then
     bad "the migration ran AGAIN on this restart — it should be a no-op"

@@ -85,14 +85,37 @@ curl -s $CFG/api/v1/config -H "Authorization: Bearer $ADMIN_TOK"
 ```json
 [
   {"name":"houses","read_role":"admin","write_role":"admin",
-   "updated_at":"2026-04-24T17:06:34.818Z","created_at":"2026-04-24T17:06:34.818Z"},
+   "updated_at":"2026-04-24T17:06:34.818Z","updated_by_username":"sweeney",
+   "created_at":"2026-04-24T17:06:34.818Z"},
   {"name":"mqtt_topics","read_role":"user","write_role":"admin",
-   "updated_at":"2026-04-24T17:06:34.828Z","created_at":"2026-04-24T17:06:34.828Z"}
+   "updated_at":"2026-04-24T17:06:34.828Z","updated_by_username":"sweeney",
+   "created_at":"2026-04-24T17:06:34.828Z"}
 ]
 ```
 
 A non-admin token sees only `mqtt_topics` (and an empty list if no
 user-readable namespaces exist).
+
+`updated_by_username` is the name whoever last wrote the namespace — its
+document or its ACL — went by at the time, recorded at write time rather than
+looked up now, and omitted where none was recorded (a service token has no
+user behind it). The writer's identity subject is not returned here at all: it
+answers "who" no better than the name does, and it is the half that correlates
+across services. Admins who want subjects have `actor` in the audit trail of
+section 13.
+
+The name moves when the document moves: after the PUT in section 6 it names
+whoever made it. That write also leaves a `document_write` row in the trail —
+this field is the same answer without an admin token and without reading a
+history.
+
+It appears here and not on the single-namespace `GET` of section 5, which can
+be answered anonymously for a public namespace (section 11): publishing a
+document must not publish who edits it, and listing always needs a token.
+Within the list there is no further restriction — any caller who can see a
+namespace sees who last touched it. The trail of section 13 stays admin-only
+for a different reason: it shows a pattern over time rather than one current
+fact.
 
 ## 5. Fetch a document
 
@@ -139,8 +162,12 @@ curl -s -X PUT $CFG/api/v1/config/houses \
 ```
 
 `changed:false` means the server detected byte-identical content after
-JSON compaction, skipped the write, and did not trigger a backup.
-Scripts can idempotently re-apply configuration without cost.
+JSON compaction, skipped the write, did not trigger a backup, and wrote
+no audit row. The comparison happens inside the write transaction,
+against the row being overwritten, so two callers submitting the same new
+content at once cannot both be told they changed something. Scripts can
+idempotently re-apply configuration without cost, and every
+`document_write` in the trail is a real change.
 
 ## 8. Update ACL
 
@@ -239,13 +266,18 @@ curl -si $CFG/api/v1/config/tariffs
 ```http
 Content-Type: application/json
 X-Read-Role: public
-X-Write-Role: admin
 Cache-Control: public, max-age=60
 Access-Control-Allow-Origin: *
 Vary: Origin, Authorization
 
 {"standing":0.51,"unit":0.24}
 ```
+
+Note what is absent: **no `X-Write-Role`**. An authenticated read of this
+same namespace carries it; an anonymous one does not. That a plain `user`
+token suffices to write is a nudge toward where to point a stolen one, and
+nobody without a token can act on it. `X-Read-Role` stays, because the read
+having succeeded already implies it.
 
 `Cache-Control: public, max-age=60` is what lets a CDN serve the
 document without touching the service — and it is also the revoke
@@ -357,7 +389,8 @@ curl -s -X PATCH $CFG/api/v1/config/namespaces/tariffs \
 ## 13. Audit trail
 
 `tariffs` has been created (section 10), published (10) and revoked
-(12). The trail has all three, oldest first:
+(12), and its document has not been written since. The trail has all
+three, oldest first:
 
 ```bash
 curl -s $CFG/api/v1/config/namespaces/tariffs/audit \
@@ -385,9 +418,13 @@ than looked up now — so the trail stays legible with identity unreachable,
 and does not change meaning if someone is later renamed. It is omitted
 where no username was recorded, and rows predating the column stay that way.
 
-The old roles are absent on a `create`, the new roles on a `delete`. The
-document writes in sections 6 and 7 left no rows at all — the trail
-records who changed the rules, never what was in the document.
+The old roles are absent on a `create`, the new roles on a `delete`, and
+all four on a `document_write`, which moves no roles. The trail records
+document writes as well as ACL changes — the PUT of section 6 is in the
+`houses` history below — but never what was in the document: a
+`document_write` says the contents changed, by whom and when, and
+nothing more. The no-op PUT of section 7 left no row at all, having
+changed nothing.
 
 Admin-only, even though `tariffs` was public a moment ago: publishing a
 document does not publish its history. To see that, you need a non-admin
@@ -417,7 +454,8 @@ curl -s $CFG/api/v1/config/namespaces/tariffs/audit \
 because only an admin can reach it and an admin can list everything
 anyway. With no token at all it is `401`, public namespace or not.
 
-`houses` was deleted in section 9, and still has a history:
+`houses` was written in section 6 and deleted in section 9, and still
+has a history:
 
 ```bash
 curl -s $CFG/api/v1/config/namespaces/houses/audit \
@@ -430,6 +468,8 @@ curl -s $CFG/api/v1/config/namespaces/houses/audit \
 [
   {"action":"create","new_read_role":"admin","new_write_role":"admin",
    "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:34.818Z"},
+  {"action":"document_write",
+   "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:34.901Z"},
   {"action":"delete","old_read_role":"admin","old_write_role":"admin",
    "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:35.002Z"}
 ]

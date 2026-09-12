@@ -95,19 +95,30 @@ components:
             type: object
         AuditEntry:
             description: |
-                One recorded change to a namespace's existence or its access
-                rules. Document writes are not audited and document bodies are
-                never recorded: the trail answers "who changed the access
-                rules", not "what was in it".
+                One recorded change to a namespace: its existence, its access
+                rules, or its contents. Document bodies are never recorded, so
+                a `document_write` says that the contents changed, by whom and
+                when — never what they said.
             properties:
                 action:
                     description: |
                         `create` records a namespace coming into existence,
                         `acl_change` a change to `read_role` or `write_role`,
-                        and `delete` its removal.
+                        `document_write` a change to the stored document, and
+                        `delete` its removal.
+
+                        A `document_write` carries none of the role fields: a
+                        document write moves no roles. A `PUT` whose content is
+                        identical to what is stored is answered
+                        `changed: false` and records nothing. That comparison
+                        is made inside the write transaction, against the row
+                        being overwritten, so every `document_write` here is a
+                        real change — with no window in which two concurrent
+                        writers of the same new content both record one.
                     enum:
                         - create
                         - acl_change
+                        - document_write
                         - delete
                     type: string
                 actor:
@@ -149,25 +160,29 @@ components:
                         - $ref: '#/components/schemas/ReadRole'
                     description: |
                         Read role after the change. Omitted when there is none:
-                        a `delete` has no resulting ACL.
+                        a `delete` has no resulting ACL, and a
+                        `document_write` moves no roles.
                 new_write_role:
                     allOf:
                         - $ref: '#/components/schemas/WriteRole'
                     description: |
                         Write role after the change. Omitted when there is
-                        none: a `delete` has no resulting ACL.
+                        none: a `delete` has no resulting ACL, and a
+                        `document_write` moves no roles.
                 old_read_role:
                     allOf:
                         - $ref: '#/components/schemas/ReadRole'
                     description: |
                         Read role before the change. Omitted when there is
-                        none: a `create` has no previous ACL.
+                        none: a `create` has no previous ACL, and a
+                        `document_write` moves no roles.
                 old_write_role:
                     allOf:
                         - $ref: '#/components/schemas/WriteRole'
                     description: |
                         Write role before the change. Omitted when there is
-                        none: a `create` has no previous ACL.
+                        none: a `create` has no previous ACL, and a
+                        `document_write` moves no roles.
             required:
                 - action
                 - actor
@@ -254,7 +269,9 @@ components:
                 - write_role
             type: object
         NamespaceSummary:
-            description: Namespace identity, ACL roles, and timestamps. Returned by list.
+            description: |
+                Namespace identity, ACL roles, timestamps, and the name of
+                whoever last wrote it. Returned by list.
             properties:
                 created_at:
                     example: "2024-01-15T09:30:00.000Z"
@@ -269,6 +286,36 @@ components:
                 updated_at:
                     example: "2024-01-15T09:30:00.000Z"
                     format: date-time
+                    type: string
+                updated_by_username:
+                    description: |
+                        The username of whoever last wrote this namespace —
+                        its document *or* its ACL — as it stood at the time of
+                        that write, taken from the token that made it.
+
+                        Stored when the write happens, never resolved at read
+                        time — the same reasoning as `actor_username` on an
+                        audit entry. It stays legible when identity is
+                        unreachable, and does not change meaning because
+                        someone was later renamed or their account deleted.
+
+                        Omitted when no username was recorded: a service token
+                        has no user behind it, and rows written before this
+                        field existed do not know one. There is no fallback,
+                        because the writer's identity `sub` is deliberately not
+                        disclosed on this route at all — it answers "who" no
+                        better than the name does, and it is the half that
+                        correlates across services. Admins who need subjects
+                        have `actor` on
+                        `GET /api/v1/config/namespaces/{ns}/audit`.
+
+                        A change to the contents is also recorded in the audit
+                        trail, as a `document_write` entry — that it happened,
+                        by whom and when, never what was written. This field is
+                        the same answer without an admin token and without
+                        reading a history, and it is only ever the *last*
+                        writer.
+                    example: sweeney
                     type: string
                 write_role:
                     $ref: '#/components/schemas/WriteRole'
@@ -286,6 +333,11 @@ components:
                         False when the submitted document is byte-identical (after
                         JSON compaction) to the stored document. No write occurs
                         and no backup is triggered in that case.
+
+                        The comparison is made inside the write transaction,
+                        against the row actually being overwritten, so two
+                        callers submitting the same new content concurrently
+                        cannot both be told they changed something.
                     type: boolean
                 name:
                     type: string
@@ -405,6 +457,26 @@ paths:
                 same as being handed an inventory of what exists. Anonymous
                 callers get 401 here, and reach public namespaces only by
                 fetching one by name.
+
+                Each summary also names whoever last wrote the namespace, as
+                `updated_by_username` where one was recorded — the human name
+                and nothing else. The writer's identity `sub` is not disclosed
+                here at all: it answers "who" no better than the name does, and
+                it is the half that correlates across services. Admins who need
+                subjects have `actor` on
+                `GET /api/v1/config/namespaces/{ns}/audit`.
+
+                Two separate lines decide who sees that name, and they land
+                differently. **Anonymous vs authenticated:** it appears here,
+                on a route that always requires a token, and deliberately
+                **not** on `GET /api/v1/config/{ns}`, which may be answered
+                anonymously when `read_role` is `public` — publishing a
+                document must not publish who edits it. **Admin vs user:**
+                within this list there is no further restriction, because any
+                caller who can see a namespace sees who last touched it, which
+                is what every collaborative system shows. The audit endpoint
+                stays admin-only for a different reason — it discloses a
+                pattern over time rather than a single current fact.
             responses:
                 "200":
                     content:
@@ -654,7 +726,14 @@ paths:
             description: |
                 Whole-document replace. Byte-identical content (after JSON
                 compaction) is detected server-side and returned as
-                `changed: false` without a write or backup.
+                `changed: false` without a write or backup. The comparison is
+                made inside the write transaction, against the row being
+                overwritten.
+
+                A write that does change the document records a
+                `document_write` entry in the namespace's audit trail — that
+                it changed, by whom and when, never the body itself. A no-op
+                records nothing.
             requestBody:
                 content:
                     application/json:
@@ -778,17 +857,24 @@ paths:
     /api/v1/config/namespaces/{ns}/audit:
         get:
             description: |
-                Returns the namespace's recorded ACL and lifecycle history,
-                oldest first: its creation, every change to `read_role` or
-                `write_role`, and its deletion. Document writes are not
-                audited and document bodies are never recorded — the trail
-                answers "who changed the access rules", not "what was in it".
+                Returns the namespace's recorded history, oldest first: its
+                creation, every change to `read_role` or `write_role`, every
+                write to its document, and its deletion. Document bodies are
+                never recorded — a `document_write` says that the contents
+                changed, by whom and when, not what they said. A `PUT` that
+                changes nothing, answered `changed: false`, records nothing.
 
                 Admin-only, **even when the namespace is public**. A document
                 and its history are different things, and publishing the one
-                does not publish the other. Every operation this trail records
-                is admin-only already, so anything weaker here would leak more
-                through the history than through the resource itself. A user
+                does not publish the other.
+
+                That `GET /api/v1/config` already names the last writer, to any
+                caller who can see the namespace, is not in tension with this.
+                What that route answers is a single current fact — who touched
+                this namespace last — by name only. What this one answers is a
+                pattern over time: everyone who ever acted, when, and their
+                identity subjects, which the list withholds. So it stays
+                admin-only even on a namespace a `user` token may write. A user
                 token gets 403, and so does a service token
                 (client_credentials `at+jwt`), which is pinned to `user` role.
                 An anonymous request gets 401.
@@ -832,7 +918,7 @@ paths:
                     $ref: '#/components/responses/InternalServerError'
                 "503":
                     $ref: '#/components/responses/ServiceUnavailable'
-            summary: Read namespace ACL history (admin-only)
+            summary: Read a namespace's change history (admin-only)
             tags:
                 - admin
         parameters:

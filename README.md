@@ -206,24 +206,63 @@ curl https://config.example.com/api/v1/config \
 ```json
 [
   {
-    "name":       "mqtt_topics",
-    "read_role":  "user",
-    "write_role": "admin",
-    "updated_at": "2026-05-01T10:00:00.000Z",
-    "created_at": "2026-04-01T09:00:00.000Z"
+    "name":                "mqtt_topics",
+    "read_role":           "user",
+    "write_role":          "admin",
+    "updated_at":          "2026-05-01T10:00:00.000Z",
+    "updated_by_username": "sweeney",
+    "created_at":          "2026-04-01T09:00:00.000Z"
   },
   {
-    "name":       "houses",
-    "read_role":  "admin",
-    "write_role": "admin",
-    "updated_at": "2026-04-15T14:22:00.000Z",
-    "created_at": "2026-04-15T14:22:00.000Z"
+    "name":                "houses",
+    "read_role":           "admin",
+    "write_role":          "admin",
+    "updated_at":          "2026-04-15T14:22:00.000Z",
+    "created_at":          "2026-04-15T14:22:00.000Z"
   }
 ]
 ```
 
+`houses` was last written by a service token, which has no user behind it, so
+it carries no `updated_by_username` at all.
+
+| Field | Notes |
+|---|---|
+| `name` | Namespace name |
+| `read_role` | `admin`, `user` or `public` |
+| `write_role` | `admin` or `user` |
+| `updated_at` | Last write to the document *or* the ACL. RFC 3339 UTC, millisecond precision |
+| `updated_by_username` | That writer's username at the time of the write; omitted when none was recorded. The only writer field on this route — the identity `sub` is not returned here |
+| `created_at` | RFC 3339 UTC, millisecond precision |
+
 If the caller has the `user` role, `houses` would not appear in this list at
 all (not even as a tombstone).
+
+**The name, and not the subject.** `updated_by_username` is recorded as it
+stood when the write was made and is stored at write time, never resolved at
+read time — the same reasoning as `actor_username` on an audit entry. It is
+omitted — absent, not empty — when none was recorded, because a service token
+has no user behind it and rows written before the field existed do not know
+one, and there is no fallback field here: the writer's identity `sub` is not
+returned on this route at all. It would answer "who" no better than the name
+does, and it is the half that correlates across every service trusting the
+same JWKS. Admins who need subjects have `actor` on the audit endpoint below.
+
+**The quickest answer to "who last edited this namespace's contents".** The
+audit trail carries a `document_write` entry for every change to a document,
+so it answers that question too — *that* the contents changed, by whom and
+when, never what they said. What this field adds is the same answer without an
+admin token and without reading a whole history. It is only ever the last
+writer, though; the trail is what keeps the history.
+
+**Deliberately here and not on `GET /api/v1/config/{ns}`.** That endpoint may
+be answered anonymously when the namespace is `read_role: public`, and
+publishing a document must not publish who edits it. The list always requires
+a token. Within the list there is no further restriction — any caller whose
+role lets them see the namespace sees who last touched it, which is what every
+collaborative system shows, so it is not admin-only. The audit endpoint is
+admin-only for a different reason: it discloses a pattern over time — everyone
+who ever acted, and when — rather than one current fact.
 
 ---
 
@@ -328,7 +367,14 @@ curl -X PUT https://config.example.com/api/v1/config/mqtt_topics \
 `changed: true` means the document was different and a write occurred.
 `changed: false` means the submitted document was byte-identical (after JSON
 compaction) to what was stored. No database write occurs, no backup is
-triggered. Safe to call in an idempotent loop.
+triggered. Safe to call in an idempotent loop. The comparison is made inside
+the write transaction, against the row being overwritten, so two callers
+submitting the same new content concurrently cannot both be told they changed
+something.
+
+A write that does change the document records a `document_write` entry in the
+namespace's audit trail (below) — that it changed, by whom and when, never the
+body itself. A no-op records nothing.
 
 **Size limit:** 64 KB after JSON compaction. Returns `413` with
 `"error":"document_too_large"` if exceeded. Request body cap is 128 KB.
@@ -449,8 +495,8 @@ same PATCH, or the combination is rejected with `400 invalid_role`.
 
 ### `GET /api/v1/config/namespaces/{ns}/audit` — namespace history (admin only)
 
-Returns the namespace's recorded lifecycle changes as a JSON array, oldest
-first: one entry per `create`, `acl_change` and `delete`.
+Returns the namespace's recorded history as a JSON array, oldest first: one
+entry per `create`, `acl_change`, `document_write` and `delete`.
 
 ```bash
 curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
@@ -476,15 +522,21 @@ curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
     "actor_username": "sweeney",
     "at":             "2026-09-04T11:02:47.906Z"
+  },
+  {
+    "action":         "document_write",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
+    "at":             "2026-09-12T15:31:00.000Z"
   }
 ]
 ```
 
 | Field | Notes |
 |---|---|
-| `action` | `create`, `acl_change` or `delete` |
-| `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create` |
-| `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete` |
+| `action` | `create`, `acl_change`, `document_write` or `delete` |
+| `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create`, and on a `document_write`, which moves no roles |
+| `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete`, and on a `document_write` |
 | `actor` | Subject of the token that made the change; always present, and the stable key |
 | `actor_username` | That actor's username at the time of the change; omitted when none was recorded |
 | `at` | RFC 3339 UTC, millisecond precision |
@@ -498,15 +550,26 @@ token has no user behind it and rows written before the field existed do not
 know one; those are deliberately not backfilled. Fall back to `actor`.
 
 **Admin-only, including when the namespace is `read_role: public`.** Publishing
-a document does not publish its history: every operation the trail records is
-admin-only already, so a weaker rule here would leak more through the history
-than through the resource. A `user` token gets `403`, so does a service token
+a document does not publish its history: the history names everyone who has
+acted on the namespace and when, which the document itself tells nobody. That
+holds for the one recorded operation that is not itself admin-only — a
+`document_write` on a `write_role: user` namespace — because what is withheld
+here is the record of who acted, not the act. That the list above names the
+last writer to any caller who can see the namespace is not in tension with
+this: one current fact is not a pattern over time, and the list gives the name
+without the subject. A `user` token gets `403`, so does a service token
 (pinned to the `user` role), and a request with no token gets `401` even on a
 public namespace. The response is `Cache-Control: private, no-store` and never
 carries a wildcard origin.
 
-**Document writes are not audited, and document bodies are never stored.** The
-trail answers *who changed the rules, and when* — never *what was in it*.
+**Document bodies are never stored.** A `document_write` records that the
+contents changed, by whom and when — never a byte of what they said. Every
+write already ships the whole database to R2, so keeping 64 KB bodies would
+inflate the database and every backup without bound; to see what a document
+used to hold, restore the R2 backup from around that timestamp. A `PUT` that
+changes nothing is answered `changed: false` and records nothing at all — the
+comparison being made inside the write transaction — so every `document_write`
+in the trail is a real change.
 
 **An unknown or deleted namespace returns `200 []`, not `404`.** Entries
 outlive the namespace they describe, and "what happened to the one that is no
@@ -514,10 +577,10 @@ longer here" is exactly what this answers. Nothing leaks by doing so — the
 caller is already an admin, who can list every namespace anyway. A name that
 does not match `^[a-z0-9_-]{1,64}$` is still `400 invalid_name`.
 
-The admin SPA shows the same history in its namespace view, naming the actor
-by username where one was recorded. For direct
-`sqlite3` access on the host, and for questions that span namespaces, see
-**Audit trail** in `docs/admin.md`.
+The admin SPA shows the same history in its namespace view — document writes
+alongside ACL changes — naming the actor by username where one was recorded.
+For direct `sqlite3` access on the host, and for questions that span
+namespaces, see **Audit trail** in `docs/admin.md`.
 
 ---
 

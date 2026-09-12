@@ -44,11 +44,12 @@ func (r *fakeConfigRepo) List() ([]domain.ConfigNamespaceSummary, error) {
 	out := make([]domain.ConfigNamespaceSummary, 0, len(r.data))
 	for _, ns := range r.data {
 		out = append(out, domain.ConfigNamespaceSummary{
-			Name:      ns.Name,
-			ReadRole:  ns.ReadRole,
-			WriteRole: ns.WriteRole,
-			UpdatedAt: ns.UpdatedAt,
-			CreatedAt: ns.CreatedAt,
+			Name:              ns.Name,
+			ReadRole:          ns.ReadRole,
+			WriteRole:         ns.WriteRole,
+			UpdatedAt:         ns.UpdatedAt,
+			UpdatedByUsername: ns.UpdatedByUsername,
+			CreatedAt:         ns.CreatedAt,
 		})
 	}
 	return out, nil
@@ -83,6 +84,8 @@ func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) 
 		return domain.ErrConflict
 	}
 	copied := *ns
+	copied.UpdatedBy = actor.Sub
+	copied.UpdatedByUsername = actor.Username
 	r.data[ns.Name] = &copied
 	r.audit.Record(domain.AuditEntry{
 		Namespace:     ns.Name,
@@ -96,17 +99,29 @@ func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) 
 	return nil
 }
 
-func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error {
+func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
-		return domain.ErrNotFound
+		return false, domain.ErrNotFound
 	}
+	// Same comparison the real store makes, in the same place.
+	if string(ns.Document) == string(document) {
+		return false, nil
+	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:     name,
+		Action:        domain.AuditActionDocumentWrite,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
+	})
 	ns.Document = append(ns.Document[:0], document...)
-	ns.UpdatedBy = updatedBy
+	ns.UpdatedBy = actor.Sub
+	ns.UpdatedByUsername = actor.Username
 	ns.UpdatedAt = at
-	return nil
+	return true, nil
 }
 
 func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
@@ -135,6 +150,7 @@ func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole string, actor domai
 	ns.ReadRole = readRole
 	ns.WriteRole = writeRole
 	ns.UpdatedBy = actor.Sub
+	ns.UpdatedByUsername = actor.Username
 	ns.UpdatedAt = at
 	return nil
 }

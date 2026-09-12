@@ -124,22 +124,54 @@ snapshot file, no migration to wait on, and no rebuild lines. If you
 are watching a new host's first boot for the rebuild output above, you
 will not see it, and that is correct — its absence is the point.
 
-**Every start after that, on either host**, logs the settled line:
+**Upgrading a host already on the public read role** — the schema steps
+are numbered, and a host that has step 1 but not step 2 runs only the
+second:
 
 ```
-config db: schema check — public read role settled (schema version 1), nothing to do
+config db: widening config_audit.action for 31 row(s); snapshot written to
+  /var/lib/config/config.db.pre-audit-rebuild-20260912T193200Z
+config db: config_audit widened, 31 row(s) carried across
+config db: schema brought to version 2
 ```
 
-The run that rebuilt, or found nothing to rebuild, also recorded
-`PRAGMA user_version`, so later boots short-circuit on that without
-probing the database at all. They still say so, deliberately: silence
+A database old enough to need both steps runs both on one boot and
+takes a snapshot for each, named for the step that took it —
+`pre-public-rebuild-…` and `pre-audit-rebuild-…`. That is the path a
+restored pre-migration backup takes.
+
+**Every start after that, on any host**, logs the settled line:
+
+```
+config db: schema settled at version 2, nothing to do
+```
+
+`PRAGMA user_version` is a step counter, and it is the ledger
+`common/db`'s migration runner does not have: steps at or below the
+recorded number are skipped outright rather than each re-deciding
+whether it has already run. The run that applied them recorded it, so
+later boots short-circuit without probing the database at all. They still say so, deliberately: silence
 would leave "checked and settled" and "a binary that never checked"
 looking identical, and which of those you are looking at is the whole
 question after a deploy.
 
-`--restore-backup` re-opens it. An older SQLite file dropped into
-`DB_PATH` carries its own `user_version`, so the next start asks the
-question again from scratch — which is exactly what makes a restore of
+One more line is worth recognising, because it appears at the moment
+something is already confusing:
+
+```
+config db: WARNING schema is at version 3 but this binary only knows 2 —
+  this database was written by a newer release.
+```
+
+That is a rollback: the database has had steps applied by a later
+build. The service starts anyway — every step this binary knows about
+is applied, and refusing to start would turn a rollback into an outage
+— but it will not understand columns or constraints the newer build
+added, so roll forward rather than leaving it there.
+
+`--restore-backup` re-opens the question. An older SQLite file dropped
+into `DB_PATH` carries its own `user_version`, so the next start asks
+again from scratch — which is exactly what makes a restore of
 a pre-migration backup self-healing.
 
 If the rebuild fails, the service does not start: the error surfaces,
