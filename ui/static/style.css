@@ -217,6 +217,11 @@ input[type="text"]:focus, select:focus, textarea:focus {
     background: var(--public-bg);
     border-color: var(--public);
 }
+/* A document write is the other thing an operator scans for, so it gets the
+   same treatment one step down: only the left edge is coloured, in the
+   ordinary brand teal, with no fill behind the row. Routine enough to read
+   past, distinct enough to pick out of a column of ACL changes. */
+.audit-entry.contents { border-left-color: var(--brand); }
 .audit-what   { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
 .audit-change { display: inline-flex; align-items: center; gap: 0.3rem; }
 .audit-field  { font-size: 0.85rem; color: var(--text-muted); }

@@ -62,6 +62,10 @@ window.ConfigAPI = (function () {
     // does not have a public history. Non-admins get 403 (401 anonymously),
     // surfaced here as err.status like any other failure.
     //
+    // Actions are `create`, `acl_change`, `document_write` and `delete`. Only
+    // the first three carry role fields — a `document_write` records that the
+    // contents changed, who changed them and when, never the body itself.
+    //
     // Entries come back oldest-first, and a namespace that never existed (or
     // has since been deleted) answers `200 []` rather than 404: an empty array
     // means "nothing recorded", never "no such namespace".
