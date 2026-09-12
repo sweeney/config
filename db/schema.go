@@ -274,6 +274,12 @@ const ConfigRolePublicLiteral = "public"
 // probeInsertRole writes the sentinel row with the given read role, clearing
 // any previous attempt first so a primary-key collision can never be mistaken
 // for a rejected CHECK.
+//
+// The DELETE belongs inside this function, not hoisted around the pair of
+// calls in permitsPublicReadRole. Both attempts write the same primary key,
+// so a surviving control row would collide with the real probe and every
+// database would read as "not permitted" — rebuilding unconditionally, on
+// every boot, including databases that are already correct.
 func probeInsertRole(tx *sql.Tx, readRole string) error {
 	if _, err := tx.Exec(
 		"DELETE FROM "+namespacesTable+" WHERE name = ?", probeNamespace,
