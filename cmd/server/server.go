@@ -329,7 +329,12 @@ func securityHeaders(next http.Handler, corsOrigins []string, identityURL string
 // — the one route that may be read without a token, and so the only one whose
 // preflight is answered for an arbitrary origin. Exactly one path segment
 // after /api/v1/config/, which excludes the list route and everything under
-// /namespaces/.
+// /namespaces/{ns}.
+//
+// It does match /api/v1/config/namespaces, which is also the create route.
+// That is harmless and correct: "namespaces" is a legal namespace name, a GET
+// of that path genuinely routes to getHandler, and the grant is GET/OPTIONS
+// with no Authorization — so a cross-origin create is still refused.
 func isNamespaceGetPath(p string) bool {
 	const prefix = "/api/v1/config/"
 	if !strings.HasPrefix(p, prefix) {
