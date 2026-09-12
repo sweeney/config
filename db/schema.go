@@ -43,11 +43,27 @@ import (
 const currentSchemaVersion = 2
 
 // auditTable and its rebuild twin, for step 2.
+// domainActionDocumentWrite mirrors domain.AuditActionDocumentWrite. Spelled
+// out rather than imported so db/ stays free of domain dependencies, exactly
+// as ConfigRolePublicLiteral does.
+const domainActionDocumentWrite = "document_write"
+
 const (
 	auditTable        = "config_audit"
 	auditRebuildTable = "config_audit_rebuild_actions"
 	auditIndex        = "idx_config_audit_namespace"
 )
+
+// expectedAuditColumns is to config_audit what expectedNamespaceColumns is to
+// config_namespaces: the exact set the rebuild knows how to carry across.
+// The same ordering hazard applies — migrations run before applySchemaSteps,
+// so a later migration adding a column here lands before this code sees the
+// table, and a hard-coded copy list would drop it silently while the
+// row-count check still passed.
+var expectedAuditColumns = []string{
+	"action", "actor", "actor_username", "at", "id", "namespace",
+	"new_read", "new_write", "old_read", "old_write",
+}
 
 // newAuditDDL is the target shape for config_audit. %s is the table name so
 // the same text serves the rebuild table and, after RENAME, the real one.
@@ -143,7 +159,19 @@ func applySchemaSteps(sqlDB *sql.DB, dbPath string) error {
 	if err := sqlDB.QueryRow("PRAGMA user_version").Scan(&recorded); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	if recorded >= currentSchemaVersion {
+	if recorded > currentSchemaVersion {
+		// A database written by a later release than this binary — a rollback,
+		// most likely. Proceeding is right: the steps this binary knows are
+		// all applied, and refusing to start would turn a rollback into an
+		// outage. But saying "settled" here would be a reassuring lie, and
+		// this is exactly the moment someone is trying to work out why the
+		// service is behaving oddly.
+		log.Printf("config db: WARNING schema is at version %d but this binary only knows %d — "+
+			"this database was written by a newer release. Continuing, but expect columns and "+
+			"constraints this build does not know about.", recorded, currentSchemaVersion)
+		return nil
+	}
+	if recorded == currentSchemaVersion {
 		// Logged on every boot, deliberately. The fast path makes this a true
 		// no-op, but silence would leave "checked and settled" and "a binary
 		// that never checked" looking identical in the journal, which is the
@@ -161,7 +189,7 @@ func applySchemaSteps(sqlDB *sql.DB, dbPath string) error {
 		}
 	}
 	if recorded < 2 {
-		if err := widenAuditActions(sqlDB); err != nil {
+		if err := widenAuditActions(sqlDB, dbPath); err != nil {
 			return err
 		}
 		if err := recordSchemaVersion(sqlDB, 2); err != nil {
@@ -197,7 +225,7 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 
 	// The rebuild flattens the table to expectedNamespaceColumns. If this
 	// database carries anything else, refuse rather than amputate it.
-	if err := assertNoUnexpectedColumns(sqlDB); err != nil {
+	if err := assertNoUnexpectedColumns(sqlDB, namespacesTable, expectedNamespaceColumns); err != nil {
 		return err
 	}
 
@@ -253,7 +281,7 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 // but its ids are load-bearing: ListAudit orders by id precisely so entries
 // written within the same clock tick keep their true order, so they are
 // copied rather than regenerated.
-func widenAuditActions(sqlDB *sql.DB) error {
+func widenAuditActions(sqlDB *sql.DB, dbPath string) error {
 	var exists int
 	if err := sqlDB.QueryRow(
 		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", auditTable,
@@ -265,7 +293,7 @@ func widenAuditActions(sqlDB *sql.DB) error {
 		return nil
 	}
 
-	permitted, err := permitsAction(sqlDB, "document_write")
+	permitted, err := permitsAction(sqlDB, domainActionDocumentWrite)
 	if err != nil {
 		return err
 	}
@@ -274,7 +302,32 @@ func widenAuditActions(sqlDB *sql.DB) error {
 		return nil
 	}
 
-	log.Printf("config db: widening %s.action to record document writes", auditTable)
+	// Same guard as the namespaces rebuild, for the same reason: the copy
+	// below names its columns, so anything this code does not know about
+	// would be dropped without the row count noticing.
+	if err := assertNoUnexpectedColumns(sqlDB, auditTable, expectedAuditColumns); err != nil {
+		return err
+	}
+
+	var rows int
+	if err := sqlDB.QueryRow("SELECT COUNT(*) FROM " + auditTable).Scan(&rows); err != nil {
+		return fmt.Errorf("count %s before rebuild: %w", auditTable, err)
+	}
+	// Snapshot before touching the table this codebase calls the one that has
+	// to outlive everything else. The transaction covers a crash or a SQL
+	// error; it does not cover a logic error that commits cleanly, and there
+	// would then be nothing to go back to.
+	if rows > 0 {
+		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath)
+		if err != nil {
+			return err
+		}
+		log.Printf("config db: widening %s.action for %d row(s); snapshot written to %s",
+			auditTable, rows, snapshot)
+	} else {
+		log.Printf("config db: widening %s.action; table is empty, no snapshot taken", auditTable)
+	}
+
 	tx, err := sqlDB.Begin()
 	if err != nil {
 		return fmt.Errorf("begin %s rebuild: %w", auditTable, err)
@@ -283,10 +336,7 @@ func widenAuditActions(sqlDB *sql.DB) error {
 
 	const cols = `id, namespace, action, old_read, old_write, new_read, new_write,
 	              actor, at, actor_username`
-	var before int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM " + auditTable).Scan(&before); err != nil {
-		return fmt.Errorf("count %s: %w", auditTable, err)
-	}
+	before := rows
 	for _, stmt := range []string{
 		"DROP TABLE IF EXISTS " + auditRebuildTable,
 		fmt.Sprintf(newAuditDDL, auditRebuildTable),
@@ -316,6 +366,19 @@ func widenAuditActions(sqlDB *sql.DB) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit %s rebuild: %w", auditTable, err)
 	}
+
+	// Confirm the rebuild achieved what it was for, so a misdiagnosis costs
+	// one failed start rather than a silent amputation.
+	permitted, err = permitsAction(sqlDB, domainActionDocumentWrite)
+	if err != nil {
+		return err
+	}
+	if !permitted {
+		return fmt.Errorf(
+			"rebuilt %s but it still rejects action=%q — refusing to continue",
+			auditTable, domainActionDocumentWrite)
+	}
+
 	log.Printf("config db: %s widened, %d row(s) carried across", auditTable, copied)
 	return nil
 }
@@ -363,35 +426,35 @@ func recordSchemaVersion(sqlDB *sql.DB, v int) error {
 
 // assertNoUnexpectedColumns refuses to rebuild a table whose shape this code
 // does not recognise.
-func assertNoUnexpectedColumns(sqlDB *sql.DB) error {
-	rows, err := sqlDB.Query("SELECT name FROM pragma_table_info(?)", namespacesTable)
+func assertNoUnexpectedColumns(sqlDB *sql.DB, table string, expected []string) error {
+	rows, err := sqlDB.Query("SELECT name FROM pragma_table_info(?)", table)
 	if err != nil {
-		return fmt.Errorf("inspect %s columns: %w", namespacesTable, err)
+		return fmt.Errorf("inspect %s columns: %w", table, err)
 	}
 	defer rows.Close()
 
 	var unexpected []string
-	known := make(map[string]bool, len(expectedNamespaceColumns))
-	for _, c := range expectedNamespaceColumns {
+	known := make(map[string]bool, len(expected))
+	for _, c := range expected {
 		known[c] = true
 	}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("scan %s columns: %w", namespacesTable, err)
+			return fmt.Errorf("scan %s columns: %w", table, err)
 		}
 		if !known[name] {
 			unexpected = append(unexpected, name)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect %s columns: %w", namespacesTable, err)
+		return fmt.Errorf("inspect %s columns: %w", table, err)
 	}
 	if len(unexpected) > 0 {
 		sort.Strings(unexpected)
 		return fmt.Errorf(
 			"refusing to rebuild %s: unrecognised column(s) %s would be dropped by the rebuild",
-			namespacesTable, strings.Join(unexpected, ", "))
+			table, strings.Join(unexpected, ", "))
 	}
 	return nil
 }

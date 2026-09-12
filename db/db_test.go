@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"database/sql"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -661,49 +662,136 @@ func TestOpen_FreshInstallHasUpdatedByUsername(t *testing.T) {
 
 // --- schema step 2: audit records document writes ---
 
-// TestOpen_WidensAuditActions: config_audit's action CHECK is already
-// deployed, and SQLite cannot ALTER a CHECK, so admitting a new action means
-// rebuilding that table too. Same dance as config_namespaces, on a table that
-// is append-only and whose ids ListAudit orders by — so they must be carried
-// across, not regenerated.
+// oldAuditDDL is config_audit as it stood before document writes were
+// recorded: the narrow action CHECK, and actor_username already added by
+// migration 003.
+const oldAuditDDL = `
+CREATE TABLE config_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace   TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    old_read    TEXT,
+    old_write   TEXT,
+    new_read    TEXT,
+    new_write   TEXT,
+    actor       TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    actor_username TEXT,
+    CHECK (action IN ('create', 'acl_change', 'delete'))
+);
+CREATE INDEX idx_config_audit_namespace ON config_audit(namespace, id);
+`
+
+// newPreDocumentWriteDB builds a database as a host running the previous
+// release has it: schema step 1 recorded, config_audit still narrow.
+//
+// This matters because a *fresh* database is created wide by migration 002,
+// so opening one never reaches the rebuild at all — every assertion about
+// rows surviving it would pass without it having run.
+func newPreDocumentWriteDB(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "pre.db")
+	raw := rawOpen(t, path)
+	_, err := raw.Exec(oldSchemaDDL)
+	require.NoError(t, err)
+	_, err = raw.Exec(`ALTER TABLE config_namespaces ADD COLUMN updated_by_username TEXT`)
+	require.NoError(t, err)
+	_, err = raw.Exec(oldAuditDDL)
+	require.NoError(t, err)
+	// Step 1 already done: the namespaces table is wide and recorded.
+	_, err = raw.Exec(`DROP TABLE config_namespaces`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE config_namespaces (
+	    name TEXT PRIMARY KEY, read_role TEXT NOT NULL, write_role TEXT NOT NULL,
+	    document TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
+	    created_at TEXT NOT NULL, updated_by_username TEXT,
+	    CHECK (read_role IN ('admin','user','public')), CHECK (write_role IN ('admin','user')))`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`PRAGMA user_version = 1`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	return path
+}
+
+// TestOpen_WidensAuditActions exercises the rebuild for real, against a
+// database that genuinely has the narrow CHECK.
 func TestOpen_WidensAuditActions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "c.db")
-
-	first, err := db.Open(path)
+	path := newPreDocumentWriteDB(t)
+	raw := rawOpen(t, path)
+	_, err := raw.Exec(
+		`INSERT INTO config_audit (id, namespace, action, new_read, new_write, actor, actor_username, at)
+		 VALUES (7, 'prefs', 'create', 'user', 'user', 'sub-1', 'alice', '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err)
-	_, err = first.DB().Exec(
-		`INSERT INTO config_audit (namespace, action, new_read, new_write, actor, actor_username, at)
-		 VALUES ('prefs','create','user','user','sub-1','alice','2026-01-01T00:00:00Z')`)
+	_, err = raw.Exec(
+		`INSERT INTO config_audit (id, namespace, action, old_read, new_read, actor, at)
+		 VALUES (9, 'prefs', 'acl_change', 'user', 'public', 'sub-2', '2026-01-02T00:00:00Z')`)
 	require.NoError(t, err)
-	var firstID int64
-	require.NoError(t, first.DB().QueryRow(
-		"SELECT id FROM config_audit WHERE namespace='prefs'").Scan(&firstID))
-	require.NoError(t, first.Close())
+	require.NoError(t, raw.Close())
 
-	reopened, err := db.Open(path)
+	database, err := db.Open(path)
 	require.NoError(t, err)
-	defer reopened.Close()
+	defer database.Close()
 
-	_, err = reopened.DB().Exec(
+	_, err = database.DB().Exec(
 		`INSERT INTO config_audit (namespace, action, actor, at)
-		 VALUES ('prefs','document_write','sub-2','2026-01-02T00:00:00Z')`)
-	assert.NoError(t, err, "the trail must accept a document write")
-
-	_, err = reopened.DB().Exec(
+		 VALUES ('prefs','document_write','sub-3','2026-01-03T00:00:00Z')`)
+	assert.NoError(t, err, "the widened trail must accept a document write")
+	_, err = database.DB().Exec(
 		`INSERT INTO config_audit (namespace, action, actor, at) VALUES ('prefs','nonsense','s','t')`)
-	assert.Error(t, err, "but still reject an action that is not one of ours")
+	assert.Error(t, err, "and still reject an action that is not ours")
 
-	var gotID int64
-	var username string
-	require.NoError(t, reopened.DB().QueryRow(
-		"SELECT id, actor_username FROM config_audit WHERE action='create'").Scan(&gotID, &username))
-	assert.Equal(t, firstID, gotID, "ids survive the rebuild — ListAudit orders by them")
-	assert.Equal(t, "alice", username, "and so does every column")
+	// ids are load-bearing: ListAudit orders by them so entries sharing a
+	// clock tick keep their true order. They must be carried, not reissued.
+	rows, qerr := database.DB().Query(
+		"SELECT id, action, COALESCE(actor_username,'') FROM config_audit WHERE namespace='prefs' ORDER BY id")
+	require.NoError(t, qerr)
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id int64
+		var action, username string
+		require.NoError(t, rows.Scan(&id, &action, &username))
+		got = append(got, fmt.Sprintf("%d/%s/%s", id, action, username))
+	}
+	assert.Equal(t, []string{"7/create/alice", "9/acl_change/", "10/document_write/"}, got,
+		"original ids and every column survive, and the next id follows them")
 
 	var idx int
-	require.NoError(t, reopened.DB().QueryRow(
+	require.NoError(t, database.DB().QueryRow(
 		"SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_config_audit_namespace'").Scan(&idx))
 	assert.Equal(t, 1, idx, "the index is recreated")
+	assert.GreaterOrEqual(t, userVersion(t, database.DB()), 2)
+	assert.Len(t, snapshotFiles(t, path), 1, "a snapshot is taken before touching the trail")
+}
+
+// TestOpen_AuditRebuildRefusesUnexpectedColumns: the trail is the artefact
+// that has to outlive everything else, so the rebuild must refuse a shape it
+// does not recognise rather than quietly flatten it. The row-count check
+// cannot catch this — the counts match either way.
+func TestOpen_AuditRebuildRefusesUnexpectedColumns(t *testing.T) {
+	path := newPreDocumentWriteDB(t)
+	raw := rawOpen(t, path)
+	// As some future migration 005 would leave it.
+	_, err := raw.Exec(`ALTER TABLE config_audit ADD COLUMN request_id TEXT`)
+	require.NoError(t, err)
+	_, err = raw.Exec(
+		`INSERT INTO config_audit (namespace, action, actor, at, request_id)
+		 VALUES ('n','create','sub-1','t','req-abc123')`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	_, err = db.Open(path)
+	require.Error(t, err, "it must refuse rather than drop the column")
+	assert.Contains(t, err.Error(), "request_id")
+
+	after := rawOpen(t, path)
+	var n int
+	require.NoError(t, after.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('config_audit') WHERE name='request_id'").Scan(&n))
+	assert.Equal(t, 1, n, "the column is still there")
+	var v string
+	require.NoError(t, after.QueryRow("SELECT request_id FROM config_audit").Scan(&v))
+	assert.Equal(t, "req-abc123", v, "and so is its data")
 }
 
 // TestOpen_SchemaStepsAreRecordedAndSkipped: user_version is now a step
