@@ -550,3 +550,42 @@ func TestOpen_RefusesRebuildWithUnexpectedColumns(t *testing.T) {
 		"SELECT COUNT(*) FROM pragma_table_info('config_namespaces') WHERE name='owner'").Scan(&n))
 	assert.Equal(t, 1, n, "the column is still there")
 }
+
+// TestOpen_RebuildsRegardlessOfConstraintNaming pins the probe's decision to
+// behaviour rather than to the driver's error text.
+//
+// An unnamed CHECK renders as "CHECK constraint failed: read_role IN (...)",
+// which happens to contain the column name. A *named* one renders as the
+// constraint's name instead — so a probe that classified by substring would
+// read a perfectly ordinary rejection as "something unrelated went wrong" and
+// refuse to boot. That path runs exactly once per host, in production, on the
+// upgrade this whole change exists for.
+//
+// Same hazard from a driver upgrade that reworded the message. The decision
+// must not depend on the wording at all.
+func TestOpen_RebuildsRegardlessOfConstraintNaming(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "named.db")
+	raw := rawOpen(t, path)
+	_, err := raw.Exec(`
+CREATE TABLE config_namespaces (
+    name        TEXT PRIMARY KEY,
+    read_role   TEXT NOT NULL,
+    write_role  TEXT NOT NULL,
+    document    TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    CONSTRAINT role_values CHECK (read_role IN ('admin', 'user')),
+    CHECK (write_role IN ('admin', 'user'))
+);`)
+	require.NoError(t, err)
+	require.NoError(t, insertNamespace(raw, "houses", "admin", "admin"))
+	require.NoError(t, raw.Close())
+
+	database, err := db.Open(path)
+	require.NoError(t, err, "a named CHECK is still just a CHECK — this must migrate, not refuse")
+	defer database.Close()
+
+	require.NoError(t, insertNamespace(database.DB(), "open", "public", "admin"))
+	assert.Equal(t, 1, userVersion(t, database.DB()))
+}

@@ -226,15 +226,25 @@ func assertNoUnexpectedColumns(sqlDB *sql.DB) error {
 	return nil
 }
 
-// permitsPublicReadRole asks the database itself, rather than pattern-matching
-// the stored DDL: it attempts a fully valid insert whose only unusual value is
-// read_role='public', inside a transaction that is always rolled back. This
-// tests the exact semantics the rebuild exists to establish, so it cannot be
-// fooled by whitespace, comment or quoting differences in the DDL text.
+// permitsPublicReadRole asks the database itself, rather than
+// pattern-matching the stored DDL: it attempts a fully valid insert whose
+// only unusual value is read_role='public', inside a transaction that is
+// always rolled back.
 //
-// The DELETE ahead of the INSERT removes any same-named row so a primary key
-// collision cannot be mistaken for a rejected CHECK. Both statements are
-// discarded by the rollback.
+// It runs a positive control first — the identical insert with a role that
+// is valid under both the old and the new CHECK. The two attempts differ in
+// exactly one value, so a control that succeeds where the real probe fails
+// isolates the read_role constraint as the thing that rejected it, whatever
+// the driver's error message happens to say.
+//
+// That differential matters more than it looks. Classifying by error text
+// worked only because the CHECK is unnamed and SQLite renders the expression
+// (which contains "read_role"); a named constraint reports its name instead,
+// and a driver upgrade could reword the message. Either would make an
+// ordinary rejection look like an unexplained failure and refuse the boot —
+// on the code path that runs exactly once per host, in production, during
+// the upgrade this change exists for. Reading semantics instead of text is
+// the same argument that made this a probe rather than a DDL match.
 func permitsPublicReadRole(sqlDB *sql.DB) (bool, error) {
 	tx, err := sqlDB.Begin()
 	if err != nil {
@@ -242,41 +252,41 @@ func permitsPublicReadRole(sqlDB *sql.DB) (bool, error) {
 	}
 	defer tx.Rollback() //nolint:errcheck // the probe must never commit
 
+	if err := probeInsertRole(tx, "user"); err != nil {
+		return false, fmt.Errorf(
+			"read_role probe control failed on %s: the table rejects a probe row even with an "+
+				"unambiguously valid role, so this says nothing about the read_role CHECK: %w",
+			namespacesTable, err)
+	}
+	if err := probeInsertRole(tx, ConfigRolePublicLiteral); err != nil {
+		// The control succeeded moments ago and only the role differs, so the
+		// read_role constraint is what refused it.
+		return false, nil
+	}
+	return true, nil
+}
+
+// ConfigRolePublicLiteral is the role value the probe tests for. Spelled out
+// here rather than imported so this file stays free of domain dependencies;
+// db/migrations owns the same literal.
+const ConfigRolePublicLiteral = "public"
+
+// probeInsertRole writes the sentinel row with the given read role, clearing
+// any previous attempt first so a primary-key collision can never be mistaken
+// for a rejected CHECK.
+func probeInsertRole(tx *sql.Tx, readRole string) error {
 	if _, err := tx.Exec(
 		"DELETE FROM "+namespacesTable+" WHERE name = ?", probeNamespace,
 	); err != nil {
-		return false, fmt.Errorf("read_role probe cleanup: %w", err)
+		return fmt.Errorf("read_role probe cleanup: %w", err)
 	}
-
-	_, err = tx.Exec(
+	_, err := tx.Exec(
 		`INSERT INTO `+namespacesTable+`
 		   (name, read_role, write_role, document, updated_at, updated_by, created_at)
-		 VALUES (?, 'public', 'admin', '{}', '', '', '')`,
-		probeNamespace,
+		 VALUES (?, ?, 'admin', '{}', '', '', '')`,
+		probeNamespace, readRole,
 	)
-	if err == nil {
-		return true, nil
-	}
-	// Only the read_role CHECK rejecting the row means "not wide enough".
-	// Every other failure — a NOT NULL column some later migration adds, a
-	// unique index the probe row happens to collide with, a busy database
-	// during a restart — says nothing about the constraint, and treating it
-	// as "needs rebuilding" would send a healthy database into a destructive,
-	// shape-flattening rebuild.
-	if isReadRoleCheckViolation(err) {
-		return false, nil
-	}
-	return false, fmt.Errorf(
-		"read_role probe on %s failed for an unrelated reason (not a CHECK violation): %w",
-		namespacesTable, err)
-}
-
-func isReadRoleCheckViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "CHECK constraint failed") && strings.Contains(msg, "read_role")
+	return err
 }
 
 // rebuildNamespacesTable performs the SQLite table-rebuild dance in one

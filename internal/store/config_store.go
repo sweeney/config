@@ -45,9 +45,8 @@ func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 		out = append(out, sum)
 	}
 	if err := rows.Err(); err != nil {
-		// Never hand back a partial trail alongside an error. The whole point
-		// of this table is that it can be believed.
-		return nil, fmt.Errorf("iterate config audit: %w", err)
+		// Never hand back a partial list alongside an error.
+		return nil, fmt.Errorf("iterate config namespaces: %w", err)
 	}
 	return out, nil
 }
