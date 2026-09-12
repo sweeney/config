@@ -113,8 +113,29 @@ components:
                 actor:
                     description: |
                         The `sub` of the admin who made the change — for a
-                        `create`, whoever created the namespace.
-                    example: user_01h8xyz
+                        `create`, whoever created the namespace. Always
+                        present, and the stable key: it identifies the actor
+                        even when `actor_username` is absent or names someone
+                        since renamed.
+                    example: adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9
+                    type: string
+                actor_username:
+                    description: |
+                        The actor's username as it was at the time of the
+                        change, taken from the token that made the request.
+
+                        Stored when the row is written, never resolved at read
+                        time. The trail records what was true then, so it stays
+                        legible when identity is unreachable and does not
+                        change meaning because someone was later renamed or
+                        their account deleted.
+
+                        Omitted when no username was recorded: a service token
+                        has no user behind it, and rows written before this
+                        field existed do not know one. They are deliberately
+                        not backfilled. Fall back to `actor`, which is always
+                        present.
+                    example: sweeney
                     type: string
                 at:
                     description: |

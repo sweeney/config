@@ -463,7 +463,8 @@ curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "action":         "create",
     "new_read_role":  "user",
     "new_write_role": "admin",
-    "actor":          "usr_01H8ZQK3M7",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
     "at":             "2026-09-01T09:14:02.113Z"
   },
   {
@@ -472,7 +473,8 @@ curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "old_write_role": "admin",
     "new_read_role":  "public",
     "new_write_role": "admin",
-    "actor":          "usr_01H8ZQK3M7",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
     "at":             "2026-09-04T11:02:47.906Z"
   }
 ]
@@ -483,8 +485,17 @@ curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
 | `action` | `create`, `acl_change` or `delete` |
 | `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create` |
 | `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete` |
-| `actor` | Subject of the token that made the change |
+| `actor` | Subject of the token that made the change; always present, and the stable key |
+| `actor_username` | That actor's username at the time of the change; omitted when none was recorded |
 | `at` | RFC 3339 UTC, millisecond precision |
+
+**`actor_username` is a label, `actor` is the key.** The username is recorded
+as it stood when the change was made and is stored at write time, never
+resolved at read time: the trail stays legible when identity is unreachable,
+and a later rename or deleted account does not rewrite what the row means. It
+is omitted — absent, not empty — when none was recorded, because a service
+token has no user behind it and rows written before the field existed do not
+know one; those are deliberately not backfilled. Fall back to `actor`.
 
 **Admin-only, including when the namespace is `read_role: public`.** Publishing
 a document does not publish its history: every operation the trail records is
@@ -503,7 +514,8 @@ longer here" is exactly what this answers. Nothing leaks by doing so — the
 caller is already an admin, who can list every namespace anyway. A name that
 does not match `^[a-z0-9_-]{1,64}$` is still `400 invalid_name`.
 
-The admin SPA shows the same history in its namespace view. For direct
+The admin SPA shows the same history in its namespace view, naming the actor
+by username where one was recorded. For direct
 `sqlite3` access on the host, and for questions that span namespaces, see
 **Audit trail** in `docs/admin.md`.
 
