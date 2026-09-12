@@ -179,22 +179,18 @@ func (s *ConfigService) PutDocument(caller Caller, name string, document []byte)
 		return false, ErrConfigForbidden
 	}
 
-	existing, err := s.repo.Get(name)
+	// The repository compares inside its write transaction and reports
+	// whether anything changed, so a no-op cannot be decided from a snapshot
+	// that another writer has already moved on from.
+	changed, err := s.repo.UpdateDocument(name, normalizedDoc, caller.actor(), s.now())
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return false, ErrConfigNamespaceNotFound
 		}
 		return false, err
 	}
-	if bytes.Equal(existing.Document, normalizedDoc) {
+	if !changed {
 		return false, nil
-	}
-
-	if err := s.repo.UpdateDocument(name, normalizedDoc, caller.actor(), s.now()); err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return false, ErrConfigNamespaceNotFound
-		}
-		return false, err
 	}
 	s.fireBackup()
 	return true, nil

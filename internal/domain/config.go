@@ -111,10 +111,15 @@ type ConfigNamespace struct {
 	UpdatedBy string
 	CreatedAt time.Time
 
-	// UpdatedByUsername is who last wrote this namespace, by name as it stood
-	// then. Empty for callers without one — service tokens — and for rows
-	// written before the column existed. Document writes are not audited, so
-	// this is the only record of who last changed the contents.
+	// UpdatedByUsername is who last modified this namespace — its document or
+	// its ACL, since UpdateACL writes this too — by name as it stood then.
+	// NULL in the database, so empty here, for callers without a username
+	// (service tokens) and for rows written before the column existed;
+	// UpdatedBy is always present.
+	//
+	// The same change is also in the audit trail, as a document_write or an
+	// acl_change. This field is that answer without an admin token and
+	// without reading a whole history.
 	UpdatedByUsername string
 }
 
@@ -135,7 +140,12 @@ type ConfigRepository interface {
 	GetACL(name string) (readRole, writeRole string, err error)
 	Get(name string) (*ConfigNamespace, error)
 	Create(ns *ConfigNamespace, actor Actor) error
-	UpdateDocument(name string, document []byte, actor Actor, at time.Time) error
+	// UpdateDocument replaces the document and reports whether anything
+	// changed. The comparison happens inside the write transaction: doing it
+	// in a separate read let two concurrent writers of the same new content
+	// both observe a difference, and the loser then recorded a document_write
+	// for a change that did not happen.
+	UpdateDocument(name string, document []byte, actor Actor, at time.Time) (changed bool, err error)
 	// UpdateACL replaces the ACL. publishConfirmed reports whether the caller
 	// supplied a valid confirmation; implementations must compare the
 	// incoming read role against the stored one inside the write transaction

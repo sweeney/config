@@ -105,7 +105,9 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 	}, domain.Actor{Sub: "u1"}))
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), domain.Actor{Sub: "u2"}, later))
+	changed, uerr := s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), domain.Actor{Sub: "u2"}, later)
+	require.NoError(t, uerr)
+	assert.True(t, changed)
 
 	got, err := s.Get("mqtt")
 	require.NoError(t, err)
@@ -117,7 +119,7 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 
 func TestConfigStore_UpdateDocument_NotFound(t *testing.T) {
 	s := store.NewConfigStore(openTestDB(t))
-	err := s.UpdateDocument("missing", []byte(`{}`), domain.Actor{Sub: "u"}, time.Now().UTC())
+	_, err := s.UpdateDocument("missing", []byte(`{}`), domain.Actor{Sub: "u"}, time.Now().UTC())
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
@@ -494,8 +496,9 @@ func TestConfigStore_RecordsWhoLastWroteTheDocument(t *testing.T) {
 	assert.Equal(t, "sub-1", got.UpdatedBy)
 	assert.Equal(t, "alice", got.UpdatedByUsername, "create records the writer")
 
-	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":1}`),
-		domain.Actor{Sub: "sub-2", Username: "bob"}, now.Add(time.Minute)))
+	_, err = s.UpdateDocument("prefs", []byte(`{"k":1}`),
+		domain.Actor{Sub: "sub-2", Username: "bob"}, now.Add(time.Minute))
+	require.NoError(t, err)
 	got, err = s.Get("prefs")
 	require.NoError(t, err)
 	assert.Equal(t, "sub-2", got.UpdatedBy)
@@ -553,8 +556,10 @@ func TestConfigStore_UpdateDocument_RecordsAnEvent(t *testing.T) {
 	seedForAudit(t, s, "prefs", "user", "user", now)
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":2}`),
-		domain.Actor{Sub: "sub-9", Username: "dave"}, later))
+	changed, uerr := s.UpdateDocument("prefs", []byte(`{"k":2}`),
+		domain.Actor{Sub: "sub-9", Username: "dave"}, later)
+	require.NoError(t, uerr)
+	assert.True(t, changed, "a genuine change reports as changed")
 
 	entries, err := s.ListAudit("prefs")
 	require.NoError(t, err)
@@ -578,7 +583,7 @@ func TestConfigStore_UpdateDocument_AuditRollsBackWithFailedWrite(t *testing.T) 
 	s := store.NewConfigStore(openTestDB(t))
 	now := time.Now().UTC().Truncate(time.Second)
 
-	err := s.UpdateDocument("nosuchns", []byte(`{}`), domain.Actor{Sub: "sub-1"}, now)
+	_, err := s.UpdateDocument("nosuchns", []byte(`{}`), domain.Actor{Sub: "sub-1"}, now)
 	require.ErrorIs(t, err, domain.ErrNotFound)
 
 	entries, aerr := s.ListAudit("nosuchns")
@@ -594,12 +599,14 @@ func TestConfigStore_DocumentWrites_InterleaveWithACLChanges(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "prefs", "user", "user", now)
 
-	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":1}`),
-		domain.Actor{Sub: "a"}, now.Add(time.Minute)))
+	_, err := s.UpdateDocument("prefs", []byte(`{"k":1}`),
+		domain.Actor{Sub: "a"}, now.Add(time.Minute))
+	require.NoError(t, err)
 	require.NoError(t, s.UpdateACL("prefs", "public", "user",
 		domain.Actor{Sub: "b"}, now.Add(2*time.Minute), true))
-	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":2}`),
-		domain.Actor{Sub: "c"}, now.Add(3*time.Minute)))
+	_, err = s.UpdateDocument("prefs", []byte(`{"k":2}`),
+		domain.Actor{Sub: "c"}, now.Add(3*time.Minute))
+	require.NoError(t, err)
 
 	entries, err := s.ListAudit("prefs")
 	require.NoError(t, err)
@@ -611,4 +618,22 @@ func TestConfigStore_DocumentWrites_InterleaveWithACLChanges(t *testing.T) {
 		domain.AuditActionACLChange,
 		domain.AuditActionDocumentWrite,
 	}, got, "one history, in the order things happened")
+}
+
+// TestConfigStore_UpdateDocument_NoOpIsNotRecorded: the comparison happens
+// inside the write transaction, so "every document_write is a real change"
+// holds even when two writers race with the same new content — the second
+// sees the row the first committed, not a snapshot taken before it.
+func TestConfigStore_UpdateDocument_NoOpIsNotRecorded(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	changed, err := s.UpdateDocument("prefs", []byte(`{}`), domain.Actor{Sub: "a"}, now.Add(time.Minute))
+	require.NoError(t, err)
+	assert.False(t, changed, "identical content is not a change")
+
+	entries, aerr := s.ListAudit("prefs")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "and leaves no entry claiming one happened")
 }
