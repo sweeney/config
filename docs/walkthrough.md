@@ -369,15 +369,21 @@ curl -s $CFG/api/v1/config/namespaces/tariffs/audit \
 ```json
 [
   {"action":"create","new_read_role":"user","new_write_role":"admin",
-   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.101Z"},
+   "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:35.101Z"},
   {"action":"acl_change","old_read_role":"user","old_write_role":"admin",
    "new_read_role":"public","new_write_role":"admin",
-   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.402Z"},
+   "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:35.402Z"},
   {"action":"acl_change","old_read_role":"public","old_write_role":"admin",
    "new_read_role":"user","new_write_role":"admin",
-   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.688Z"}
+   "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:35.688Z"}
 ]
 ```
+
+`actor` is the identity subject and is always present; `actor_username` is
+the name it went by at the time, recorded when the change was made rather
+than looked up now — so the trail stays legible with identity unreachable,
+and does not change meaning if someone is later renamed. It is omitted
+where no username was recorded, and rows predating the column stay that way.
 
 The old roles are absent on a `create`, the new roles on a `delete`. The
 document writes in sections 6 and 7 left no rows at all — the trail
@@ -423,9 +429,9 @@ curl -s $CFG/api/v1/config/namespaces/houses/audit \
 ```json
 [
   {"action":"create","new_read_role":"admin","new_write_role":"admin",
-   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:34.818Z"},
+   "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:34.818Z"},
   {"action":"delete","old_read_role":"admin","old_write_role":"admin",
-   "actor":"usr_01H8ZQK3M7","at":"2026-04-24T17:06:35.002Z"}
+   "actor":"adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9","actor_username":"sweeney","at":"2026-04-24T17:06:35.002Z"}
 ]
 ```
 

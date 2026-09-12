@@ -121,9 +121,10 @@ func (s *ConfigStore) withTx(fn func(*sql.Tx) error) error {
 	return nil
 }
 
-// nullableRole maps an inapplicable role to NULL rather than to the empty
+// nullableRole maps an inapplicable value to NULL rather than to the empty
 // string: "this event had no previous ACL" is different from "the previous
-// ACL was blank".
+// ACL was blank". Also used for the actor username, where NULL means "not
+// recorded" rather than "named the empty string".
 func nullableRole(role string) any {
 	if role == "" {
 		return nil
@@ -137,8 +138,8 @@ func nullableRole(role string) any {
 func insertAudit(tx *sql.Tx, e domain.AuditEntry) error {
 	_, err := tx.Exec(
 		`INSERT INTO config_audit
-		   (namespace, action, old_read, old_write, new_read, new_write, actor, at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		   (namespace, action, old_read, old_write, new_read, new_write, actor, actor_username, at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Namespace,
 		e.Action,
 		nullableRole(e.OldReadRole),
@@ -146,6 +147,7 @@ func insertAudit(tx *sql.Tx, e domain.AuditEntry) error {
 		nullableRole(e.NewReadRole),
 		nullableRole(e.NewWriteRole),
 		e.Actor,
+		nullableRole(e.ActorUsername),
 		formatTime(e.At),
 	)
 	if err != nil {
@@ -171,15 +173,16 @@ func readACLTx(tx *sql.Tx, name string) (readRole, writeRole string, err error) 
 	return readRole, writeRole, nil
 }
 
-func (s *ConfigStore) Create(ns *domain.ConfigNamespace) error {
+func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		if err := insertAudit(tx, domain.AuditEntry{
-			Namespace:    ns.Name,
-			Action:       domain.AuditActionCreate,
-			NewReadRole:  ns.ReadRole,
-			NewWriteRole: ns.WriteRole,
-			Actor:        ns.UpdatedBy,
-			At:           ns.CreatedAt,
+			Namespace:     ns.Name,
+			Action:        domain.AuditActionCreate,
+			NewReadRole:   ns.ReadRole,
+			NewWriteRole:  ns.WriteRole,
+			Actor:         actor.Sub,
+			ActorUsername: actor.Username,
+			At:            ns.CreatedAt,
 		}); err != nil {
 			return err
 		}
@@ -193,7 +196,7 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace) error {
 			ns.WriteRole,
 			string(ns.Document),
 			formatTime(ns.UpdatedAt),
-			ns.UpdatedBy,
+			actor.Sub,
 			formatTime(ns.CreatedAt),
 		)
 		if err != nil {
@@ -226,7 +229,7 @@ func (s *ConfigStore) UpdateDocument(name string, document []byte, updatedBy str
 	return nil
 }
 
-func (s *ConfigStore) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error {
+func (s *ConfigStore) UpdateACL(name, readRole, writeRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		oldRead, oldWrite, err := readACLTx(tx, name)
 		if err != nil {
@@ -240,14 +243,15 @@ func (s *ConfigStore) UpdateACL(name, readRole, writeRole, updatedBy string, at 
 			return domain.ErrPublishNotConfirmed
 		}
 		if err := insertAudit(tx, domain.AuditEntry{
-			Namespace:    name,
-			Action:       domain.AuditActionACLChange,
-			OldReadRole:  oldRead,
-			OldWriteRole: oldWrite,
-			NewReadRole:  readRole,
-			NewWriteRole: writeRole,
-			Actor:        updatedBy,
-			At:           at,
+			Namespace:     name,
+			Action:        domain.AuditActionACLChange,
+			OldReadRole:   oldRead,
+			OldWriteRole:  oldWrite,
+			NewReadRole:   readRole,
+			NewWriteRole:  writeRole,
+			Actor:         actor.Sub,
+			ActorUsername: actor.Username,
+			At:            at,
 		}); err != nil {
 			return err
 		}
@@ -259,7 +263,7 @@ func (s *ConfigStore) UpdateACL(name, readRole, writeRole, updatedBy string, at 
 			readRole,
 			writeRole,
 			formatTime(at),
-			updatedBy,
+			actor.Sub,
 			name,
 		)
 		if err != nil {
@@ -273,7 +277,7 @@ func (s *ConfigStore) UpdateACL(name, readRole, writeRole, updatedBy string, at 
 	})
 }
 
-func (s *ConfigStore) Delete(name, deletedBy string, at time.Time) error {
+func (s *ConfigStore) Delete(name string, actor domain.Actor, at time.Time) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		oldRead, oldWrite, err := readACLTx(tx, name)
 		if err != nil {
@@ -281,12 +285,13 @@ func (s *ConfigStore) Delete(name, deletedBy string, at time.Time) error {
 		}
 		// New roles are left empty: a deleted namespace has no resulting ACL.
 		if err := insertAudit(tx, domain.AuditEntry{
-			Namespace:    name,
-			Action:       domain.AuditActionDelete,
-			OldReadRole:  oldRead,
-			OldWriteRole: oldWrite,
-			Actor:        deletedBy,
-			At:           at,
+			Namespace:     name,
+			Action:        domain.AuditActionDelete,
+			OldReadRole:   oldRead,
+			OldWriteRole:  oldWrite,
+			Actor:         actor.Sub,
+			ActorUsername: actor.Username,
+			At:            at,
 		}); err != nil {
 			return err
 		}
@@ -309,7 +314,8 @@ func (s *ConfigStore) Delete(name, deletedBy string, at time.Time) error {
 // describe — see the note on the config_audit schema.
 func (s *ConfigStore) ListAudit(namespace string) ([]domain.AuditEntry, error) {
 	rows, err := s.db.DB().Query(
-		`SELECT id, namespace, action, old_read, old_write, new_read, new_write, actor, at
+		`SELECT id, namespace, action, old_read, old_write, new_read, new_write,
+		        actor, actor_username, at
 		 FROM config_audit WHERE namespace = ? ORDER BY id ASC`,
 		namespace,
 	)
@@ -323,16 +329,18 @@ func (s *ConfigStore) ListAudit(namespace string) ([]domain.AuditEntry, error) {
 		var (
 			e                                    domain.AuditEntry
 			oldRead, oldWrite, newRead, newWrite sql.NullString
+			actorUsername                        sql.NullString
 			at                                   string
 		)
 		if err := rows.Scan(&e.ID, &e.Namespace, &e.Action,
-			&oldRead, &oldWrite, &newRead, &newWrite, &e.Actor, &at); err != nil {
+			&oldRead, &oldWrite, &newRead, &newWrite, &e.Actor, &actorUsername, &at); err != nil {
 			return nil, fmt.Errorf("scan config audit: %w", err)
 		}
 		e.OldReadRole = oldRead.String
 		e.OldWriteRole = oldWrite.String
 		e.NewReadRole = newRead.String
 		e.NewWriteRole = newWrite.String
+		e.ActorUsername = actorUsername.String
 		e.At = parseTime(at)
 		out = append(out, e)
 	}

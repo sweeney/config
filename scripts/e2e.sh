@@ -461,6 +461,10 @@ check_contains "history records the create" '"action":"create"' "$BODY"
 check_contains "history records the ACL change" '"action":"acl_change"' "$BODY"
 check_contains "history records the role it moved away from" '"old_read_role":"public"' "$BODY"
 check_contains "history records who did it" '"actor"' "$BODY"
+# The username is recorded at write time from the token, so the trail names
+# who acted without a later lookup against identity — which would not work
+# during an outage, nor after a rename.
+check_contains "history names the actor, not just their id" "\"actor_username\":\"$ADMIN_USER\"" "$BODY"
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
   "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" \

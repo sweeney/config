@@ -36,7 +36,7 @@ func TestConfigStore_CreateAndGet(t *testing.T) {
 		UpdatedBy: "user-123",
 		CreatedAt: now,
 	}
-	require.NoError(t, s.Create(ns))
+	require.NoError(t, s.Create(ns, domain.Actor{Sub: "user-123"}))
 
 	got, err := s.Get("houses")
 	require.NoError(t, err)
@@ -60,8 +60,8 @@ func TestConfigStore_GetACL(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, s.Create(&domain.ConfigNamespace{
 		Name: "prefs", ReadRole: "user", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	readRole, writeRole, err := s.GetACL("prefs")
 	require.NoError(t, err)
@@ -80,10 +80,10 @@ func TestConfigStore_Create_Duplicate_ReturnsConflict(t *testing.T) {
 	now := time.Now().UTC()
 	ns := &domain.ConfigNamespace{
 		Name: "dup", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
 	}
-	require.NoError(t, s.Create(ns))
-	assert.ErrorIs(t, s.Create(ns), domain.ErrConflict)
+	require.NoError(t, s.Create(ns, domain.Actor{Sub: "user-123"}))
+	assert.ErrorIs(t, s.Create(ns, domain.Actor{Sub: "user-123"}), domain.ErrConflict)
 }
 
 func TestConfigStore_Create_InvalidRole_RejectedByCheckConstraint(t *testing.T) {
@@ -91,8 +91,8 @@ func TestConfigStore_Create_InvalidRole_RejectedByCheckConstraint(t *testing.T) 
 	now := time.Now().UTC()
 	err := s.Create(&domain.ConfigNamespace{
 		Name: "bad", ReadRole: "root", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	})
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"})
 	assert.Error(t, err, "CHECK constraint on read_role must reject unknown roles")
 }
 
@@ -101,8 +101,8 @@ func TestConfigStore_UpdateDocument(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	require.NoError(t, s.Create(&domain.ConfigNamespace{
 		Name: "mqtt", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{"topic":"/a"}`), UpdatedAt: now, UpdatedBy: "u1", CreatedAt: now,
-	}))
+		Document: []byte(`{"topic":"/a"}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u1"}))
 
 	later := now.Add(time.Minute)
 	require.NoError(t, s.UpdateDocument("mqtt", []byte(`{"topic":"/b"}`), "u2", later))
@@ -126,11 +126,11 @@ func TestConfigStore_UpdateACL(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	require.NoError(t, s.Create(&domain.ConfigNamespace{
 		Name: "prefs", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateACL("prefs", "user", "admin", "admin-2", later, true))
+	require.NoError(t, s.UpdateACL("prefs", "user", "admin", domain.Actor{Sub: "admin-2"}, later, true))
 
 	got, err := s.Get("prefs")
 	require.NoError(t, err)
@@ -142,7 +142,7 @@ func TestConfigStore_UpdateACL(t *testing.T) {
 
 func TestConfigStore_UpdateACL_NotFound(t *testing.T) {
 	s := store.NewConfigStore(openTestDB(t))
-	err := s.UpdateACL("missing", "user", "admin", "admin-1", time.Now().UTC(), true)
+	err := s.UpdateACL("missing", "user", "admin", domain.Actor{Sub: "admin-1"}, time.Now().UTC(), true)
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
@@ -151,14 +151,14 @@ func TestConfigStore_Delete(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, s.Create(&domain.ConfigNamespace{
 		Name: "temp", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
-	require.NoError(t, s.Delete("temp", "deleter", now))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
+	require.NoError(t, s.Delete("temp", domain.Actor{Sub: "deleter"}, now))
 
 	_, err := s.Get("temp")
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 
-	assert.ErrorIs(t, s.Delete("temp", "deleter", now), domain.ErrNotFound,
+	assert.ErrorIs(t, s.Delete("temp", domain.Actor{Sub: "deleter"}, now), domain.ErrNotFound,
 		"second delete must return not-found")
 }
 
@@ -175,8 +175,8 @@ func TestConfigStore_List_Ordered(t *testing.T) {
 	for _, name := range []string{"charlie", "alpha", "bravo"} {
 		require.NoError(t, s.Create(&domain.ConfigNamespace{
 			Name: name, ReadRole: "admin", WriteRole: "admin",
-			Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-		}))
+			Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+		}, domain.Actor{Sub: "u"}))
 	}
 
 	list, err := s.List()
@@ -193,8 +193,8 @@ func seedForAudit(t *testing.T, s *store.ConfigStore, name, readRole, writeRole 
 	t.Helper()
 	require.NoError(t, s.Create(&domain.ConfigNamespace{
 		Name: name, ReadRole: readRole, WriteRole: writeRole,
-		Document: []byte(`{}`), UpdatedAt: at, UpdatedBy: "creator", CreatedAt: at,
-	}))
+		Document: []byte(`{}`), UpdatedAt: at, CreatedAt: at,
+	}, domain.Actor{Sub: "creator"}))
 }
 
 func TestConfigStore_Create_WritesAuditEntry(t *testing.T) {
@@ -223,7 +223,7 @@ func TestConfigStore_UpdateACL_WritesAuditEntryWithTransition(t *testing.T) {
 	seedForAudit(t, s, "tariffs", "user", "user", now)
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.UpdateACL("tariffs", "public", "user", "admin-1", later, true))
+	require.NoError(t, s.UpdateACL("tariffs", "public", "user", domain.Actor{Sub: "admin-1"}, later, true))
 
 	entries, err := s.ListAudit("tariffs")
 	require.NoError(t, err)
@@ -249,7 +249,7 @@ func TestConfigStore_Delete_AuditSurvivesTheNamespace(t *testing.T) {
 	seedForAudit(t, s, "temp", "admin", "admin", now)
 
 	later := now.Add(time.Minute)
-	require.NoError(t, s.Delete("temp", "admin-9", later))
+	require.NoError(t, s.Delete("temp", domain.Actor{Sub: "admin-9"}, later))
 
 	_, err := s.Get("temp")
 	require.ErrorIs(t, err, domain.ErrNotFound, "namespace is gone")
@@ -281,7 +281,7 @@ func TestConfigStore_UpdateACL_AuditRollsBackWithFailedMutation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "prefs", "user", "user", now)
 
-	err := s.UpdateACL("prefs", "root", "user", "admin-1", now.Add(time.Minute), true)
+	err := s.UpdateACL("prefs", "root", "user", domain.Actor{Sub: "admin-1"}, now.Add(time.Minute), true)
 	require.Error(t, err, "an invalid role must be rejected by the CHECK constraint")
 
 	readRole, writeRole, gerr := s.GetACL("prefs")
@@ -304,8 +304,8 @@ func TestConfigStore_Create_AuditRollsBackOnConflict(t *testing.T) {
 
 	err := s.Create(&domain.ConfigNamespace{
 		Name: "dup", ReadRole: "user", WriteRole: "user",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "creator2", CreatedAt: now,
-	})
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "creator2"})
 	require.ErrorIs(t, err, domain.ErrConflict)
 
 	entries, aerr := s.ListAudit("dup")
@@ -318,8 +318,8 @@ func TestConfigStore_ListAudit_ScopedAndOrdered(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "alpha", "user", "user", now)
 	seedForAudit(t, s, "beta", "admin", "admin", now)
-	require.NoError(t, s.UpdateACL("alpha", "public", "user", "admin-1", now.Add(time.Minute), true))
-	require.NoError(t, s.UpdateACL("alpha", "user", "user", "admin-1", now.Add(2*time.Minute), true))
+	require.NoError(t, s.UpdateACL("alpha", "public", "user", domain.Actor{Sub: "admin-1"}, now.Add(time.Minute), true))
+	require.NoError(t, s.UpdateACL("alpha", "user", "user", domain.Actor{Sub: "admin-1"}, now.Add(2*time.Minute), true))
 
 	entries, err := s.ListAudit("alpha")
 	require.NoError(t, err)
@@ -347,7 +347,7 @@ func TestConfigStore_UpdateACL_RefusesUnconfirmedPublish(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "tariffs", "user", "user", now)
 
-	err := s.UpdateACL("tariffs", "public", "user", "admin-1", now.Add(time.Minute), false)
+	err := s.UpdateACL("tariffs", "public", "user", domain.Actor{Sub: "admin-1"}, now.Add(time.Minute), false)
 	require.ErrorIs(t, err, domain.ErrPublishNotConfirmed)
 
 	readRole, _, gerr := s.GetACL("tariffs")
@@ -367,7 +367,7 @@ func TestConfigStore_UpdateACL_AlreadyPublicNeedsNoConfirmation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedForAudit(t, s, "tariffs", "public", "user", now)
 
-	require.NoError(t, s.UpdateACL("tariffs", "public", "admin", "admin-1", now.Add(time.Minute), false))
+	require.NoError(t, s.UpdateACL("tariffs", "public", "admin", domain.Actor{Sub: "admin-1"}, now.Add(time.Minute), false))
 	_, writeRole, err := s.GetACL("tariffs")
 	require.NoError(t, err)
 	assert.Equal(t, "admin", writeRole)
@@ -399,4 +399,78 @@ func TestConfigStore_Audit_RejectsRolesTheLiveTableCouldNotHold(t *testing.T) {
 		`INSERT INTO config_audit (namespace, action, old_read, old_write, actor, at)
 		 VALUES ('n','delete','admin','admin','a','t')`)
 	assert.NoError(t, err)
+}
+
+// --- actor username ---
+
+// TestConfigStore_Audit_RecordsActorUsername: the sub stays the stable key,
+// the username is the human label as it was at the time. Both are kept.
+func TestConfigStore_Audit_RecordsActorUsername(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "tariffs", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+	require.NoError(t, s.UpdateACL("tariffs", "public", "user",
+		domain.Actor{Sub: "sub-2", Username: "bob"}, now.Add(time.Minute), true))
+	require.NoError(t, s.Delete("tariffs",
+		domain.Actor{Sub: "sub-3", Username: "carol"}, now.Add(2*time.Minute)))
+
+	entries, err := s.ListAudit("tariffs")
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+
+	assert.Equal(t, "sub-1", entries[0].Actor)
+	assert.Equal(t, "alice", entries[0].ActorUsername)
+	assert.Equal(t, "sub-2", entries[1].Actor)
+	assert.Equal(t, "bob", entries[1].ActorUsername, "the publisher is who you look for first")
+	assert.Equal(t, "sub-3", entries[2].Actor)
+	assert.Equal(t, "carol", entries[2].ActorUsername)
+}
+
+// TestConfigStore_Audit_UsernameIsOptional: rows written before the column
+// existed, and any caller without a username claim, leave it empty rather
+// than inventing one. Readers fall back to the sub.
+func TestConfigStore_Audit_UsernameIsOptional(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+
+	require.NoError(t, s.Create(&domain.ConfigNamespace{
+		Name: "legacy", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-only"}))
+	entries, err := s.ListAudit("legacy")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "sub-only", entries[0].Actor)
+	assert.Empty(t, entries[0].ActorUsername)
+}
+
+// TestConfigStore_Audit_UsernameSurvivesReopen guards the migration itself:
+// ALTER TABLE ADD COLUMN re-runs on every boot under common/db's ledger-less
+// runner, and must not disturb rows already written.
+func TestConfigStore_Audit_UsernameSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.db")
+
+	first, err := db.Open(path)
+	require.NoError(t, err)
+	s1 := store.NewConfigStore(first)
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s1.Create(&domain.ConfigNamespace{
+		Name: "tariffs", ReadRole: "user", WriteRole: "user",
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+	require.NoError(t, first.Close())
+
+	second, err := db.Open(path)
+	require.NoError(t, err, "re-running ADD COLUMN must be harmless")
+	defer second.Close()
+
+	entries, err := store.NewConfigStore(second).ListAudit("tariffs")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "alice", entries[0].ActorUsername, "the recorded username survives a reopen")
 }

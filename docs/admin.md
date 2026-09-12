@@ -322,8 +322,8 @@ Never:
 
 Namespace lifecycle changes are recorded in a `config_audit` table: one
 row per `create`, `acl_change` and `delete`, carrying the namespace, the
-action, the old and new read/write roles, the actor's subject, and a
-timestamp. Old roles are empty on a create; new roles are empty on a
+action, the old and new read/write roles, the actor's subject and —
+where one was recorded — their username, and a timestamp. Old roles are empty on a create; new roles are empty on a
 delete. The table lives in the same SQLite file as the namespaces, so it
 rides along in every R2 backup.
 
@@ -360,7 +360,8 @@ curl -s https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "action":         "create",
     "new_read_role":  "user",
     "new_write_role": "admin",
-    "actor":          "usr_01H8ZQK3M7",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
     "at":             "2026-09-01T09:14:02.113Z"
   },
   {
@@ -369,7 +370,8 @@ curl -s https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "old_write_role": "admin",
     "new_read_role":  "public",
     "new_write_role": "admin",
-    "actor":          "usr_01H8ZQK3M7",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
     "at":             "2026-09-04T11:02:47.906Z"
   }
 ]
@@ -380,6 +382,31 @@ which is the same thing the empty columns say below — absent rather than
 empty, because there was no previous ACL and no resulting one. (The JSON
 keys are `old_read_role` / `new_read_role`; the columns they come from
 are `old_read` / `new_read`.)
+
+**`actor` is the subject; `actor_username` is the name it went by.**
+`actor` is the identity `sub`, always present, and the stable key — it is
+what you match on. `actor_username` is the human label, the username as
+it stood at the time of the change, taken from the token that made the
+request.
+
+It is stored when the row is written, not resolved when the row is read,
+and that is the whole of the design:
+
+- An audit trail should not need identity to be reachable in order to be
+  legible. The one artefact you reach for when something has gone wrong
+  is the last one that should stop answering because another service is
+  down.
+- It should not change meaning because someone was later renamed, or
+  their account deleted. The row records what was true then, which is
+  the only thing a history is for.
+
+`actor_username` is **absent rather than empty** when none was recorded,
+and there are two ways that happens: a service token has no user behind
+it, and rows written before the field existed do not know one. Those old
+rows are deliberately not backfilled — asking identity for the current
+name of that subject today would write a present-day fact into a
+historical row, which is exactly the confusion the stored username
+avoids. Clients fall back to `actor`.
 
 **Admin-only, including when the namespace is public.** Publishing a
 document does not publish its history. A document and its history are
@@ -401,15 +428,18 @@ foreign key. *What happened to the namespace that is no longer here* is
 exactly what this endpoint is for, and a `404` would withhold the answer
 for precisely the namespaces where it matters most.
 
-The admin SPA shows the same history in its namespace view, so the
-routine "who published this, and when?" question needs neither a curl
-nor a shell on the host.
+The admin SPA shows the same history in its namespace view, naming the
+actor by username where one was recorded and keeping the subject to
+hand, so the routine "who published this, and when?" question needs
+neither a curl nor a shell on the host.
 
 ### Direct access with `sqlite3`
 
 The table is still queryable on the box, and that is the route to reach
 for when you are already there, when the service is down, or when the
 question spans namespaces — the API answers for one namespace at a time.
+The username sits in `actor_username`, `NULL` on the rows that never
+recorded one.
 
 ```bash
 sudo -u config sqlite3 -header -column /var/lib/config/config.db \
@@ -422,8 +452,8 @@ sudo -u config sqlite3 -header -column /var/lib/config/config.db \
 ```
 at                          action      old_read  new_read  actor
 --------------------------  ----------  --------  --------  ---------
-2026-09-01T09:14:02.113Z    create                user      usr_01H8…
-2026-09-04T11:02:47.906Z    acl_change  user      public    usr_01H8…
+2026-09-01T09:14:02.113Z    create                user      adcc1b9d-64f9-…
+2026-09-04T11:02:47.906Z    acl_change  user      public    adcc1b9d-64f9-…
 ```
 
 The cross-namespace question — when did *anything* become public, and

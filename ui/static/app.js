@@ -177,6 +177,22 @@
   //   │ auto-filled box confirms nothing: it turns the server check    │
   //   │ into a formality that an unrelated edit satisfies by accident, │
   //   │ which is precisely the accident the guard exists to stop.      │
+  //   │                                                                │
+  //   │ Paste and drop are blocked on the input for the same reason:   │
+  //   │ the namespace name is printed a few lines above the box, so    │
+  //   │ copy-paste (or dragging the selection into the field) reaches  │
+  //   │ the same auto-filled end state by hand, and the deliberate     │
+  //   │ re-typing is the whole of what the guard buys.                 │
+  //   │                                                                │
+  //   │ Be clear about what that is worth: it is NOT a security        │
+  //   │ control and nothing may be built on it as one. Devtools, a     │
+  //   │ console one-liner or a synthetic event defeat it in seconds,   │
+  //   │ and the real check is the server's. Blocking paste buys        │
+  //   │ exactly what a speed bump buys — a few seconds against a slip  │
+  //   │ or a hurry, in which the operator may notice which namespace   │
+  //   │ they are about to make world-readable. Ordinary typing,        │
+  //   │ ctrl+A, backspace and the rest are left alone; a guard that    │
+  //   │ fights the keyboard just teaches people to route around it.    │
   //   └────────────────────────────────────────────────────────────────┘
   //
   // opts:
@@ -229,6 +245,20 @@
         :                               'Must match “' + want + '” exactly.';
       opts.submitBtn.disabled = !satisfied();
     }
+
+    // Swallowing a paste silently reads as a broken box — the operator tries
+    // it, nothing lands, and they retry rather than type. So say why, in the
+    // hint that is already there for the "must match" message. sync() owns
+    // that element and runs on the very next keystroke, so the notice is
+    // replaced the moment the operator does the thing it asked for.
+    function refuseFill(e) {
+      e.preventDefault();
+      hint.textContent = 'Type the name out — pasting is disabled here.';
+    }
+    // `drop` as well as `paste`: text dragged from the warning above lands in
+    // the field without a paste event ever firing.
+    input.addEventListener('paste', refuseFill);
+    input.addEventListener('drop',  refuseFill);
 
     opts.readSel.addEventListener('change', sync);
     input.addEventListener('input', sync);
@@ -304,12 +334,32 @@
     return [el('span', { class: 'audit-verb', text: String(item.action || 'changed') })];
   }
 
+  // Who made the change. `actor` is the identity subject — a UUID, always
+  // present, and the stable key. `actor_username` is the name that subject
+  // carried at the time of the change and is optional: a service token has no
+  // user behind it, and rows written before the column existed do not know
+  // one. The panel exists to answer "who changed this", which a UUID does not,
+  // so the name is the label when there is one and the subject moves onto the
+  // title attribute — the same hover-for-the-exact-value convention the
+  // timestamp beside it already uses for local time. With no name the subject
+  // is the label exactly as it was before, and carries no title that would
+  // only repeat what is already on screen.
+  function auditActor(item) {
+    const subject  = item.actor || '';
+    const username = item.actor_username || '';
+    return el('code', {
+      class: 'audit-actor',
+      title: (username && subject) ? subject : false,
+      text:  username || subject || 'unknown actor',
+    });
+  }
+
   function auditRow(item) {
     const published = publishesRead(item);
     const what = el('div', { class: 'audit-what' }, auditWhat(item));
     if (published) what.insertBefore(el('span', { class: 'badge public', text: 'published' }), what.firstChild);
     const meta = el('div', { class: 'audit-meta' }, [
-      el('code', { class: 'audit-actor', text: item.actor || 'unknown actor' }),
+      auditActor(item),
       el('span', { text: '·' }),
       el('time', {
         class:    'audit-at',
@@ -352,7 +402,7 @@
         body.appendChild(el('div', { class: 'empty', text: 'No recorded changes for this namespace.' }));
         return;
       }
-      body.appendChild(el('p', { class: 'form-help', text: 'Newest first. Times are UTC — hover a timestamp for local time.' }));
+      body.appendChild(el('p', { class: 'form-help', text: 'Newest first. Times are UTC — hover a timestamp for local time, or a name for the identity subject behind it.' }));
       const ul = el('ul', { class: 'audit-list' });
       // The API returns oldest-first; an operator opening this is asking
       // "what happened to this namespace lately", so it reads newest-first.

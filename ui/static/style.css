@@ -233,6 +233,9 @@ input[type="text"]:focus, select:focus, textarea:focus {
 }
 .audit-meta code { background: none; padding: 0; font-size: 0.95em; color: inherit; }
 .audit-at { cursor: help; }
+/* Only when there is something to hover for: the actor carries a title just
+   when a username is displayed in place of the identity subject. */
+.audit-actor[title] { cursor: help; }
 
 /* JSON editor */
 .editor-wrap {

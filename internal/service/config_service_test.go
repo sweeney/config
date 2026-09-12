@@ -76,7 +76,7 @@ func (r *fakeConfigRepo) Get(name string) (*domain.ConfigNamespace, error) {
 	return &copied, nil
 }
 
-func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace) error {
+func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.data[ns.Name]; exists {
@@ -85,12 +85,13 @@ func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace) error {
 	copied := *ns
 	r.data[ns.Name] = &copied
 	r.audit.Record(domain.AuditEntry{
-		Namespace:    ns.Name,
-		Action:       domain.AuditActionCreate,
-		NewReadRole:  ns.ReadRole,
-		NewWriteRole: ns.WriteRole,
-		Actor:        ns.UpdatedBy,
-		At:           ns.CreatedAt,
+		Namespace:     ns.Name,
+		Action:        domain.AuditActionCreate,
+		NewReadRole:   ns.ReadRole,
+		NewWriteRole:  ns.WriteRole,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            ns.CreatedAt,
 	})
 	return nil
 }
@@ -108,7 +109,7 @@ func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, updatedBy 
 	return nil
 }
 
-func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error {
+func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
@@ -121,23 +122,24 @@ func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, 
 		return domain.ErrPublishNotConfirmed
 	}
 	r.audit.Record(domain.AuditEntry{
-		Namespace:    name,
-		Action:       domain.AuditActionACLChange,
-		OldReadRole:  ns.ReadRole,
-		OldWriteRole: ns.WriteRole,
-		NewReadRole:  readRole,
-		NewWriteRole: writeRole,
-		Actor:        updatedBy,
-		At:           at,
+		Namespace:     name,
+		Action:        domain.AuditActionACLChange,
+		OldReadRole:   ns.ReadRole,
+		OldWriteRole:  ns.WriteRole,
+		NewReadRole:   readRole,
+		NewWriteRole:  writeRole,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
 	})
 	ns.ReadRole = readRole
 	ns.WriteRole = writeRole
-	ns.UpdatedBy = updatedBy
+	ns.UpdatedBy = actor.Sub
 	ns.UpdatedAt = at
 	return nil
 }
 
-func (r *fakeConfigRepo) Delete(name, deletedBy string, at time.Time) error {
+func (r *fakeConfigRepo) Delete(name string, actor domain.Actor, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
@@ -145,12 +147,13 @@ func (r *fakeConfigRepo) Delete(name, deletedBy string, at time.Time) error {
 		return domain.ErrNotFound
 	}
 	r.audit.Record(domain.AuditEntry{
-		Namespace:    name,
-		Action:       domain.AuditActionDelete,
-		OldReadRole:  ns.ReadRole,
-		OldWriteRole: ns.WriteRole,
-		Actor:        deletedBy,
-		At:           at,
+		Namespace:     name,
+		Action:        domain.AuditActionDelete,
+		OldReadRole:   ns.ReadRole,
+		OldWriteRole:  ns.WriteRole,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
 	})
 	delete(r.data, name)
 	return nil
@@ -329,8 +332,8 @@ func TestGet_AdminReadsAll(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "secret", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{"a":1}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{"a":1}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	got, err := svc.Get(admin, "secret")
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"a":1}`, string(got.Document))
@@ -341,8 +344,8 @@ func TestGet_UserBlockedFromAdminNamespaceReturns404(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "secret", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	_, err := svc.Get(user, "secret")
 	assert.ErrorIs(t, err, service.ErrConfigNamespaceNotFound,
 		"role-deny on read must surface as not-found to avoid leaking existence")
@@ -353,8 +356,8 @@ func TestGet_UserCanReadUserNamespace(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "prefs", ReadRole: "user", WriteRole: "admin",
-		Document: []byte(`{"theme":"dark"}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{"theme":"dark"}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	got, err := svc.Get(user, "prefs")
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"theme":"dark"}`, string(got.Document))
@@ -379,8 +382,7 @@ func TestListVisible_FiltersByReadRole(t *testing.T) {
 		ns := ns
 		ns.Document = []byte(`{}`)
 		ns.UpdatedAt, ns.CreatedAt = now, now
-		ns.UpdatedBy = "u"
-		require.NoError(t, repo.Create(&ns))
+		require.NoError(t, repo.Create(&ns, domain.Actor{Sub: "u"}))
 	}
 
 	// Admin sees all three.
@@ -402,8 +404,8 @@ func TestPutDocument_Changes(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{"a":1}`), UpdatedAt: now, UpdatedBy: "orig", CreatedAt: now,
-	}))
+		Document: []byte(`{"a":1}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "orig"}))
 
 	changed, err := svc.PutDocument(admin, "n", []byte(`{"a":2}`))
 	require.NoError(t, err)
@@ -421,8 +423,8 @@ func TestPutDocument_NoOpReturnsFalseAndNoBackup(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{"a":1}`), UpdatedAt: now, UpdatedBy: "orig", CreatedAt: now,
-	}))
+		Document: []byte(`{"a":1}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "orig"}))
 
 	changed, err := svc.PutDocument(admin, "n", []byte(`{ "a" : 1 }`))
 	require.NoError(t, err)
@@ -435,8 +437,8 @@ func TestPutDocument_UserBlockedFromAdminWrite(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "shared", ReadRole: "user", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	// User can see (read_role=user) but cannot write → ErrConfigForbidden.
 	_, err := svc.PutDocument(user, "shared", []byte(`{"x":1}`))
@@ -449,8 +451,8 @@ func TestPutDocument_UserBlockedFromUnreadableNamespace(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "secret", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	// User cannot read AND cannot write → 404 (no existence leak)
 	_, err := svc.PutDocument(user, "secret", []byte(`{"x":1}`))
@@ -462,8 +464,8 @@ func TestPutDocument_InvalidDocument(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	_, err := svc.PutDocument(admin, "n", []byte(`[]`))
 	assert.ErrorIs(t, err, service.ErrConfigInvalidDocument)
 }
@@ -481,8 +483,8 @@ func TestUpdateACL_AdminOnly(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	require.NoError(t, svc.UpdateACL(admin, "n", service.UpdateACLInput{ReadRole: "user", WriteRole: "admin"}))
 	assert.Equal(t, 1, b.count())
@@ -499,8 +501,8 @@ func TestUpdateACL_InvalidRole(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	err := svc.UpdateACL(admin, "n", service.UpdateACLInput{ReadRole: "root", WriteRole: "admin"})
 	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
 }
@@ -512,8 +514,8 @@ func TestDelete_AdminOnly(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "user", WriteRole: "user",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	err := svc.Delete(user, "n")
 	assert.ErrorIs(t, err, service.ErrConfigForbidden,
@@ -535,8 +537,8 @@ func seedNS(t *testing.T, repo *fakeConfigRepo, name, readRole, writeRole string
 	now := time.Now().UTC()
 	require.NoError(t, repo.Create(&domain.ConfigNamespace{
 		Name: name, ReadRole: readRole, WriteRole: writeRole,
-		Document: []byte(`{"k":1}`), UpdatedAt: now, UpdatedBy: "seed", CreatedAt: now,
-	}))
+		Document: []byte(`{"k":1}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "seed"}))
 }
 
 // TestGet_RoleMatrix enumerates every (namespace read_role, caller role)
@@ -913,7 +915,7 @@ func TestUpdateACL_RepositoryRefusesUnconfirmedPublish(t *testing.T) {
 	_, repo, _ := newConfigSvc(t)
 	seedNS(t, repo, "tariffs", "user", "user")
 
-	err := repo.UpdateACL("tariffs", "public", "user", "admin-1", time.Now().UTC(), false)
+	err := repo.UpdateACL("tariffs", "public", "user", domain.Actor{Sub: "admin-1"}, time.Now().UTC(), false)
 	assert.ErrorIs(t, err, domain.ErrPublishNotConfirmed)
 
 	readRole, _, gerr := repo.GetACL("tariffs")
