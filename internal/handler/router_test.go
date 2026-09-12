@@ -199,12 +199,16 @@ func (r *fakeRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) error 
 	})
 	return nil
 }
-func (r *fakeRepo) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) error {
+func (r *fakeRepo) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
-		return domain.ErrNotFound
+		return false, domain.ErrNotFound
+	}
+	// Same comparison the real store makes, in the same place.
+	if string(ns.Document) == string(document) {
+		return false, nil
 	}
 	r.audit.Record(domain.AuditEntry{
 		Namespace:     name,
@@ -217,7 +221,7 @@ func (r *fakeRepo) UpdateDocument(name string, document []byte, actor domain.Act
 	ns.UpdatedBy = actor.Sub
 	ns.UpdatedByUsername = actor.Username
 	ns.UpdatedAt = at
-	return nil
+	return true, nil
 }
 func (r *fakeRepo) UpdateACL(name, rRole, wRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
@@ -1520,9 +1524,9 @@ func TestAudit_UsernameOmittedWhenUnknown(t *testing.T) {
 	assert.NotContains(t, entries[0], "actor_username", "absent, not empty")
 }
 
-// TestList_ShowsWhoLastWrote: document writes are not audited, so without
-// this the question "who last changed this namespace" is unanswerable from
-// the API at all — updated_by was stored but never returned.
+// TestList_ShowsWhoLastWrote: the audit trail records this too, but only to
+// an admin and only by reading a whole history. This is the same answer in
+// one field, available to anyone who can see the namespace.
 func TestList_ShowsWhoLastWrote(t *testing.T) {
 	h := newHarness(t)
 	resp, _ := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
@@ -1537,8 +1541,10 @@ func TestList_ShowsWhoLastWrote(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &list))
 	require.Len(t, list, 1)
 
-	assert.Equal(t, "admin-1", list[0]["updated_by"], "the subject is the stable key")
 	assert.Equal(t, "name-of-admin-1", list[0]["updated_by_username"])
+	assert.NotContains(t, list[0], "updated_by",
+		"the identity subject is not disclosed here — it answers no better than the name, "+
+			"and it is the half that correlates across services")
 }
 
 // TestList_UsernameOmittedWhenUnknown: absent rather than empty, so clients
@@ -1551,7 +1557,6 @@ func TestList_UsernameOmittedWhenUnknown(t *testing.T) {
 	var list []map[string]any
 	require.NoError(t, json.Unmarshal(body, &list))
 	require.Len(t, list, 1)
-	assert.Equal(t, "seed", list[0]["updated_by"])
 	assert.NotContains(t, list[0], "updated_by_username", "absent, not empty")
 }
 
@@ -1619,4 +1624,47 @@ func TestAudit_DocumentBodiesAreNeverStored(t *testing.T) {
 	_, body := h.do("GET", "/api/v1/config/namespaces/prefs/audit", h.adminTok, nil)
 	assert.NotContains(t, string(body), "hunter2")
 	assert.NotContains(t, string(body), "secret")
+}
+
+// TestList_NonAdminSeesWhoLastWrote pins the admin-vs-user boundary, which is
+// the one axis the list and the audit endpoint answer differently.
+//
+// A caller who can see a namespace sees who last touched it — the single
+// current fact every collaborative system shows. The audit endpoint stays
+// admin-only because it discloses a pattern over time. Both halves are
+// asserted here so the boundary cannot move by accident.
+func TestList_NonAdminSeesWhoLastWrote(t *testing.T) {
+	h := newHarness(t)
+	resp, _ := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "prefs", "read_role": "user", "write_role": "user",
+		"document": map[string]any{},
+	})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config", h.userTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var list []map[string]any
+	require.NoError(t, json.Unmarshal(body, &list))
+	require.Len(t, list, 1)
+	assert.Equal(t, "name-of-admin-1", list[0]["updated_by_username"],
+		"a user who can see the namespace sees who last wrote it")
+	assert.NotContains(t, list[0], "updated_by", "but never the identity subject")
+
+	resp, _ = h.do("GET", "/api/v1/config/namespaces/prefs/audit", h.userTok, nil)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"while the history — everyone who ever acted, and when — stays admin-only")
+}
+
+// TestGet_PublicDocumentDisclosesNobody: the namespace GET may be anonymous,
+// and it returns the document verbatim today. Nothing stops that becoming a
+// JSON envelope, so pin it.
+func TestGet_PublicDocumentDisclosesNobody(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{"unit":0.24}`)
+
+	resp, body := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, string(body), "updated_by")
+	assert.NotContains(t, string(body), "seed", "nor the actor by any other name")
+	assert.JSONEq(t, `{"unit":0.24}`, string(body))
 }

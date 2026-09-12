@@ -71,22 +71,19 @@
       ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' UTC';
   }
 
-  // "updated <when> by <who>". The username is the label where one was
-  // recorded, with the identity subject on hover — the same convention the
-  // audit panel uses. Falls back to the bare subject when no username was
-  // recorded (a service token wrote it, or the row predates the column), and
-  // omits the "by" clause entirely if neither is known.
+  // "updated <when> by <who>", or just "updated <when>" when no username was
+  // recorded — a service token wrote it, or the row predates the column. The
+  // list carries no identity subject to fall back on: it answers "who" no
+  // better than the name does, and admins who need subjects have the history
+  // panel, which shows them.
   //
   // The audit panel records document writes too, but it is admin-only and
   // collapsed by default, so this line stays the at-a-glance answer to "who
   // last touched this" — and the only one a non-admin ever gets.
   function nsUpdatedMeta(ns) {
-    const subject  = ns.updated_by || '';
-    const username = ns.updated_by_username || '';
-    const who      = username || subject;
+    const who = ns.updated_by_username || '';
     return el('div', {
       class: 'meta',
-      title: (username && subject) ? subject : false,
       text:  'updated ' + fmtTime(ns.updated_at) + (who ? ' by ' + who : ''),
     });
   }

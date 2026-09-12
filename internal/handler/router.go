@@ -253,15 +253,25 @@ func listHandler(svc *service.ConfigService) http.HandlerFunc {
 			ReadRole  string `json:"read_role"`
 			WriteRole string `json:"write_role"`
 			UpdatedAt string `json:"updated_at"`
-			UpdatedBy string `json:"updated_by"`
-			// Omitted when not recorded: service tokens have no username, and
-			// rows predating the column do not know one. Clients fall back to
-			// updated_by.
+			// The username only — never the identity subject.
 			//
-			// This is disclosed on the authenticated list rather than on the
-			// namespace GET deliberately. The GET may be anonymous for a
-			// public namespace, and publishing a document should not publish
-			// who edits it.
+			// Two axes had to be settled here, and they land differently.
+			// Anonymous vs authenticated: this is on the list, which always
+			// requires a token, and not on the namespace GET, which may be
+			// anonymous for a public namespace — publishing a document should
+			// not publish who edits it.
+			//
+			// Admin vs user: any caller who can see a namespace sees who last
+			// touched it, which is what every collaborative system shows. The
+			// audit endpoint stays admin-only because it discloses a pattern
+			// over time — everyone who ever acted, and when — which is a
+			// different kind of fact from a single current one. The subject is
+			// withheld from both sides of that line: it answers "who" no
+			// better than the name does, and it is the half that correlates
+			// across services. Admins who need it have the audit trail.
+			//
+			// Omitted when not recorded: service tokens have no username, and
+			// rows predating the column do not know one.
 			UpdatedByUsername string `json:"updated_by_username,omitempty"`
 			CreatedAt         string `json:"created_at"`
 		}
@@ -272,7 +282,6 @@ func listHandler(svc *service.ConfigService) http.HandlerFunc {
 				ReadRole:          ns.ReadRole,
 				WriteRole:         ns.WriteRole,
 				UpdatedAt:         ns.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-				UpdatedBy:         ns.UpdatedBy,
 				UpdatedByUsername: ns.UpdatedByUsername,
 				CreatedAt:         ns.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			})
