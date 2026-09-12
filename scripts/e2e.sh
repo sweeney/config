@@ -218,16 +218,16 @@ echo
 echo "=== 8. List visibility ==="
 ADMIN_LIST=$(curl -s -H "Authorization: Bearer $ADMIN_TOK" "$CFG_BASE/api/v1/config")
 USER_LIST=$(curl -s -H "Authorization: Bearer $USER_TOK" "$CFG_BASE/api/v1/config")
-# Document writes are not audited, so updated_by is the only record of who
-# last changed a namespace's contents — and until now it was stored but never
-# returned by any endpoint.
-check_contains "list says who last wrote each namespace" '"updated_by"' "$ADMIN_LIST"
-check_contains "and names them, not just their id" "\"updated_by_username\":\"$ADMIN_USER\"" "$ADMIN_LIST"
-# Deliberately on the authenticated list and not on the namespace GET, which
-# may be anonymous for a public namespace.
-check "who wrote it is not disclosed anonymously" "401" \
-  "$(curl -s -o /dev/null -w '%{http_code}' "$CFG_BASE/api/v1/config")"
-
+# The same answer the audit trail gives, without an admin token and without
+# reading a whole history. The identity subject is deliberately not here: it
+# answers "who" no better than the name, and it is the half that correlates
+# across services.
+check_contains "list names who last wrote each namespace" "\"updated_by_username\":\"$ADMIN_USER\"" "$ADMIN_LIST"
+if echo "$ADMIN_LIST" | grep -q '"updated_by"'; then
+  check "list does not disclose the identity subject" "absent" "PRESENT"
+else
+  check "list does not disclose the identity subject" "absent" "absent"
+fi
 check_contains "admin sees 'houses'" "houses" "$ADMIN_LIST"
 check_contains "admin sees 'mqtt'" "mqtt" "$ADMIN_LIST"
 check_contains "user sees 'mqtt'" "mqtt" "$USER_LIST"
@@ -320,6 +320,14 @@ STATUS=$(echo "$R" | tail -n1)
 BODY=$(echo "$R" | sed '$d')
 check "anonymous GET of public namespace = 200" "200" "$STATUS"
 check_contains "anonymous read returns the document" "0.24" "$BODY"
+# The namespace GET may be anonymous, so it must disclose nobody. Checked here
+# rather than in section 8, where tariffs does not yet exist and the 404 body
+# would satisfy it without proving anything.
+if echo "$BODY" | grep -q "updated_by"; then
+  check "a public document does not disclose who edits it" "absent" "PRESENT"
+else
+  check "a public document does not disclose who edits it" "absent" "absent"
+fi
 
 HDRS=$(curl -s -D - -o /dev/null "$CFG_BASE/api/v1/config/tariffs")
 check_contains "public namespace is shared-cacheable" "max-age=60" "$HDRS"

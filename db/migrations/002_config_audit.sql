@@ -1,4 +1,4 @@
--- Audit trail for namespace lifecycle and ACL changes.
+-- Audit trail for namespace lifecycle, access and content changes.
 --
 -- There is deliberately NO foreign key to config_namespaces. PRAGMA
 -- foreign_keys is ON, so a foreign key here would either cascade these rows
@@ -12,12 +12,12 @@
 -- both the database and every backup without bound. To see what a document
 -- used to contain, restore the backup from around that timestamp.
 --
--- Older note, kept because the constraint above is widened in db/schema.go
--- for databases created before document writes were recorded.
--- Every write already triggers a full-database upload to R2, so auditing
--- 64KB bodies would inflate both the database and every backup without
--- bound. This table records who changed a namespace's existence or its
--- access rules, not what was in it.
+-- The action CHECK below lists document_write, but only new databases get it
+-- from here: CREATE TABLE IF NOT EXISTS means a database that already has the
+-- table does not re-run this statement. Those go through widenAuditActions in
+-- db/schema.go, which rebuilds the table because SQLite cannot ALTER a CHECK.
+-- Same split, and same reason, as the read_role widening in 001_init.sql.
+--
 CREATE TABLE IF NOT EXISTS config_audit (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace   TEXT NOT NULL,
