@@ -248,10 +248,11 @@ audit entry. It is omitted — absent, not empty — when none was recorded,
 because a service token has no user behind it and rows written before the
 field existed do not know one. Fall back to `updated_by`.
 
-**This is the only record of who last edited a namespace's contents.**
-Document writes are deliberately not audited: the trail carries `create`,
-`acl_change` and `delete` only, so it cannot answer "who last changed what is
-*in* this namespace". These two fields can.
+**The quickest answer to "who last edited this namespace's contents".** The
+audit trail carries a `document_write` entry for every change to a document,
+so it answers that question too — but only *that* the contents changed, by
+whom and when, never what they said. These two fields say the same about the
+most recent write without reading the history at all.
 
 **Deliberately here and not on `GET /api/v1/config/{ns}`.** That endpoint may
 be answered anonymously when the namespace is `read_role: public`, and
@@ -363,6 +364,10 @@ curl -X PUT https://config.example.com/api/v1/config/mqtt_topics \
 `changed: false` means the submitted document was byte-identical (after JSON
 compaction) to what was stored. No database write occurs, no backup is
 triggered. Safe to call in an idempotent loop.
+
+A write that does change the document records a `document_write` entry in the
+namespace's audit trail (below) — that it changed, by whom and when, never the
+body itself. A no-op records nothing.
 
 **Size limit:** 64 KB after JSON compaction. Returns `413` with
 `"error":"document_too_large"` if exceeded. Request body cap is 128 KB.
@@ -483,8 +488,8 @@ same PATCH, or the combination is rejected with `400 invalid_role`.
 
 ### `GET /api/v1/config/namespaces/{ns}/audit` — namespace history (admin only)
 
-Returns the namespace's recorded lifecycle changes as a JSON array, oldest
-first: one entry per `create`, `acl_change` and `delete`.
+Returns the namespace's recorded history as a JSON array, oldest first: one
+entry per `create`, `acl_change`, `document_write` and `delete`.
 
 ```bash
 curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
@@ -510,15 +515,21 @@ curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
     "actor_username": "sweeney",
     "at":             "2026-09-04T11:02:47.906Z"
+  },
+  {
+    "action":         "document_write",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
+    "at":             "2026-09-12T15:31:00.000Z"
   }
 ]
 ```
 
 | Field | Notes |
 |---|---|
-| `action` | `create`, `acl_change` or `delete` |
-| `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create` |
-| `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete` |
+| `action` | `create`, `acl_change`, `document_write` or `delete` |
+| `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create`, and on a `document_write`, which moves no roles |
+| `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete`, and on a `document_write` |
 | `actor` | Subject of the token that made the change; always present, and the stable key |
 | `actor_username` | That actor's username at the time of the change; omitted when none was recorded |
 | `at` | RFC 3339 UTC, millisecond precision |
@@ -532,15 +543,22 @@ token has no user behind it and rows written before the field existed do not
 know one; those are deliberately not backfilled. Fall back to `actor`.
 
 **Admin-only, including when the namespace is `read_role: public`.** Publishing
-a document does not publish its history: every operation the trail records is
-admin-only already, so a weaker rule here would leak more through the history
-than through the resource. A `user` token gets `403`, so does a service token
-(pinned to the `user` role), and a request with no token gets `401` even on a
-public namespace. The response is `Cache-Control: private, no-store` and never
-carries a wildcard origin.
+a document does not publish its history: the history names everyone who has
+acted on the namespace and when, which the document itself tells nobody. That
+holds for the one recorded operation that is not itself admin-only — a
+`document_write` on a `write_role: user` namespace — because what is withheld
+here is the record of who acted, not the act. A `user` token gets `403`, so
+does a service token (pinned to the `user` role), and a request with no token
+gets `401` even on a public namespace. The response is
+`Cache-Control: private, no-store` and never carries a wildcard origin.
 
-**Document writes are not audited, and document bodies are never stored.** The
-trail answers *who changed the rules, and when* — never *what was in it*.
+**Document bodies are never stored.** A `document_write` records that the
+contents changed, by whom and when — never a byte of what they said. Every
+write already ships the whole database to R2, so keeping 64 KB bodies would
+inflate the database and every backup without bound; to see what a document
+used to hold, restore the R2 backup from around that timestamp. A `PUT` that
+changes nothing is answered `changed: false` and records nothing at all, so
+every `document_write` in the trail is a real change.
 
 **An unknown or deleted namespace returns `200 []`, not `404`.** Entries
 outlive the namespace they describe, and "what happened to the one that is no
@@ -548,10 +566,10 @@ longer here" is exactly what this answers. Nothing leaks by doing so — the
 caller is already an admin, who can list every namespace anyway. A name that
 does not match `^[a-z0-9_-]{1,64}$` is still `400 invalid_name`.
 
-The admin SPA shows the same history in its namespace view, naming the actor
-by username where one was recorded. For direct
-`sqlite3` access on the host, and for questions that span namespaces, see
-**Audit trail** in `docs/admin.md`.
+The admin SPA shows the same history in its namespace view — document writes
+alongside ACL changes — naming the actor by username where one was recorded.
+For direct `sqlite3` access on the host, and for questions that span
+namespaces, see **Audit trail** in `docs/admin.md`.
 
 ---
 

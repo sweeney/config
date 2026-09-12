@@ -302,7 +302,7 @@ Publish only what you would be content to see indexed. Anonymous means
 anonymous: no account behind the request, nothing but the per-IP rate
 limit in front of it, and no record of who read it. Reads are not
 audited for anyone, authenticated or not — the audit trail below
-records ACL changes, not access.
+records changes, not access.
 
 Reasonable:
 
@@ -347,13 +347,14 @@ curl -s https://config.example.com/api/v1/config \
 ]
 ```
 
-**This is the only record of who edited a namespace's contents.** The
-audit trail below records `create`, `acl_change` and `delete` — document
-writes are deliberately not among them, for the reasons given there. So
-"who last changed what is *in* `tariffs`" has no answer in the trail,
-and `updated_by` is where to look for it. The flip side is that it is
-only ever the *last* writer: one row, overwritten by the next write,
-with no history behind it.
+**This is the shortest answer to "who edited this namespace's
+contents".** The audit trail below records a `document_write` row for
+every change to a document, so it answers the question too — but only
+*that* the contents changed, by whom and when, never what they said.
+These two fields say the same about the most recent write without
+reading the history at all. The flip side is that they are only ever the
+*last* writer: one row, overwritten by the next write, with no history
+behind it. The history is what the trail is for.
 
 `updated_by` is the identity `sub`, always present, and the stable key —
 it is what you match on. `updated_by_username` is the human label,
@@ -388,22 +389,29 @@ the namespaces they could already see. They are not admin-only.
 
 ## Audit trail
 
-Namespace lifecycle changes are recorded in a `config_audit` table: one
-row per `create`, `acl_change` and `delete`, carrying the namespace, the
-action, the old and new read/write roles, the actor's subject and —
-where one was recorded — their username, and a timestamp. Old roles are empty on a create; new roles are empty on a
-delete. The table lives in the same SQLite file as the namespaces, so it
-rides along in every R2 backup.
+Changes to a namespace are recorded in a `config_audit` table: one row
+per `create`, `acl_change`, `document_write` and `delete`, carrying the
+namespace, the action, the old and new read/write roles, the actor's
+subject and — where one was recorded — their username, and a timestamp.
+Old roles are empty on a create; new roles are empty on a delete; both
+are empty on a `document_write`, which moves no roles. The table lives
+in the same SQLite file as the namespaces, so it rides along in every R2
+backup.
 
-Three deliberate limits, worth knowing before you rely on it:
+Four deliberate limits, worth knowing before you rely on it:
 
-- **Document writes are not audited, and document bodies are never
-  stored.** Every write already ships the whole database to R2, so
-  auditing 64KB bodies would inflate both the database and every backup
-  without bound. The table answers *who changed the rules, and when* —
-  not *what was in it*. For who last changed the contents, see [Who last
-  wrote a namespace](#who-last-wrote-a-namespace) above — that field is
-  the only record of it.
+- **Document bodies are never stored.** The write is recorded — a
+  `document_write` row says the contents changed, who changed them and
+  when — but not a byte of what they said. Every write already ships the
+  whole database to R2, so keeping 64KB bodies would inflate both the
+  database and every backup without bound. To see what a document used
+  to hold, restore the R2 backup from around that timestamp. For who
+  last wrote a namespace without reading its history, see [Who last
+  wrote a namespace](#who-last-wrote-a-namespace) above.
+- **A `PUT` that changes nothing is not recorded.** Content identical to
+  what is stored is answered `changed: false` without a write, and
+  without an audit row. Every `document_write` in the table is a real
+  change.
 - **The audit row is written in the same transaction as the mutation.**
   A mutation that fails leaves no audit row behind, and a row that is
   present always describes a change that really happened. A trail with
@@ -443,13 +451,20 @@ curl -s https://config.example.com/api/v1/config/namespaces/tariffs/audit \
     "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
     "actor_username": "sweeney",
     "at":             "2026-09-04T11:02:47.906Z"
+  },
+  {
+    "action":         "document_write",
+    "actor":          "adcc1b9d-64f9-4a0f-b4e9-ab51a164b1c9",
+    "actor_username": "sweeney",
+    "at":             "2026-09-12T15:31:00.000Z"
   }
 ]
 ```
 
-The old roles are absent on a `create` and the new roles on a `delete`,
-which is the same thing the empty columns say below — absent rather than
-empty, because there was no previous ACL and no resulting one. (The JSON
+The old roles are absent on a `create`, the new roles on a `delete`, and
+all four on a `document_write` — which is the same thing the empty
+columns say below, absent rather than empty, because there was no
+previous ACL, no resulting one, or no ACL involved at all. (The JSON
 keys are `old_read_role` / `new_read_role`; the columns they come from
 are `old_read` / `new_read`.)
 
@@ -480,12 +495,14 @@ avoids. Clients fall back to `actor`.
 
 **Admin-only, including when the namespace is public.** Publishing a
 document does not publish its history. A document and its history are
-different things, and every operation the trail records — create, ACL
-change, delete — is admin-only already, so anything weaker here would
-leak more through the history than through the resource itself. A `user`
-token gets `403`, a service token gets `403` (service tokens are pinned
-to the `user` role), and no token at all gets `401` — even on a
-namespace anyone in the world can read anonymously.
+different things: the history names everyone who has acted on the
+namespace and when, which the document itself tells nobody. That holds
+even for the one recorded operation that is not admin-only — a
+`document_write` on a `write_role: user` namespace — because the leak
+here is the record of who acted, not the act. A `user` token gets `403`,
+a service token gets `403` (service tokens are pinned to the `user`
+role), and no token at all gets `401` — even on a namespace anyone in
+the world can read anonymously.
 
 The response carries `Cache-Control: private, no-store` and no wildcard
 origin, unlike the public document reads it may be describing.
@@ -498,10 +515,11 @@ foreign key. *What happened to the namespace that is no longer here* is
 exactly what this endpoint is for, and a `404` would withhold the answer
 for precisely the namespaces where it matters most.
 
-The admin SPA shows the same history in its namespace view, naming the
-actor by username where one was recorded and keeping the subject to
-hand, so the routine "who published this, and when?" question needs
-neither a curl nor a shell on the host.
+The admin SPA shows the same history in its namespace view — document
+writes alongside ACL changes — naming the actor by username where one
+was recorded and keeping the subject to hand, so the routine "who
+published this, and when?" question needs neither a curl nor a shell on
+the host.
 
 ### Direct access with `sqlite3`
 
@@ -520,10 +538,11 @@ sudo -u config sqlite3 -header -column /var/lib/config/config.db \
 ```
 
 ```
-at                          action      old_read  new_read  actor
---------------------------  ----------  --------  --------  ---------
-2026-09-01T09:14:02.113Z    create                user      adcc1b9d-64f9-…
-2026-09-04T11:02:47.906Z    acl_change  user      public    adcc1b9d-64f9-…
+at                          action          old_read  new_read  actor
+--------------------------  --------------  --------  --------  ---------
+2026-09-01T09:14:02.113Z    create                    user      adcc1b9d-64f9-…
+2026-09-04T11:02:47.906Z    acl_change      user      public    adcc1b9d-64f9-…
+2026-09-12T15:31:00.000Z    document_write                      adcc1b9d-64f9-…
 ```
 
 The cross-namespace question — when did *anything* become public, and
