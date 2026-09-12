@@ -471,6 +471,25 @@ check_contains "history records the create" '"action":"create"' "$BODY"
 check_contains "history records the ACL change" '"action":"acl_change"' "$BODY"
 check_contains "history records the role it moved away from" '"old_read_role":"public"' "$BODY"
 check_contains "history records who did it" '"actor"' "$BODY"
+# Content changes are recorded too, as events — never the body.
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$CFG_BASE/api/v1/config/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"unit":0.99,"note":"e2e-secret-value"}')
+check "document write accepted" "200" "$STATUS"
+R2=$(curl -s "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" -H "Authorization: Bearer $ADMIN_TOK")
+check_contains "history records the document write" '"action":"document_write"' "$R2"
+if echo "$R2" | grep -q "e2e-secret-value"; then
+  check "document bodies are never stored in the trail" "absent" "PRESENT"
+else
+  check "document bodies are never stored in the trail" "absent" "absent"
+fi
+# A write that changes nothing is not an event.
+BEFORE=$(echo "$R2" | grep -o '"action"' | wc -l | tr -d ' ')
+curl -s -o /dev/null -X PUT "$CFG_BASE/api/v1/config/tariffs" \
+  -H "Authorization: Bearer $ADMIN_TOK" -H 'Content-Type: application/json' \
+  -d '{"unit":0.99,"note":"e2e-secret-value"}'
+AFTER=$(curl -s "$CFG_BASE/api/v1/config/namespaces/tariffs/audit" -H "Authorization: Bearer $ADMIN_TOK" | grep -o '"action"' | wc -l | tr -d ' ')
+check "a no-op write adds no history entry" "$BEFORE" "$AFTER"
 # The username is recorded at write time from the token, so the trail names
 # who acted without a later lookup against identity — which would not work
 # during an outage, nor after a rename.

@@ -220,24 +220,42 @@ func (s *ConfigStore) Create(ns *domain.ConfigNamespace, actor domain.Actor) err
 }
 
 func (s *ConfigStore) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) error {
-	res, err := s.db.DB().Exec(
-		`UPDATE config_namespaces
-		 SET document = ?, updated_at = ?, updated_by = ?, updated_by_username = ?
-		 WHERE name = ?`,
-		string(document),
-		formatTime(at),
-		actor.Sub,
-		nullableRole(actor.Username),
-		name,
-	)
-	if err != nil {
-		return fmt.Errorf("update config document: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	return s.withTx(func(tx *sql.Tx) error {
+		// Reading the ACL first gives not-found before anything is written,
+		// and matches the other mutating paths. The roles are left off the
+		// audit row: a document write moves none.
+		if _, _, err := readACLTx(tx, name); err != nil {
+			return err
+		}
+		if err := insertAudit(tx, domain.AuditEntry{
+			Namespace:     name,
+			Action:        domain.AuditActionDocumentWrite,
+			Actor:         actor.Sub,
+			ActorUsername: actor.Username,
+			At:            at,
+		}); err != nil {
+			return err
+		}
+
+		res, err := tx.Exec(
+			`UPDATE config_namespaces
+			 SET document = ?, updated_at = ?, updated_by = ?, updated_by_username = ?
+			 WHERE name = ?`,
+			string(document),
+			formatTime(at),
+			actor.Sub,
+			nullableRole(actor.Username),
+			name,
+		)
+		if err != nil {
+			return fmt.Errorf("update config document: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return domain.ErrNotFound
+		}
+		return nil
+	})
 }
 
 func (s *ConfigStore) UpdateACL(name, readRole, writeRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {

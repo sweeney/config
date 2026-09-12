@@ -476,7 +476,8 @@ func TestOpen_FreshInstallDoesNotRebuild(t *testing.T) {
 		"a fresh install should keep the migration's table, not a rebuilt one")
 	assert.NotContains(t, ddl, `"config_namespaces"`, "an unquoted name means it was never renamed into place")
 	assert.Contains(t, ddl, "'public'")
-	assert.Equal(t, 1, userVersion(t, database.DB()), "the completed state is recorded")
+	assert.GreaterOrEqual(t, userVersion(t, database.DB()), 1,
+		"the completed state is recorded")
 }
 
 // TestOpen_SkipsOnceRecorded: with the version recorded, a later Open must
@@ -587,7 +588,7 @@ CREATE TABLE config_namespaces (
 	defer database.Close()
 
 	require.NoError(t, insertNamespace(database.DB(), "open", "public", "admin"))
-	assert.Equal(t, 1, userVersion(t, database.DB()))
+	assert.GreaterOrEqual(t, userVersion(t, database.DB()), 1)
 }
 
 // TestOpen_RebuildCarriesUpdatedByUsername is the coupling test between
@@ -656,4 +657,75 @@ func TestOpen_FreshInstallHasUpdatedByUsername(t *testing.T) {
 	require.NoError(t, database.DB().QueryRow(
 		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
 	assert.NotContains(t, ddl, `"config_namespaces"`, "a fresh install still does not rebuild")
+}
+
+// --- schema step 2: audit records document writes ---
+
+// TestOpen_WidensAuditActions: config_audit's action CHECK is already
+// deployed, and SQLite cannot ALTER a CHECK, so admitting a new action means
+// rebuilding that table too. Same dance as config_namespaces, on a table that
+// is append-only and whose ids ListAudit orders by — so they must be carried
+// across, not regenerated.
+func TestOpen_WidensAuditActions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.db")
+
+	first, err := db.Open(path)
+	require.NoError(t, err)
+	_, err = first.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, new_read, new_write, actor, actor_username, at)
+		 VALUES ('prefs','create','user','user','sub-1','alice','2026-01-01T00:00:00Z')`)
+	require.NoError(t, err)
+	var firstID int64
+	require.NoError(t, first.DB().QueryRow(
+		"SELECT id FROM config_audit WHERE namespace='prefs'").Scan(&firstID))
+	require.NoError(t, first.Close())
+
+	reopened, err := db.Open(path)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	_, err = reopened.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, actor, at)
+		 VALUES ('prefs','document_write','sub-2','2026-01-02T00:00:00Z')`)
+	assert.NoError(t, err, "the trail must accept a document write")
+
+	_, err = reopened.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, actor, at) VALUES ('prefs','nonsense','s','t')`)
+	assert.Error(t, err, "but still reject an action that is not one of ours")
+
+	var gotID int64
+	var username string
+	require.NoError(t, reopened.DB().QueryRow(
+		"SELECT id, actor_username FROM config_audit WHERE action='create'").Scan(&gotID, &username))
+	assert.Equal(t, firstID, gotID, "ids survive the rebuild — ListAudit orders by them")
+	assert.Equal(t, "alice", username, "and so does every column")
+
+	var idx int
+	require.NoError(t, reopened.DB().QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_config_audit_namespace'").Scan(&idx))
+	assert.Equal(t, 1, idx, "the index is recreated")
+}
+
+// TestOpen_SchemaStepsAreRecordedAndSkipped: user_version is now a step
+// counter rather than a single flag, so a database at the current version
+// does no work at all on later boots.
+func TestOpen_SchemaStepsAreRecordedAndSkipped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.db")
+	first, err := db.Open(path)
+	require.NoError(t, err)
+	v := userVersion(t, first.DB())
+	assert.GreaterOrEqual(t, v, 2, "a fresh database ends at the current step")
+	// A sentinel index would be dropped by any rebuild of either table.
+	_, err = first.DB().Exec("CREATE INDEX idx_step_sentinel ON config_audit(actor)")
+	require.NoError(t, err)
+	require.NoError(t, first.Close())
+
+	second, err := db.Open(path)
+	require.NoError(t, err)
+	defer second.Close()
+	var n int
+	require.NoError(t, second.DB().QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_step_sentinel'").Scan(&n))
+	assert.Equal(t, 1, n, "no table was rebuilt on the second open")
+	assert.Equal(t, v, userVersion(t, second.DB()))
 }

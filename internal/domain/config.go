@@ -48,6 +48,13 @@ const (
 	AuditActionCreate    = "create"
 	AuditActionACLChange = "acl_change"
 	AuditActionDelete    = "delete"
+
+	// AuditActionDocumentWrite records that a namespace's contents changed.
+	// The event only — never the body. Every write already ships the whole
+	// database to R2, so keeping documents here would inflate both the
+	// database and every backup without bound. To see what a document used
+	// to contain, restore the backup from around that timestamp.
+	AuditActionDocumentWrite = "document_write"
 )
 
 // Actor is who performed a change: the identity subject, which is the stable
@@ -64,12 +71,12 @@ type Actor struct {
 	Username string
 }
 
-// AuditEntry is one recorded change to a namespace's existence or its access
-// rules. Document writes are not audited and document bodies are never
-// recorded — this answers "who changed the rules, and when", not "what was
-// in it".
+// AuditEntry is one recorded change to a namespace: its creation, its access
+// rules, its contents, or its deletion. Document bodies are never recorded —
+// this answers "who changed it, and when", not "what it said".
 //
-// Old roles are empty on create; new roles are empty on delete.
+// Old roles are empty on create, new roles on delete, and both on a document
+// write, which moves no roles.
 type AuditEntry struct {
 	ID            int64
 	Namespace     string

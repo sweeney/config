@@ -206,6 +206,13 @@ func (r *fakeRepo) UpdateDocument(name string, document []byte, actor domain.Act
 	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:     name,
+		Action:        domain.AuditActionDocumentWrite,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
+	})
 	ns.Document = append(ns.Document[:0], document...)
 	ns.UpdatedBy = actor.Sub
 	ns.UpdatedByUsername = actor.Username
@@ -1561,4 +1568,55 @@ func TestList_StillRequiresAToken(t *testing.T) {
 	resp, _ := h.do("GET", "/api/v1/config", "", nil)
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
 		"but who wrote it is not disclosed without a token")
+}
+
+// TestAudit_RecordsDocumentWrites: a content change is now in the same
+// history as an access change, so one endpoint answers "what happened to this
+// namespace" rather than only "who changed who can see it".
+func TestAudit_RecordsDocumentWrites(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("prefs", "user", "user", `{"k":1}`)
+
+	resp, _ := h.do("PUT", "/api/v1/config/prefs", h.adminTok, map[string]any{"k": 2})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/prefs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 2)
+
+	assert.Equal(t, "document_write", entries[1]["action"])
+	assert.Equal(t, "admin-1", entries[1]["actor"])
+	assert.Equal(t, "name-of-admin-1", entries[1]["actor_username"])
+	assert.NotContains(t, entries[1], "new_read_role", "a document write moves no roles")
+	assert.NotContains(t, entries[1], "old_read_role")
+}
+
+// TestAudit_NoOpWriteIsNotRecorded: PUT with unchanged content is a no-op,
+// and recording it would fill the history with events where nothing happened
+// — which is how a trail stops being worth reading.
+func TestAudit_NoOpWriteIsNotRecorded(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("prefs", "user", "user", `{"k":1}`)
+
+	resp, body := h.do("PUT", "/api/v1/config/prefs", h.adminTok, map[string]any{"k": 1})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), `"changed":false`)
+
+	_, body = h.do("GET", "/api/v1/config/namespaces/prefs/audit", h.adminTok, nil)
+	assert.Len(t, auditEntries(t, body), 1, "only the seed create")
+}
+
+// TestAudit_DocumentBodiesAreNeverStored: the trail says a change happened,
+// never what it said. Storing bodies would inflate the database and every R2
+// backup without bound.
+func TestAudit_DocumentBodiesAreNeverStored(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("prefs", "user", "user", `{"k":1}`)
+	resp, _ := h.do("PUT", "/api/v1/config/prefs", h.adminTok, map[string]any{"secret": "hunter2"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	_, body := h.do("GET", "/api/v1/config/namespaces/prefs/audit", h.adminTok, nil)
+	assert.NotContains(t, string(body), "hunter2")
+	assert.NotContains(t, string(body), "secret")
 }

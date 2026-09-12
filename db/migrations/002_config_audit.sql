@@ -6,7 +6,14 @@
 -- which is the single event most worth keeping -- or block the delete
 -- outright. The trail has to outlive the thing it describes.
 --
--- Document writes are not recorded and document bodies are never stored.
+-- Document bodies are never stored. A document write is recorded as an event
+-- -- who wrote, and when -- but not what was written: every write already
+-- ships the whole database to R2, so keeping 64KB bodies here would inflate
+-- both the database and every backup without bound. To see what a document
+-- used to contain, restore the backup from around that timestamp.
+--
+-- Older note, kept because the constraint above is widened in db/schema.go
+-- for databases created before document writes were recorded.
 -- Every write already triggers a full-database upload to R2, so auditing
 -- 64KB bodies would inflate both the database and every backup without
 -- bound. This table records who changed a namespace's existence or its
@@ -21,7 +28,7 @@ CREATE TABLE IF NOT EXISTS config_audit (
     new_write   TEXT,
     actor       TEXT NOT NULL,
     at          TEXT NOT NULL,
-    CHECK (action IN ('create', 'acl_change', 'delete')),
+    CHECK (action IN ('create', 'acl_change', 'delete', 'document_write')),
     -- The role columns are constrained to the same values config_namespaces
     -- allows. This is the artefact you reach for when reconstructing how a
     -- namespace came to be public, so it is the last place that should be

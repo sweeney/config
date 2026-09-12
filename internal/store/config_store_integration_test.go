@@ -540,3 +540,75 @@ func TestConfigStore_UsernameOptionalOnNamespaces(t *testing.T) {
 	assert.Equal(t, "client-abc", got.UpdatedBy)
 	assert.Empty(t, got.UpdatedByUsername)
 }
+
+// --- document writes in the trail ---
+
+// TestConfigStore_UpdateDocument_RecordsAnEvent: the trail now answers "was
+// this changed, by whom, when" for contents as well as access. It still
+// stores no body — every write already ships the whole database to R2, so
+// keeping 64KB documents here would inflate both.
+func TestConfigStore_UpdateDocument_RecordsAnEvent(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	later := now.Add(time.Minute)
+	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":2}`),
+		domain.Actor{Sub: "sub-9", Username: "dave"}, later))
+
+	entries, err := s.ListAudit("prefs")
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "create, then the document write")
+
+	e := entries[1]
+	assert.Equal(t, domain.AuditActionDocumentWrite, e.Action)
+	assert.Equal(t, "sub-9", e.Actor)
+	assert.Equal(t, "dave", e.ActorUsername)
+	assert.True(t, e.At.Equal(later))
+	assert.Empty(t, e.OldReadRole, "a document write moves no roles")
+	assert.Empty(t, e.NewReadRole)
+	assert.Empty(t, e.OldWriteRole)
+	assert.Empty(t, e.NewWriteRole)
+}
+
+// TestConfigStore_UpdateDocument_AuditRollsBackWithFailedWrite: same
+// atomicity guarantee as the other write paths. The audit row goes in before
+// the mutation, so a write that fails takes it with it.
+func TestConfigStore_UpdateDocument_AuditRollsBackWithFailedWrite(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+
+	err := s.UpdateDocument("nosuchns", []byte(`{}`), domain.Actor{Sub: "sub-1"}, now)
+	require.ErrorIs(t, err, domain.ErrNotFound)
+
+	entries, aerr := s.ListAudit("nosuchns")
+	require.NoError(t, aerr)
+	assert.Empty(t, entries, "a write that hit nothing must leave no trace")
+}
+
+// TestConfigStore_DocumentWrites_InterleaveWithACLChanges: both kinds of
+// change share one ordered history, which is the point of recording them
+// together rather than in separate places.
+func TestConfigStore_DocumentWrites_InterleaveWithACLChanges(t *testing.T) {
+	s := store.NewConfigStore(openTestDB(t))
+	now := time.Now().UTC().Truncate(time.Second)
+	seedForAudit(t, s, "prefs", "user", "user", now)
+
+	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":1}`),
+		domain.Actor{Sub: "a"}, now.Add(time.Minute)))
+	require.NoError(t, s.UpdateACL("prefs", "public", "user",
+		domain.Actor{Sub: "b"}, now.Add(2*time.Minute), true))
+	require.NoError(t, s.UpdateDocument("prefs", []byte(`{"k":2}`),
+		domain.Actor{Sub: "c"}, now.Add(3*time.Minute)))
+
+	entries, err := s.ListAudit("prefs")
+	require.NoError(t, err)
+	require.Len(t, entries, 4)
+	got := []string{entries[0].Action, entries[1].Action, entries[2].Action, entries[3].Action}
+	assert.Equal(t, []string{
+		domain.AuditActionCreate,
+		domain.AuditActionDocumentWrite,
+		domain.AuditActionACLChange,
+		domain.AuditActionDocumentWrite,
+	}, got, "one history, in the order things happened")
+}

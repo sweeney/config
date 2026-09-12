@@ -107,6 +107,13 @@ func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, actor doma
 	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:     name,
+		Action:        domain.AuditActionDocumentWrite,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
+	})
 	ns.Document = append(ns.Document[:0], document...)
 	ns.UpdatedBy = actor.Sub
 	ns.UpdatedByUsername = actor.Username
