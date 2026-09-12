@@ -302,6 +302,10 @@ cmd_verify() {
   head_ "Data"
   info "namespaces now = $total"
   if [ -r "$STATE_FILE" ]; then
+    # Say how old it is: preflight is not re-run on every deploy, so a
+    # comparison can silently be against a much earlier state.
+    local taken; taken=$(awk -F= '/^taken=/{print $2}' "$STATE_FILE")
+    info "comparing against preflight state taken $taken"
     local before; before=$(awk -F= '/^total=/{print $2}' "$STATE_FILE")
     if [ "$before" = "$total" ]; then ok "namespace count unchanged since preflight ($before)"
     else bad "namespace count changed: $before before, $total now"; fi
@@ -331,11 +335,29 @@ cmd_verify() {
       ok "snapshot opens as a valid SQLite database"
       local snaprows
       snaprows=$(sq_file "$snap" "SELECT COUNT(*) FROM config_namespaces;")
-      if sq_file "$snap" "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces';" | grep -q "'public'"; then
-        warn "snapshot already permits 'public' — it may post-date the migration"
-      else
-        ok "snapshot carries the pre-migration schema (it is what you would restore)"
-      fi
+      # Each step names its own snapshot, and "does it predate the change?"
+      # means something different for each. A pre-audit snapshot is taken on a
+      # host that already went through the public step, so it permits 'public'
+      # and should — checking for its absence there reports a false alarm.
+      case "$(basename "$snap")" in
+        *.pre-public-rebuild-*)
+          if sq_file "$snap" "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces';" | grep -q "'public'"; then
+            warn "snapshot already permits 'public' — it may post-date the migration it is named for"
+          else
+            ok "snapshot predates the read_role widening (it is what you would restore)"
+          fi
+          ;;
+        *.pre-audit-rebuild-*)
+          if sq_file "$snap" "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_audit';" | grep -q "document_write"; then
+            warn "snapshot already records document writes — it may post-date the migration it is named for"
+          else
+            ok "snapshot predates the config_audit widening (it is what you would restore)"
+          fi
+          ;;
+        *)
+          info "snapshot $(basename "$snap") is not one this script knows how to date"
+          ;;
+      esac
       info "snapshot holds $snaprows namespace(s)"
       [ "$snaprows" = "$total" ] || warn "snapshot row count ($snaprows) differs from current ($total) — expected if data changed after the deploy"
     else
