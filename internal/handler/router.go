@@ -222,9 +222,13 @@ func allowAnonymous(next http.Handler) http.Handler {
 
 func callerFromRequest(r *http.Request) service.Caller {
 	if c := auth.ClaimsFromContext(r.Context()); c != nil {
-		return service.Caller{Sub: c.UserID, Role: string(c.Role)}
+		// Username comes straight from the token. Keeping it here is what
+		// lets the audit trail name who acted without asking identity later —
+		// which it could not do during an outage, nor after a rename.
+		return service.Caller{Sub: c.UserID, Role: string(c.Role), Username: c.Username}
 	}
 	if sc := auth.ServiceClaimsFromContext(r.Context()); sc != nil {
+		// A client is not a user, so there is no username to record.
 		return service.Caller{Sub: sc.ClientID, Role: domain.ConfigRoleUser}
 	}
 	// Neither kind of claim: an unauthenticated request that OptionalAuth let
@@ -461,18 +465,23 @@ func auditHandler(svc *service.ConfigService) http.HandlerFunc {
 			NewReadRole  string `json:"new_read_role,omitempty"`
 			NewWriteRole string `json:"new_write_role,omitempty"`
 			Actor        string `json:"actor"`
-			At           string `json:"at"`
+			// Omitted when not recorded: service tokens have no user, and
+			// rows predating the column do not know it. Clients fall back to
+			// actor.
+			ActorUsername string `json:"actor_username,omitempty"`
+			At            string `json:"at"`
 		}
 		out := make([]item, 0, len(entries))
 		for _, e := range entries {
 			out = append(out, item{
-				Action:       e.Action,
-				OldReadRole:  e.OldReadRole,
-				OldWriteRole: e.OldWriteRole,
-				NewReadRole:  e.NewReadRole,
-				NewWriteRole: e.NewWriteRole,
-				Actor:        e.Actor,
-				At:           e.At.UTC().Format("2006-01-02T15:04:05.000Z"),
+				Action:        e.Action,
+				OldReadRole:   e.OldReadRole,
+				OldWriteRole:  e.OldWriteRole,
+				NewReadRole:   e.NewReadRole,
+				NewWriteRole:  e.NewWriteRole,
+				Actor:         e.Actor,
+				ActorUsername: e.ActorUsername,
+				At:            e.At.UTC().Format("2006-01-02T15:04:05.000Z"),
 			})
 		}
 		// The history of a public namespace is not itself public.

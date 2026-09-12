@@ -50,6 +50,20 @@ const (
 	AuditActionDelete    = "delete"
 )
 
+// Actor is who performed a change: the identity subject, which is the stable
+// key, and the username as it was at that moment.
+//
+// The username is stored rather than resolved when the trail is read. An
+// audit record should not need identity to be reachable in order to be
+// legible, and it should not change meaning because someone was later renamed
+// or deleted — it says what was true at the time, which is the point of
+// keeping one. Username may be empty: service tokens have no user, and rows
+// written before the column existed do not know it. Readers fall back to Sub.
+type Actor struct {
+	Sub      string
+	Username string
+}
+
 // AuditEntry is one recorded change to a namespace's existence or its access
 // rules. Document writes are not audited and document bodies are never
 // recorded — this answers "who changed the rules, and when", not "what was
@@ -57,15 +71,16 @@ const (
 //
 // Old roles are empty on create; new roles are empty on delete.
 type AuditEntry struct {
-	ID           int64
-	Namespace    string
-	Action       string
-	OldReadRole  string
-	OldWriteRole string
-	NewReadRole  string
-	NewWriteRole string
-	Actor        string
-	At           time.Time
+	ID            int64
+	Namespace     string
+	Action        string
+	OldReadRole   string
+	OldWriteRole  string
+	NewReadRole   string
+	NewWriteRole  string
+	Actor         string
+	ActorUsername string
+	At            time.Time
 }
 
 // BackupService defines the interface for triggering database backups.
@@ -104,15 +119,15 @@ type ConfigRepository interface {
 	List() ([]ConfigNamespaceSummary, error)
 	GetACL(name string) (readRole, writeRole string, err error)
 	Get(name string) (*ConfigNamespace, error)
-	Create(ns *ConfigNamespace) error
+	Create(ns *ConfigNamespace, actor Actor) error
 	UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error
 	// UpdateACL replaces the ACL. publishConfirmed reports whether the caller
 	// supplied a valid confirmation; implementations must compare the
 	// incoming read role against the stored one inside the write transaction
 	// and return ErrPublishNotConfirmed when an unconfirmed publish would
 	// result.
-	UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error
-	Delete(name, deletedBy string, at time.Time) error
+	UpdateACL(name, readRole, writeRole string, actor Actor, at time.Time, publishConfirmed bool) error
+	Delete(name string, actor Actor, at time.Time) error
 
 	// ListAudit returns the recorded history for one namespace, oldest
 	// first. Entries survive deletion of the namespace they describe.

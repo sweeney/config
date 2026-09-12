@@ -21,6 +21,16 @@ var configNameRE = regexp.MustCompile(`^[a-z0-9_-]{1,64}$`)
 type Caller struct {
 	Sub  string
 	Role string
+
+	// Username is the caller's human-readable name from the token, empty for
+	// service tokens and anonymous callers. Carried so the audit trail can
+	// record who acted without a later lookup against identity.
+	Username string
+}
+
+// actor is what the repository records against a change.
+func (c Caller) actor() domain.Actor {
+	return domain.Actor{Sub: c.Sub, Username: c.Username}
 }
 
 // ConfigService is the business logic layer for the config service.
@@ -133,7 +143,7 @@ func (s *ConfigService) CreateNamespace(caller Caller, in CreateNamespaceInput) 
 		UpdatedBy: caller.Sub,
 		CreatedAt: now,
 	}
-	if err := s.repo.Create(ns); err != nil {
+	if err := s.repo.Create(ns, caller.actor()); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
 			return nil, ErrConfigNamespaceExists
 		}
@@ -218,7 +228,7 @@ func (s *ConfigService) UpdateACL(caller Caller, name string, in UpdateACLInput)
 	// reads the row before it judges the transition — so the guard is not an
 	// existence oracle. It also costs one query fewer than it used to.
 	if err := s.repo.UpdateACL(
-		name, in.ReadRole, in.WriteRole, caller.Sub, s.now(), in.ConfirmPublic == name,
+		name, in.ReadRole, in.WriteRole, caller.actor(), s.now(), in.ConfirmPublic == name,
 	); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return ErrConfigNamespaceNotFound
@@ -263,7 +273,7 @@ func (s *ConfigService) Delete(caller Caller, name string) error {
 	if !configNameRE.MatchString(name) {
 		return ErrConfigInvalidName
 	}
-	if err := s.repo.Delete(name, caller.Sub, s.now()); err != nil {
+	if err := s.repo.Delete(name, caller.actor(), s.now()); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return ErrConfigNamespaceNotFound
 		}

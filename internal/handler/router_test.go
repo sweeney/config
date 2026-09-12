@@ -177,7 +177,7 @@ func (r *fakeRepo) Get(name string) (*domain.ConfigNamespace, error) {
 	c := *ns
 	return &c, nil
 }
-func (r *fakeRepo) Create(ns *domain.ConfigNamespace) error {
+func (r *fakeRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.data[ns.Name]; ok {
@@ -186,12 +186,13 @@ func (r *fakeRepo) Create(ns *domain.ConfigNamespace) error {
 	c := *ns
 	r.data[ns.Name] = &c
 	r.audit.Record(domain.AuditEntry{
-		Namespace:    ns.Name,
-		Action:       domain.AuditActionCreate,
-		NewReadRole:  ns.ReadRole,
-		NewWriteRole: ns.WriteRole,
-		Actor:        ns.UpdatedBy,
-		At:           ns.CreatedAt,
+		Namespace:     ns.Name,
+		Action:        domain.AuditActionCreate,
+		NewReadRole:   ns.ReadRole,
+		NewWriteRole:  ns.WriteRole,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            ns.CreatedAt,
 	})
 	return nil
 }
@@ -207,7 +208,7 @@ func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string
 	ns.UpdatedAt = at
 	return nil
 }
-func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time, publishConfirmed bool) error {
+func (r *fakeRepo) UpdateACL(name, rRole, wRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
@@ -220,19 +221,20 @@ func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time,
 		return domain.ErrPublishNotConfirmed
 	}
 	r.audit.Record(domain.AuditEntry{
-		Namespace:    name,
-		Action:       domain.AuditActionACLChange,
-		OldReadRole:  ns.ReadRole,
-		OldWriteRole: ns.WriteRole,
-		NewReadRole:  rRole,
-		NewWriteRole: wRole,
-		Actor:        updatedBy,
-		At:           at,
+		Namespace:     name,
+		Action:        domain.AuditActionACLChange,
+		OldReadRole:   ns.ReadRole,
+		OldWriteRole:  ns.WriteRole,
+		NewReadRole:   rRole,
+		NewWriteRole:  wRole,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
 	})
-	ns.ReadRole, ns.WriteRole, ns.UpdatedBy, ns.UpdatedAt = rRole, wRole, updatedBy, at
+	ns.ReadRole, ns.WriteRole, ns.UpdatedBy, ns.UpdatedAt = rRole, wRole, actor.Sub, at
 	return nil
 }
-func (r *fakeRepo) Delete(name, deletedBy string, at time.Time) error {
+func (r *fakeRepo) Delete(name string, actor domain.Actor, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
@@ -240,12 +242,13 @@ func (r *fakeRepo) Delete(name, deletedBy string, at time.Time) error {
 		return domain.ErrNotFound
 	}
 	r.audit.Record(domain.AuditEntry{
-		Namespace:    name,
-		Action:       domain.AuditActionDelete,
-		OldReadRole:  ns.ReadRole,
-		OldWriteRole: ns.WriteRole,
-		Actor:        deletedBy,
-		At:           at,
+		Namespace:     name,
+		Action:        domain.AuditActionDelete,
+		OldReadRole:   ns.ReadRole,
+		OldWriteRole:  ns.WriteRole,
+		Actor:         actor.Sub,
+		ActorUsername: actor.Username,
+		At:            at,
 	})
 	delete(r.data, name)
 	return nil
@@ -264,8 +267,7 @@ func (r *fakeRepo) seed(name, readRole, writeRole, document string) {
 	_ = r.Create(&domain.ConfigNamespace{
 		Name: name, ReadRole: readRole, WriteRole: writeRole,
 		Document: []byte(document), CreatedAt: now, UpdatedAt: now,
-		UpdatedBy: "seed",
-	})
+	}, domain.Actor{Sub: "seed"})
 }
 
 type fakeBackup struct{}
@@ -294,9 +296,12 @@ func newHarness(t *testing.T) *harness {
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
 
+	// Username is deliberately distinct from UserID: tests that assert the
+	// audit trail records the username would pass vacuously if the two were
+	// the same string.
 	mint := func(role commonauth.Role, sub string) string {
 		return iss.mint(&commonauth.TokenClaims{
-			UserID: sub, Username: sub, Role: role, IsActive: true,
+			UserID: sub, Username: "name-of-" + sub, Role: role, IsActive: true,
 		})
 	}
 	return &harness{
@@ -513,8 +518,8 @@ func TestGet_UserBlockedFromAdminNamespace_Returns404(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "secret", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, _ := h.do("GET", "/api/v1/config/secret", h.userTok, nil)
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
 		"user must see 404 not 403, to avoid leaking namespace existence")
@@ -525,8 +530,8 @@ func TestGet_UserCanReadUserNamespace(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "prefs", ReadRole: "user", WriteRole: "admin",
-		Document: []byte(`{"theme":"dark"}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{"theme":"dark"}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, body := h.do("GET", "/api/v1/config/prefs", h.userTok, nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.JSONEq(t, `{"theme":"dark"}`, string(body))
@@ -542,8 +547,7 @@ func TestList_FiltersByVisibility(t *testing.T) {
 		n := ns
 		n.Document = []byte(`{}`)
 		n.UpdatedAt, n.CreatedAt = now, now
-		n.UpdatedBy = "u"
-		require.NoError(t, h.repo.Create(&n))
+		require.NoError(t, h.repo.Create(&n, domain.Actor{Sub: "u"}))
 	}
 
 	resp, body := h.do("GET", "/api/v1/config", h.userTok, nil)
@@ -562,8 +566,8 @@ func TestPut_WriteRoleEnforced(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "shared", ReadRole: "user", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	// User can READ but not WRITE → 403 (since they can read it, we don't pretend it's 404)
 	resp, _ := h.do("PUT", "/api/v1/config/shared", h.userTok, json.RawMessage(`{"x":1}`))
@@ -584,8 +588,8 @@ func TestPut_UserBlockedFromInvisibleNamespace_Returns404(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "secret", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	resp, _ := h.do("PUT", "/api/v1/config/secret", h.userTok, json.RawMessage(`{"x":1}`))
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
@@ -597,8 +601,8 @@ func TestPut_InvalidDocument_Returns400(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, body := h.do("PUT", "/api/v1/config/n", h.adminTok, "[]")
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assert.Contains(t, string(body), "invalid_document")
@@ -609,8 +613,8 @@ func TestPut_NoOp_ReturnsChangedFalse(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{"a":1}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{"a":1}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, body := h.do("PUT", "/api/v1/config/n", h.adminTok, json.RawMessage(`{"a":1}`))
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	var out map[string]any
@@ -623,8 +627,8 @@ func TestPut_OversizedBody_Returns413(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	// Build a JSON object larger than the handler's 128KB body cap.
 	big := &strings.Builder{}
 	big.WriteString(`{"k":"`)
@@ -643,8 +647,8 @@ func TestGet_ReturnsACLHeaders(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "prefs", ReadRole: "user", WriteRole: "admin",
-		Document: []byte(`{"x":1}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{"x":1}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, _ := h.do("GET", "/api/v1/config/prefs", h.adminTok, nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "user", resp.Header.Get("X-Read-Role"))
@@ -656,8 +660,8 @@ func TestGet_ACLHeaders_MatchStoredACL(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "sec", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, _ := h.do("GET", "/api/v1/config/sec", h.adminTok, nil)
 	assert.Equal(t, "admin", resp.Header.Get("X-Read-Role"))
 	assert.Equal(t, "admin", resp.Header.Get("X-Write-Role"))
@@ -668,8 +672,8 @@ func TestPatchACL_ReturnsACLHeaders(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/n", h.adminTok,
 		map[string]string{"read_role": "user", "write_role": "admin"})
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -684,8 +688,8 @@ func TestPatchACL_GetHeadersMatchPatchHeaders(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	patchResp, _ := h.do("PATCH", "/api/v1/config/namespaces/n", h.adminTok,
 		map[string]string{"read_role": "user", "write_role": "admin"})
 	require.Equal(t, http.StatusOK, patchResp.StatusCode)
@@ -704,8 +708,8 @@ func TestGet_NoACLHeadersOn404_ReadDenied(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "secret", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 	resp, _ := h.do("GET", "/api/v1/config/secret", h.userTok, nil)
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 	assert.Empty(t, resp.Header.Get("X-Read-Role"))
@@ -728,8 +732,8 @@ func TestPatchACL_AdminOnly(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/n", h.userTok,
 		map[string]string{"read_role": "user", "write_role": "admin"})
@@ -747,8 +751,8 @@ func TestDelete_AdminOnly(t *testing.T) {
 	now := time.Now().UTC()
 	require.NoError(t, h.repo.Create(&domain.ConfigNamespace{
 		Name: "n", ReadRole: "user", WriteRole: "user",
-		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
-	}))
+		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
+	}, domain.Actor{Sub: "u"}))
 
 	resp, _ := h.do("DELETE", "/api/v1/config/n", h.userTok, nil)
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
@@ -1465,4 +1469,41 @@ func TestGet_PublicExposesRoleHeadersCrossOrigin(t *testing.T) {
 	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
 	assert.Contains(t, resp.Header.Get("Access-Control-Expose-Headers"), "X-Read-Role",
 		"a wildcard origin that cannot read the headers it is sent is only half a wildcard")
+}
+
+// TestAudit_RecordsActorUsername: the trail names who acted, taken from the
+// token at the time of the change rather than resolved against identity when
+// the trail is read — which could not work during an outage, nor after a
+// rename.
+func TestAudit_RecordsActorUsername(t *testing.T) {
+	h := newHarness(t)
+	resp, _ := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "user", "write_role": "user",
+		"document": map[string]any{},
+	})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 1)
+
+	assert.Equal(t, "admin-1", entries[0]["actor"], "the subject stays the stable key")
+	assert.Equal(t, "name-of-admin-1", entries[0]["actor_username"],
+		"and the username is recorded alongside it")
+}
+
+// TestAudit_UsernameOmittedWhenUnknown: a service token has no user, and rows
+// written before the column existed do not know one. The field is absent
+// rather than empty, so clients can fall back to the subject.
+func TestAudit_UsernameOmittedWhenUnknown(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "seed", entries[0]["actor"])
+	assert.NotContains(t, entries[0], "actor_username", "absent, not empty")
 }

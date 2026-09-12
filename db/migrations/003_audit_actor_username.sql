@@ -1,0 +1,25 @@
+-- Record the actor's username alongside their identity subject.
+--
+-- The sub is the stable key and stays authoritative. The username is the
+-- human label, stored rather than resolved at read time for two reasons.
+-- An audit trail should not need identity to be reachable in order to be
+-- legible, and it should not change meaning when someone is renamed or their
+-- account is deleted — it records what was true at the time, which is the
+-- whole point of keeping one.
+--
+-- Nullable, and deliberately not backfilled: rows written before this column
+-- existed genuinely do not know the username, and asking identity for the
+-- current name of that sub today would record a present-day fact as a
+-- historical one. Readers fall back to the sub.
+--
+-- ALTER TABLE ADD COLUMN is the one migration shape common/db's ledger-less
+-- runner handles natively. It re-runs every file on every boot and
+-- special-cases the resulting "duplicate column name" by retrying the file
+-- statement by statement.
+--
+-- That retry splits the file on semicolons with no awareness of comments, so
+-- a semicolon anywhere in this prose would cut a comment in half and the
+-- remainder would not parse. Keep punctuation here semicolon-free. It bites
+-- only migrations that legitimately fail on re-run, which is exactly this
+-- shape, and on every boot after the first.
+ALTER TABLE config_audit ADD COLUMN actor_username TEXT;
