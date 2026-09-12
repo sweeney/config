@@ -22,9 +22,11 @@ import (
 
 	commonauth "github.com/sweeney/identity/common/auth"
 
+	"github.com/sweeney/config/internal/auth"
 	"github.com/sweeney/config/internal/domain"
 	"github.com/sweeney/config/internal/handler"
 	"github.com/sweeney/config/internal/service"
+	"github.com/sweeney/config/internal/testutil"
 )
 
 // --- testIssuer ---
@@ -133,6 +135,10 @@ func (ti *testIssuer) ParseServiceToken(_ context.Context, tokenStr string) (*co
 type fakeRepo struct {
 	mu   sync.Mutex
 	data map[string]*domain.ConfigNamespace
+
+	// Audit recording is shared with the other suite's fake so the two
+	// cannot disagree about what gets recorded; see internal/testutil.
+	audit testutil.AuditLog
 }
 
 func newFakeRepo() *fakeRepo {
@@ -179,6 +185,14 @@ func (r *fakeRepo) Create(ns *domain.ConfigNamespace) error {
 	}
 	c := *ns
 	r.data[ns.Name] = &c
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    ns.Name,
+		Action:       domain.AuditActionCreate,
+		NewReadRole:  ns.ReadRole,
+		NewWriteRole: ns.WriteRole,
+		Actor:        ns.UpdatedBy,
+		At:           ns.CreatedAt,
+	})
 	return nil
 }
 func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string, at time.Time) error {
@@ -193,34 +207,65 @@ func (r *fakeRepo) UpdateDocument(name string, document []byte, updatedBy string
 	ns.UpdatedAt = at
 	return nil
 }
-func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time) error {
+func (r *fakeRepo) UpdateACL(name, rRole, wRole, updatedBy string, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
 		return domain.ErrNotFound
 	}
+	// The same guard the real store applies, decided against the stored row.
+	if rRole == domain.ConfigRolePublic &&
+		ns.ReadRole != domain.ConfigRolePublic && !publishConfirmed {
+		return domain.ErrPublishNotConfirmed
+	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionACLChange,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		NewReadRole:  rRole,
+		NewWriteRole: wRole,
+		Actor:        updatedBy,
+		At:           at,
+	})
 	ns.ReadRole, ns.WriteRole, ns.UpdatedBy, ns.UpdatedAt = rRole, wRole, updatedBy, at
 	return nil
 }
-func (r *fakeRepo) Delete(name string) error {
+func (r *fakeRepo) Delete(name, deletedBy string, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.data[name]; !ok {
+	ns, ok := r.data[name]
+	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionDelete,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		Actor:        deletedBy,
+		At:           at,
+	})
 	delete(r.data, name)
 	return nil
 }
 
+func (r *fakeRepo) ListAudit(namespace string) ([]domain.AuditEntry, error) {
+	return r.audit.List(namespace), nil
+}
+
+// seed installs a namespace as if it had been created through the API.
+// It routes through Create rather than writing the map directly so the fake
+// records the same audit entry the real store would — otherwise a seeded
+// namespace has a history the production code path would never produce.
 func (r *fakeRepo) seed(name, readRole, writeRole, document string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now()
-	r.data[name] = &domain.ConfigNamespace{
+	_ = r.Create(&domain.ConfigNamespace{
 		Name: name, ReadRole: readRole, WriteRole: writeRole,
 		Document: []byte(document), CreatedAt: now, UpdatedAt: now,
-	}
+		UpdatedBy: "seed",
+	})
 }
 
 type fakeBackup struct{}
@@ -859,6 +904,7 @@ var documentedPaths = []string{
 	"/api/v1/config/{ns}",
 	"/api/v1/config/namespaces",
 	"/api/v1/config/namespaces/{ns}",
+	"/api/v1/config/namespaces/{ns}/audit",
 }
 
 // TestOpenAPI_PathCoverage cross-references the spec's paths against the routes
@@ -966,4 +1012,457 @@ func TestHealthz_StaysOKDuringKeysOutage(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close() //nolint:errcheck
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// --- anonymous reads of public namespaces ---
+//
+// GET of a single namespace is the only optionally-authenticated route. The
+// list endpoint deliberately stays authenticated: knowing a namespace's name
+// is the price of reading it anonymously, and nothing advertises the names.
+
+// outageParser stands in for a verifier that cannot reach identity's JWKS.
+type outageParser struct{}
+
+func (outageParser) Parse(context.Context, string) (*commonauth.TokenClaims, error) {
+	return nil, commonauth.ErrKeysUnavailable
+}
+
+func (outageParser) ParseServiceToken(context.Context, string) (*commonauth.ServiceTokenClaims, error) {
+	return nil, commonauth.ErrKeysUnavailable
+}
+
+func newHarnessWithParser(t *testing.T, parser auth.TokenParser) *harness {
+	t.Helper()
+	repo := newFakeRepo()
+	svc := service.NewConfigService(repo, fakeBackup{})
+	srv := httptest.NewServer(handler.NewRouter(handler.Deps{
+		Service: svc, Verifier: parser, Version: "test",
+	}))
+	t.Cleanup(srv.Close)
+	return &harness{t: t, repo: repo, srv: srv}
+}
+
+func TestGet_Anonymous_PublicNamespace_Returns200(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{"unit":0.24}`)
+
+	resp, body := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `{"unit":0.24}`, string(body))
+}
+
+func TestGet_Anonymous_PrivateNamespace_Returns404(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{"secret":true}`)
+
+	resp, body := h.do("GET", "/api/v1/config/internal", "", nil)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"a private namespace must be not-found to an anonymous caller, never 401")
+	assert.NotContains(t, string(body), "secret")
+}
+
+// TestGet_Anonymous_PrivateAndMissingAreIndistinguishable is the property
+// that makes the obscurity model hold: an anonymous caller brute-forcing
+// names must not be able to tell a private namespace from one that does not
+// exist.
+func TestGet_Anonymous_PrivateAndMissingAreIndistinguishable(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	privateResp, privateBody := h.do("GET", "/api/v1/config/internal", "", nil)
+	missingResp, missingBody := h.do("GET", "/api/v1/config/nosuchns", "", nil)
+
+	assert.Equal(t, missingResp.StatusCode, privateResp.StatusCode)
+	assert.Equal(t, string(missingBody), string(privateBody))
+	assert.Empty(t, privateResp.Header.Get("X-Read-Role"),
+		"ACL headers must not leak on a denied read")
+	assert.Equal(t, missingResp.Header.Get("Cache-Control"), privateResp.Header.Get("Cache-Control"))
+}
+
+// TestGet_BrokenTokenOnPublicNamespaceReturns401: a presented token that does
+// not verify is never silently downgraded to anonymous, even where anonymous
+// would have succeeded.
+func TestGet_BrokenTokenOnPublicNamespaceReturns401(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "not-a-real-token", nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// TestGet_Anonymous_SurvivesIdentityOutage: with no token presented there is
+// nothing to verify, so a public namespace stays readable while identity is
+// unreachable. Public namespaces are the outage-resilient read path.
+func TestGet_Anonymous_SurvivesIdentityOutage(t *testing.T) {
+	h := newHarnessWithParser(t, outageParser{})
+	h.repo.seed("tariffs", "public", "user", `{"unit":0.24}`)
+
+	resp, body := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"an anonymous public read must not depend on identity being up")
+	assert.JSONEq(t, `{"unit":0.24}`, string(body))
+}
+
+func TestGet_TokenPresentedDuringIdentityOutage_Returns503(t *testing.T) {
+	h := newHarnessWithParser(t, outageParser{})
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "some-token", nil)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, "30", resp.Header.Get("Retry-After"))
+}
+
+func TestGet_AuthenticatedUserCanAlsoReadPublic(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", h.userTok, nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestGet_CacheHeaders: the TTL on a public namespace is also the revoke
+// latency — flipping read_role back does not purge a CDN or a browser cache
+// — so it is deliberately short, and Vary stays on both because the same URL
+// answers differently with and without a token.
+func TestGet_CacheHeaders(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	pub, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "public, max-age=60", pub.Header.Get("Cache-Control"))
+	assert.Equal(t, "Authorization", pub.Header.Get("Vary"))
+
+	priv, _ := h.do("GET", "/api/v1/config/internal", h.userTok, nil)
+	assert.Equal(t, "private, no-store", priv.Header.Get("Cache-Control"))
+	assert.Equal(t, "Authorization", priv.Header.Get("Vary"))
+}
+
+// TestAnonymous_EveryOtherRouteStillRequiresAToken guards the blast radius:
+// only the single-namespace GET became optionally authenticated.
+func TestAnonymous_EveryOtherRouteStillRequiresAToken(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	cases := []struct {
+		method, path string
+		body         any
+	}{
+		{"GET", "/api/v1/config", nil},
+		{"PUT", "/api/v1/config/tariffs", map[string]any{"k": 1}},
+		{"DELETE", "/api/v1/config/tariffs", nil},
+		{"POST", "/api/v1/config/namespaces", map[string]any{"name": "x", "read_role": "user", "write_role": "user"}},
+		{"PATCH", "/api/v1/config/namespaces/tariffs", map[string]any{"read_role": "user", "write_role": "user"}},
+	}
+	for _, c := range cases {
+		t.Run(c.method+" "+c.path, func(t *testing.T) {
+			resp, _ := h.do(c.method, c.path, "", c.body)
+			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+				"a public read role must not open any route but the namespace GET")
+		})
+	}
+}
+
+// --- publish confirmation ---
+
+func TestPatchACL_PublishWithoutConfirmation_Returns400(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, body := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user"})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "confirm_required", env["error"])
+
+	readRole, _, err := h.repo.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "user", readRole, "the ACL must be untouched")
+}
+
+func TestPatchACL_PublishWithConfirmation_Succeeds(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user", "confirm_public": "tariffs"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "public", resp.Header.Get("X-Read-Role"))
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, http.StatusOK, anon.StatusCode, "publishing must actually open the read path")
+}
+
+func TestPatchACL_PublishWithWrongConfirmation_Returns400(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user", "confirm_public": "some-other-ns"})
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// TestPatchACL_RevokeNeedsNoConfirmation: unpublishing is an ordinary edit,
+// and the anonymous read must stop immediately at the origin.
+func TestPatchACL_RevokeNeedsNoConfirmation(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "user", "write_role": "user"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, http.StatusNotFound, anon.StatusCode)
+}
+
+func TestCreate_PublicWithoutConfirmation_Returns400(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "public", "write_role": "user",
+		"document": map[string]any{},
+	})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "confirm_required", env["error"])
+}
+
+func TestCreate_PublicWithConfirmation_Returns201(t *testing.T) {
+	h := newHarness(t)
+	resp, _ := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "public", "write_role": "user",
+		"document": map[string]any{}, "confirm_public": "tariffs",
+	})
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+}
+
+func TestCreate_PublicWriteRole_Returns400(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("POST", "/api/v1/config/namespaces", h.adminTok, map[string]any{
+		"name": "tariffs", "read_role": "public", "write_role": "public",
+		"document": map[string]any{}, "confirm_public": "tariffs",
+	})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "invalid_role", env["error"])
+}
+
+// --- CORS on published namespaces ---
+
+// TestGet_PublicNamespaceAllowsAnyOrigin: a published document is meant to be
+// fetched from anywhere. Restricting browser origins on it is friction rather
+// than protection — anything server-side ignores CORS entirely — so a public
+// namespace answers any origin, as /openapi.json already does.
+func TestGet_PublicNamespaceAllowsAnyOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+}
+
+// TestGet_PrivateNamespaceDoesNotAllowAnyOrigin: the wildcard is scoped to
+// what was deliberately published. A private namespace keeps whatever the
+// origin allow-list decided.
+func TestGet_PrivateNamespaceDoesNotAllowAnyOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/internal", h.userTok, nil)
+	assert.NotEqual(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+}
+
+// TestGet_VaryPreservesUpstreamValues: the CORS middleware sets Vary: Origin
+// before the handler runs. The handler used to Set Vary outright, silently
+// dropping it — which with a shared cache and max-age on public namespaces
+// means a cached response could be served to an origin it was not built for.
+func TestGet_VaryPreservesUpstreamValues(t *testing.T) {
+	repo := newFakeRepo()
+	repo.seed("tariffs", "public", "user", `{}`)
+	router := handler.NewRouter(handler.Deps{
+		Service:  service.NewConfigService(repo, fakeBackup{}),
+		Verifier: newTestIssuer(t, "https://test"),
+		Version:  "test",
+	})
+	// Stand in for the securityHeaders middleware in cmd/server.
+	withVary := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "Origin")
+		router.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(withVary)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/api/v1/config/tariffs")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	vary := resp.Header.Values("Vary")
+	joined := strings.Join(vary, ", ")
+	assert.Contains(t, joined, "Origin", "the handler must not drop an upstream Vary")
+	assert.Contains(t, joined, "Authorization")
+}
+
+// --- audit endpoint ---
+
+func auditEntries(t *testing.T, body []byte) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	require.NoError(t, json.Unmarshal(body, &out))
+	return out
+}
+
+func TestAudit_AdminSeesHistory(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+	resp, _ := h.do("PATCH", "/api/v1/config/namespaces/tariffs", h.adminTok,
+		map[string]any{"read_role": "public", "write_role": "user", "confirm_public": "tariffs"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 2, "seeded create, then the publish")
+	assert.Equal(t, "acl_change", entries[1]["action"])
+	assert.Equal(t, "user", entries[1]["old_read_role"])
+	assert.Equal(t, "public", entries[1]["new_read_role"])
+	assert.Equal(t, "admin-1", entries[1]["actor"])
+	assert.NotEmpty(t, entries[1]["at"])
+	assert.NotContains(t, entries[0], "old_read_role", "a create has no previous ACL")
+}
+
+func TestAudit_NotCacheable(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "private, no-store", resp.Header.Get("Cache-Control"),
+		"the history of a public namespace is not itself public")
+	assert.NotEqual(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+}
+
+func TestAudit_RequiresAdmin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", h.userTok, nil)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestAudit_ServiceTokenForbidden(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "user", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", svcTok(h), nil)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"service tokens are pinned to user role and never read the trail")
+}
+
+// TestAudit_AnonymousRejectedEvenForPublicNamespace: publishing a document
+// does not publish its history.
+func TestAudit_AnonymousRejectedEvenForPublicNamespace(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	pub, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	require.Equal(t, http.StatusOK, pub.StatusCode, "the document itself is anonymous-readable")
+
+	resp, _ := h.do("GET", "/api/v1/config/namespaces/tariffs/audit", "", nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestAudit_DeletedNamespaceKeepsItsHistory(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("temp", "user", "user", `{}`)
+	resp, _ := h.do("DELETE", "/api/v1/config/temp", h.adminTok, nil)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	resp, body := h.do("GET", "/api/v1/config/namespaces/temp/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	entries := auditEntries(t, body)
+	require.Len(t, entries, 2)
+	assert.Equal(t, "delete", entries[1]["action"])
+	assert.Equal(t, "admin-1", entries[1]["actor"])
+}
+
+func TestAudit_UnknownNamespaceReturnsEmptyArray(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do("GET", "/api/v1/config/namespaces/nosuchns/audit", h.adminTok, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `[]`, string(body), "never null — clients iterate it")
+}
+
+// --- review follow-ups: caching and disclosure on the namespace GET ---
+
+// TestGet_NotFoundCarriesCacheHeaders: 404 is heuristically cacheable
+// (RFC 9111 §4.2.2), and it is the only answer an anonymous caller ever gets
+// for a private namespace. Without these headers a shared cache can key the
+// anonymous 404 without regard to Authorization and replay it to a user who
+// can actually read that namespace.
+func TestGet_NotFoundCarriesCacheHeaders(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("internal", "user", "user", `{}`)
+
+	for name, path := range map[string]string{
+		"private": "/api/v1/config/internal",
+		"missing": "/api/v1/config/nosuchns",
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp, _ := h.do("GET", path, "", nil)
+			require.Equal(t, http.StatusNotFound, resp.StatusCode)
+			assert.Equal(t, "private, no-store", resp.Header.Get("Cache-Control"),
+				"a cacheable 404 on a route that answers differently per token is a poisoning vector")
+			assert.Contains(t, resp.Header.Get("Vary"), "Authorization")
+		})
+	}
+}
+
+// TestGet_SharedCacheOnlyForAnonymousReads: Vary keeps a token-bearing read
+// of a public namespace correct, but marking it shared-cacheable stores a
+// copy per distinct token and hands a shared cache a response served to an
+// identified principal. Only the genuinely anonymous answer earns that.
+func TestGet_SharedCacheOnlyForAnonymousReads(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "public, max-age=60", anon.Header.Get("Cache-Control"))
+
+	authed, _ := h.do("GET", "/api/v1/config/tariffs", h.userTok, nil)
+	assert.Equal(t, "private, no-store", authed.Header.Get("Cache-Control"),
+		"an authenticated read is not shared-cacheable, even of a public namespace")
+}
+
+// TestGet_AnonymousIsNotToldTheWriteRole: that a plain user token suffices to
+// write is a nudge toward where to point a stolen one, and nobody without a
+// token can act on it. The read role is self-evident from the read having
+// succeeded.
+func TestGet_AnonymousIsNotToldTheWriteRole(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	anon, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "public", anon.Header.Get("X-Read-Role"))
+	assert.Empty(t, anon.Header.Get("X-Write-Role"), "not disclosed to an anonymous caller")
+
+	authed, _ := h.do("GET", "/api/v1/config/tariffs", h.userTok, nil)
+	assert.Equal(t, "user", authed.Header.Get("X-Write-Role"), "still sent to an authenticated caller")
+}
+
+// TestGet_PublicExposesRoleHeadersCrossOrigin: the CORS middleware only sends
+// Access-Control-Expose-Headers to allow-listed origins, so without this the
+// role headers are unreadable from JS for exactly the wildcard audience.
+func TestGet_PublicExposesRoleHeadersCrossOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed("tariffs", "public", "user", `{}`)
+
+	resp, _ := h.do("GET", "/api/v1/config/tariffs", "", nil)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+	assert.Contains(t, resp.Header.Get("Access-Control-Expose-Headers"), "X-Read-Role",
+		"a wildcard origin that cannot read the headers it is sent is only half a wildcard")
 }

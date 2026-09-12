@@ -1,8 +1,9 @@
 # Config service — administrator guide
 
 Operational notes for running the config service: namespace design,
-backups, restore, role changes, identity-coupling concerns. For the
-integration surface, see [`README.md`](../README.md).
+backups, restore, role changes, public namespaces, identity-coupling
+concerns. For the integration surface, see
+[`README.md`](../README.md).
 
 ## Creating namespaces
 
@@ -25,7 +26,23 @@ curl -s -X POST https://config.example.com/api/v1/config/namespaces \
 Names must match `^[a-z0-9_-]{1,64}$`. Keep them descriptive but short:
 `mqtt_topics`, `house_names`, `sensor_locations`, `prefs`.
 
+Creating a namespace straight at `read_role: public` additionally
+requires a `confirm_public` field — see [Publishing a
+namespace](#publishing-a-namespace).
+
 ## Choosing roles
+
+There are three roles, ranked weakest to strongest: `public` (0),
+`user` (1), `admin` (2). Every access decision is a rank comparison, and
+two rules cover all of it:
+
+- A caller may read a namespace when its own rank is at least the
+  namespace's `read_role` rank.
+- A namespace's `read_role` may be no stronger than its `write_role`.
+
+`public` is a valid `read_role` only — never a `write_role`. See
+[Public namespaces](#public-namespaces) below for what that buys and
+what it costs.
 
 Defaults that age well:
 
@@ -36,9 +53,14 @@ Defaults that age well:
   location coords. `read_role: user`, `write_role: admin`.
 - **User-writable only when genuinely user data.** Per-user UI prefs,
   dashboard layouts. `read_role: user`, `write_role: user`.
+- **Public only when the data is genuinely public.** Anything a client
+  legitimately needs before it has a token. `read_role: public`,
+  `write_role: admin`. Deliberate step, not a default — read the whole
+  of [Public namespaces](#public-namespaces) first.
 
 Users cannot delete namespaces or change ACLs regardless of `write_role`
-— both operations are admin-only.
+— both operations are admin-only. Anonymous callers can only read, and
+only namespaces at `read_role: public`.
 
 ### Changing roles later
 
@@ -47,12 +69,384 @@ Use `PATCH /api/v1/config/namespaces/{ns}` with the new `read_role` and
 `read_role` from `user` to `admin` will immediately start returning 404
 to in-flight user requests — there is no grace period.
 
+PATCH rewrites **both** roles on every call: it is a replacement, not a
+partial update, so whatever you send is the new ACL in full. Two
+consequences worth holding on to — moving a namespace *into*
+`read_role: public` needs an explicit confirmation, and moving it back
+*out* is not immediate. Both are covered under
+[Public namespaces](#public-namespaces).
+
 ```bash
 curl -s -X PATCH \
   https://config.example.com/api/v1/config/namespaces/mqtt_topics \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"read_role":"admin","write_role":"admin"}'
+```
+
+## Public namespaces
+
+A namespace at `read_role: public` is readable **with no token at all**:
+`GET /api/v1/config/{ns}` with no `Authorization` header returns the
+document. It is the only anonymous path into the API.
+
+`public` is a read role only. Nothing is ever anonymously writable — the
+`write_role` CHECK does not accept `public`, and there is no request
+shape that reaches a write without a verified token. A role the service
+does not recognise is unranked and satisfies nothing, so a malformed
+`role` claim in a token fails closed rather than falling through to
+public.
+
+Three things anonymous callers deliberately do **not** get:
+
+- **Discovery.** `GET /api/v1/config` is unchanged: it still requires a
+  token, still answers `401` without one, and never lists public
+  namespaces to an anonymous caller. Knowing the name is the price of
+  reading it anonymously; nothing advertises the names.
+- **A distinguishable miss.** An anonymous `GET` of a private namespace
+  and an anonymous `GET` of a namespace that does not exist return
+  byte-identical `404`s. The public read path cannot be turned into an
+  enumeration oracle.
+- **The write role.** An authenticated read carries both `X-Read-Role`
+  and `X-Write-Role`; an anonymous read carries `X-Read-Role` only.
+  That a plain `user` token suffices to write a given namespace is a
+  nudge toward where a stolen token would be worth pointing, and nobody
+  without a token can act on it. The read role is kept because the read
+  having succeeded already implies it.
+
+A token that is *present* but invalid or expired still gets `401`. It is
+never quietly downgraded to an anonymous read: a client holding a stale
+token needs to be told to refresh it, not silently handed whichever
+subset of config happens to be public.
+
+### Publishing a namespace
+
+Setting `read_role: public` — on `POST /api/v1/config/namespaces` or on
+`PATCH /api/v1/config/namespaces/{ns}` — requires a `confirm_public`
+field in the body whose value is exactly the namespace name. Without it:
+
+```http
+HTTP/1.1 400 Bad Request
+{"error":"confirm_required","message":"making a namespace public requires confirm_public to equal the namespace name"}
+```
+
+Three reasons the guard exists:
+
+- **Publishing is the one ACL change that cannot be undone.** Every
+  other role change takes effect and that is the end of it. Revoking
+  `public` stops future reads but cannot unfetch what has already been
+  served.
+- **PATCH rewrites both roles on every call.** Without the guard, a
+  stale `public` sitting in a dropdown — or in a script's saved
+  payload — would publish a namespace as a side effect of an edit that
+  was about something else entirely.
+- **Binding it to the name** stops a body being replayed against a
+  different namespace. A payload that publishes `tariffs` is inert
+  against `mqtt_topics`.
+
+Publishing `tariffs`, which currently has `read_role: user`:
+
+```bash
+curl -s -X PATCH \
+  https://config.example.com/api/v1/config/namespaces/tariffs \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "read_role":      "public",
+    "write_role":     "admin",
+    "confirm_public": "tariffs"
+  }'
+```
+
+Confirmation guards the *transition* into public, not the state of
+being public. A namespace that is already public does not need
+`confirm_public` on a later PATCH that leaves `read_role` alone, and
+revoking never needs it.
+
+### Revoking
+
+Revoke by PATCHing `read_role` back to `user` or `admin`.
+
+Mind the read-no-stronger-than-write invariant on the way down. A
+namespace at `read_role: public, write_role: user` can move to
+`read_role: user` freely, but going straight to `read_role: admin`
+must raise `write_role` to `admin` in the same PATCH — otherwise the
+combination asks for readers stronger than writers and is rejected:
+
+```bash
+# rejected — 400 invalid_role: read=admin is stronger than write=user
+-d '{"read_role":"admin","write_role":"user"}'
+
+# accepted
+-d '{"read_role":"admin","write_role":"admin"}'
+```
+
+It is an easy one to trip over, because the namespace was perfectly
+valid a moment earlier and the field you were thinking about is the one
+you got right.
+
+### Revoke latency is the cache TTL, not the PATCH
+
+`Cache-Control: public, max-age=60` is served to an **anonymous read of
+a public namespace**, and to nothing else. An authenticated read of that
+same namespace gets `private, no-store`, like every other authenticated
+read. All of them carry `Vary: Authorization`, because the same URL
+answers differently with and without a token and no cache may serve one
+response to the other.
+
+Note that the caching decision is keyed on the *caller*, not just the
+namespace. `Vary` alone would keep a token-bearing copy correct, but it
+would also store one copy per distinct token, and it would mark a
+response served to an identified principal as shared-cacheable. Keying
+on the caller also confines the window below to the anonymous copies,
+which are the only ones a revoke cannot reach anyway.
+
+The shared-cache header is most of the point of publishing: Cloudflare's
+edge, and every browser behind it, can serve the document without
+touching the service at all. It is also the thing to understand before
+you publish anything.
+
+**Flipping `read_role` back does not purge any of those caches.** The
+PATCH stops the service from serving the document anonymously, and it
+does that immediately, but edge and browser copies keep being handed out
+until they expire. The practical revoke latency is the **60-second cache
+TTL**, not the PATCH. Plan revocations around a minute, not an instant,
+and treat anything you could not tolerate being readable for one more
+minute as something you should not have published.
+
+A manual Cloudflare cache purge for the URL is the only way to shorten
+that window at the edge — nothing in the config service does it for you.
+Browser caches you cannot purge at all.
+
+The `404` is cached deliberately too — as `private, no-store`. Those
+headers are set *before* the namespace lookup, so a miss carries them as
+well as a hit. A `404` is heuristically cacheable under RFC 9111 §4.2.2,
+and it is the only answer an anonymous caller gets for a private
+namespace; without the headers a shared cache could key that anonymous
+`404` without regard to `Authorization` and replay it to a user who can
+actually read the namespace. Production sits behind Cloudflare, so this
+was not a hypothetical.
+
+### Public reads carry wildcard CORS headers
+
+A `GET` of a `read_role: public` namespace also answers with
+`Access-Control-Allow-Origin: *`. Nothing else does: private namespaces
+keep the allow-list configured in `CORS_ORIGINS`, and so does every
+write path.
+
+The reasoning is the same as the shared-cache header above. A published
+document is meant to be fetchable from anywhere, including a browser on
+an origin this service has never heard of. Withholding the header
+protects nothing, because a server-to-server caller ignores CORS
+entirely — it only breaks the browser half of the audience, which is
+the half least able to work around it. So the wildcard is scoped
+exactly to what an admin deliberately published, and to nothing else.
+
+Two headers travel with that wildcard and are easy to miss.
+
+`Access-Control-Expose-Headers: X-Read-Role, X-Write-Role` goes out
+alongside it. The CORS middleware only sends that header to allow-listed
+origins, so without it the role headers on the response were present on
+the wire but unreadable from JavaScript — for exactly the audience the
+wildcard exists to serve.
+
+And the **preflight** is answered for any origin, but only on the
+single-namespace path (`/api/v1/config/{ns}` — exactly one path segment
+after `/api/v1/config/`). A non-allow-listed `OPTIONS` there gets
+`Access-Control-Allow-Origin: *`, `Allow-Methods: GET, OPTIONS`,
+`Allow-Headers: Content-Type`, the expose-headers above, and
+`Max-Age: 86400`. Previously every `OPTIONS` under `/api/` was answered
+by the security-headers middleware, which emits CORS headers only for
+allow-listed origins — so the wildcard held for *simple* GETs and
+nothing else, and a client that set `Content-Type` on the GET, or sent
+any custom header, preflighted and was refused.
+
+Answering it permissively is safe because a preflight says only which
+method and headers may be *attempted*. The GET still enforces the ACL,
+and a namespace the caller may not read still answers `404`. Note what
+is **not** on that list: `Authorization`. The wildcard exists for
+anonymous reads; a cross-origin request carrying a token still goes
+through `CORS_ORIGINS`. Every other route keeps allow-list behaviour
+unchanged.
+
+The practical consequence is worth stating plainly: a public namespace
+can be fetched straight from front-end JavaScript on any site in the
+world, with no token and without anyone adding that site to
+`CORS_ORIGINS`. That is the intended behaviour — and it is one more
+reason to read [What to publish](#what-to-publish) before you publish
+anything, because "readable by anyone who knows the name" now includes
+"readable by a script on a page you have never seen".
+
+### Public reads survive an identity outage
+
+An anonymous read verifies no token, so it never touches JWKS. While
+identity is unreachable and every authenticated request is answering
+`503` (see [Identity outages answer 503, not
+401](#identity-outages-answer-503-not-401)), a tokenless `GET` of a
+public namespace still returns `200`.
+
+That makes public namespaces the one read path that does not depend on
+identity being up, which is worth knowing when deciding where a client's
+bootstrap config should live. The catch is that the client has to *not*
+send the header: a request carrying a token during an outage is a
+request the service cannot verify, and it gets the `503` like everyone
+else. A client that wants the fallback has to retry without the
+`Authorization` header, deliberately.
+
+### What to publish
+
+Publish only what you would be content to see indexed. Anonymous means
+anonymous: no account behind the request, nothing but the per-IP rate
+limit in front of it, and no record of who read it. Reads are not
+audited for anyone, authenticated or not — the audit trail below
+records ACL changes, not access.
+
+Reasonable:
+
+- Data a client legitimately needs before it can hold a token — service
+  endpoints, feature flags that gate a login screen, supported regions.
+- Reference data that is public anyway — tariff rates, opening hours,
+  a list of names you would not mind a stranger reading.
+
+Never:
+
+- Anything you would not paste into a public web page. Documents are
+  not supposed to hold secrets in the first place, but `public` removes
+  the last accidental protection that policy had.
+- Anything naming internal hosts, device IDs, MQTT topics or network
+  topology. Collectively that is an inventory of the house.
+- Per-user data of any kind. A namespace is a single shared document;
+  there is no per-caller view of it, public or otherwise.
+
+## Audit trail
+
+Namespace lifecycle changes are recorded in a `config_audit` table: one
+row per `create`, `acl_change` and `delete`, carrying the namespace, the
+action, the old and new read/write roles, the actor's subject, and a
+timestamp. Old roles are empty on a create; new roles are empty on a
+delete. The table lives in the same SQLite file as the namespaces, so it
+rides along in every R2 backup.
+
+Three deliberate limits, worth knowing before you rely on it:
+
+- **Document writes are not audited, and document bodies are never
+  stored.** Every write already ships the whole database to R2, so
+  auditing 64KB bodies would inflate both the database and every backup
+  without bound. The table answers *who changed the rules, and when* —
+  not *what was in it*.
+- **The audit row is written in the same transaction as the mutation.**
+  A mutation that fails leaves no audit row behind, and a row that is
+  present always describes a change that really happened. A trail with
+  gaps is worse than no trail, because it gets believed.
+- **There is no foreign key to `config_namespaces`.** `PRAGMA
+  foreign_keys` is ON, so a foreign key here would either cascade the
+  rows away when a namespace is deleted — destroying the record of the
+  deletion, which is the single event most worth keeping — or block the
+  delete outright. The trail has to outlive the thing it describes.
+
+### Reading it over the API
+
+`GET /api/v1/config/namespaces/{ns}/audit` returns one namespace's
+history as a JSON array, oldest first:
+
+```bash
+curl -s https://config.example.com/api/v1/config/namespaces/tariffs/audit \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+[
+  {
+    "action":         "create",
+    "new_read_role":  "user",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-01T09:14:02.113Z"
+  },
+  {
+    "action":         "acl_change",
+    "old_read_role":  "user",
+    "old_write_role": "admin",
+    "new_read_role":  "public",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-04T11:02:47.906Z"
+  }
+]
+```
+
+The old roles are absent on a `create` and the new roles on a `delete`,
+which is the same thing the empty columns say below — absent rather than
+empty, because there was no previous ACL and no resulting one. (The JSON
+keys are `old_read_role` / `new_read_role`; the columns they come from
+are `old_read` / `new_read`.)
+
+**Admin-only, including when the namespace is public.** Publishing a
+document does not publish its history. A document and its history are
+different things, and every operation the trail records — create, ACL
+change, delete — is admin-only already, so anything weaker here would
+leak more through the history than through the resource itself. A `user`
+token gets `403`, a service token gets `403` (service tokens are pinned
+to the `user` role), and no token at all gets `401` — even on a
+namespace anyone in the world can read anonymously.
+
+The response carries `Cache-Control: private, no-store` and no wildcard
+origin, unlike the public document reads it may be describing.
+
+**An unknown or deleted namespace returns `200 []`, not `404`.** This is
+not the no-existence-leak rule bending: the caller is an admin, who can
+list every namespace anyway, so there is nothing here to leak. It is the
+trail outliving the thing it describes, the same reason there is no
+foreign key. *What happened to the namespace that is no longer here* is
+exactly what this endpoint is for, and a `404` would withhold the answer
+for precisely the namespaces where it matters most.
+
+The admin SPA shows the same history in its namespace view, so the
+routine "who published this, and when?" question needs neither a curl
+nor a shell on the host.
+
+### Direct access with `sqlite3`
+
+The table is still queryable on the box, and that is the route to reach
+for when you are already there, when the service is down, or when the
+question spans namespaces — the API answers for one namespace at a time.
+
+```bash
+sudo -u config sqlite3 -header -column /var/lib/config/config.db \
+  "SELECT at, action, old_read, new_read, actor
+     FROM config_audit
+    WHERE namespace = 'tariffs'
+    ORDER BY at;"
+```
+
+```
+at                          action      old_read  new_read  actor
+--------------------------  ----------  --------  --------  ---------
+2026-09-01T09:14:02.113Z    create                user      usr_01H8…
+2026-09-04T11:02:47.906Z    acl_change  user      public    usr_01H8…
+```
+
+The cross-namespace question — when did *anything* become public, and
+who did it — has no API equivalent for that reason:
+
+```bash
+sudo -u config sqlite3 -header -column /var/lib/config/config.db \
+  "SELECT namespace, at, actor
+     FROM config_audit
+    WHERE action = 'acl_change'
+      AND new_read = 'public'
+      AND old_read <> 'public'
+    ORDER BY at DESC;"
+```
+
+That is history, not current state: a namespace listed there may have
+been revoked since. For what is readable anonymously *right now*, ask
+the namespace table instead:
+
+```bash
+sudo -u config sqlite3 -header -column /var/lib/config/config.db \
+  "SELECT name, write_role, updated_at FROM config_namespaces
+    WHERE read_role = 'public';"
 ```
 
 ## Document design patterns
@@ -126,7 +520,7 @@ short of removing R2 credentials from the env.
 
 ### Failure handling
 
-Failed backups log to stdout and increment the audit trail but do **not**
+Failed backups log to stdout with an `audit:` line and do **not**
 fail the user's request. Rationale: a successful PUT has already been
 committed to SQLite; surfacing the backup error to the caller would
 imply an all-or-nothing guarantee we don't provide. Monitor the logs
@@ -177,6 +571,10 @@ via JWKS. It does **not** depend on identity for:
   is reachable again — see below)
 - Database (fully separate SQLite file)
 - Backups (separate R2 prefix)
+- Tokenless reads of `read_role: public` namespaces — there is no token
+  to verify, so they keep answering `200` throughout an outage. See
+  [Public reads survive an identity
+  outage](#public-reads-survive-an-identity-outage).
 
 If identity is down, config keeps serving cached JWKS, so most requests
 carry on working. Once the cache goes stale beyond `MaxStaleAge`

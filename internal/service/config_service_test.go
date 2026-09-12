@@ -14,6 +14,7 @@ import (
 
 	"github.com/sweeney/config/internal/domain"
 	"github.com/sweeney/config/internal/service"
+	"github.com/sweeney/config/internal/testutil"
 )
 
 // --- fakes ---
@@ -23,6 +24,14 @@ import (
 type fakeConfigRepo struct {
 	mu   sync.Mutex
 	data map[string]*domain.ConfigNamespace
+
+	// Audit recording is shared with the other suite's fake so the two
+	// cannot disagree about what gets recorded; see internal/testutil.
+	audit testutil.AuditLog
+
+	// getACLCalls counts reads of the ACL, so a test can prove the publish
+	// guard is not decided from a separately-read snapshot.
+	getACLCalls int
 }
 
 func newFakeConfigRepo() *fakeConfigRepo {
@@ -52,6 +61,7 @@ func (r *fakeConfigRepo) GetACL(name string) (string, string, error) {
 	if !ok {
 		return "", "", domain.ErrNotFound
 	}
+	r.getACLCalls++
 	return ns.ReadRole, ns.WriteRole, nil
 }
 
@@ -74,6 +84,14 @@ func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace) error {
 	}
 	copied := *ns
 	r.data[ns.Name] = &copied
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    ns.Name,
+		Action:       domain.AuditActionCreate,
+		NewReadRole:  ns.ReadRole,
+		NewWriteRole: ns.WriteRole,
+		Actor:        ns.UpdatedBy,
+		At:           ns.CreatedAt,
+	})
 	return nil
 }
 
@@ -90,13 +108,28 @@ func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, updatedBy 
 	return nil
 }
 
-func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time) error {
+func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, at time.Time, publishConfirmed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
 		return domain.ErrNotFound
 	}
+	// The same guard the real store applies, decided against the stored row.
+	if readRole == domain.ConfigRolePublic &&
+		ns.ReadRole != domain.ConfigRolePublic && !publishConfirmed {
+		return domain.ErrPublishNotConfirmed
+	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionACLChange,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		NewReadRole:  readRole,
+		NewWriteRole: writeRole,
+		Actor:        updatedBy,
+		At:           at,
+	})
 	ns.ReadRole = readRole
 	ns.WriteRole = writeRole
 	ns.UpdatedBy = updatedBy
@@ -104,14 +137,27 @@ func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole, updatedBy string, 
 	return nil
 }
 
-func (r *fakeConfigRepo) Delete(name string) error {
+func (r *fakeConfigRepo) Delete(name, deletedBy string, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.data[name]; !ok {
+	ns, ok := r.data[name]
+	if !ok {
 		return domain.ErrNotFound
 	}
+	r.audit.Record(domain.AuditEntry{
+		Namespace:    name,
+		Action:       domain.AuditActionDelete,
+		OldReadRole:  ns.ReadRole,
+		OldWriteRole: ns.WriteRole,
+		Actor:        deletedBy,
+		At:           at,
+	})
 	delete(r.data, name)
 	return nil
+}
+
+func (r *fakeConfigRepo) ListAudit(namespace string) ([]domain.AuditEntry, error) {
+	return r.audit.List(namespace), nil
 }
 
 // fakeBackup records TriggerAsync calls so tests can assert on-write
@@ -143,6 +189,10 @@ func newConfigSvc(t *testing.T) (*service.ConfigService, *fakeConfigRepo, *fakeB
 
 var admin = service.Caller{Sub: "admin-1", Role: domain.ConfigRoleAdmin}
 var user = service.Caller{Sub: "user-1", Role: domain.ConfigRoleUser}
+
+// anon is the synthetic caller the HTTP layer mints for a request that
+// carried no Authorization header at all.
+var anon = service.Caller{Sub: "", Role: domain.ConfigRolePublic}
 
 // --- CreateNamespace ---
 
@@ -434,13 +484,13 @@ func TestUpdateACL_AdminOnly(t *testing.T) {
 		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
 	}))
 
-	require.NoError(t, svc.UpdateACL(admin, "n", "user", "admin"))
+	require.NoError(t, svc.UpdateACL(admin, "n", service.UpdateACLInput{ReadRole: "user", WriteRole: "admin"}))
 	assert.Equal(t, 1, b.count())
 
 	got, _ := svc.Get(admin, "n")
 	assert.Equal(t, "user", got.ReadRole)
 
-	err := svc.UpdateACL(user, "n", "user", "user")
+	err := svc.UpdateACL(user, "n", service.UpdateACLInput{ReadRole: "user", WriteRole: "user"})
 	assert.ErrorIs(t, err, service.ErrConfigForbidden)
 }
 
@@ -451,7 +501,7 @@ func TestUpdateACL_InvalidRole(t *testing.T) {
 		Name: "n", ReadRole: "admin", WriteRole: "admin",
 		Document: []byte(`{}`), UpdatedAt: now, UpdatedBy: "u", CreatedAt: now,
 	}))
-	err := svc.UpdateACL(admin, "n", "root", "admin")
+	err := svc.UpdateACL(admin, "n", service.UpdateACLInput{ReadRole: "root", WriteRole: "admin"})
 	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
 }
 
@@ -474,4 +524,399 @@ func TestDelete_AdminOnly(t *testing.T) {
 
 	_, err = svc.Get(admin, "n")
 	assert.True(t, errors.Is(err, service.ErrConfigNamespaceNotFound))
+}
+
+// --- public read role ---
+
+// seedNS is a small helper for the public-role tests, which care about the
+// ACL rather than the document.
+func seedNS(t *testing.T, repo *fakeConfigRepo, name, readRole, writeRole string) {
+	t.Helper()
+	now := time.Now().UTC()
+	require.NoError(t, repo.Create(&domain.ConfigNamespace{
+		Name: name, ReadRole: readRole, WriteRole: writeRole,
+		Document: []byte(`{"k":1}`), UpdatedAt: now, UpdatedBy: "seed", CreatedAt: now,
+	}))
+}
+
+// TestGet_RoleMatrix enumerates every (namespace read_role, caller role)
+// pair rather than spot-checking. This is the authorization primitive the
+// whole feature rests on, and an exhaustive table is cheap at 3x3.
+//
+// A denied read must surface as not-found, never forbidden, so an anonymous
+// caller cannot use the status code to discover which namespaces exist.
+func TestGet_RoleMatrix(t *testing.T) {
+	callers := map[string]service.Caller{"anonymous": anon, "user": user, "admin": admin}
+	allowed := map[string]map[string]bool{
+		//  namespace read_role -> caller -> may read
+		"public": {"anonymous": true, "user": true, "admin": true},
+		"user":   {"anonymous": false, "user": true, "admin": true},
+		"admin":  {"anonymous": false, "user": false, "admin": true},
+	}
+
+	for nsRole, byCaller := range allowed {
+		for callerName, want := range byCaller {
+			t.Run(nsRole+"/"+callerName, func(t *testing.T) {
+				svc, repo, _ := newConfigSvc(t)
+				writeRole := nsRole
+				if nsRole == "public" {
+					writeRole = "user" // public is never a write role
+				}
+				seedNS(t, repo, "ns", nsRole, writeRole)
+
+				got, err := svc.Get(callers[callerName], "ns")
+				if want {
+					require.NoError(t, err)
+					assert.JSONEq(t, `{"k":1}`, string(got.Document))
+					return
+				}
+				assert.ErrorIs(t, err, service.ErrConfigNamespaceNotFound,
+					"a denied read must be indistinguishable from a missing namespace")
+			})
+		}
+	}
+}
+
+// TestGet_AnonymousMissingNamespace pins the other half of the
+// indistinguishability property: a namespace that does not exist and one the
+// anonymous caller may not read must produce the same error.
+func TestGet_AnonymousMissingNamespace(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "private", "user", "user")
+
+	_, errPrivate := svc.Get(anon, "private")
+	_, errMissing := svc.Get(anon, "nosuchns")
+	assert.ErrorIs(t, errPrivate, service.ErrConfigNamespaceNotFound)
+	assert.ErrorIs(t, errMissing, service.ErrConfigNamespaceNotFound)
+	assert.Equal(t, errMissing, errPrivate, "the two cases must be the same error value")
+}
+
+func TestCreate_PublicReadRequiresConfirmation(t *testing.T) {
+	svc, _, b := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "admin", Document: []byte(`{}`),
+	})
+	assert.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired)
+	assert.Equal(t, 0, b.count(), "a rejected publish must not trigger a backup")
+}
+
+func TestCreate_PublicReadWrongConfirmation(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "admin",
+		Document: []byte(`{}`), ConfirmPublic: "something-else",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired,
+		"the confirmation must match this namespace, so a body cannot be replayed against another")
+}
+
+func TestCreate_PublicReadWithConfirmation(t *testing.T) {
+	svc, _, b := newConfigSvc(t)
+	ns, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "admin",
+		Document: []byte(`{}`), ConfirmPublic: "tariffs",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "public", ns.ReadRole)
+	assert.Equal(t, 1, b.count())
+}
+
+func TestCreate_PublicWriteRoleAlwaysRejected(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "public",
+		Document: []byte(`{}`), ConfirmPublic: "tariffs",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigInvalidRole,
+		"nothing is anonymously writable, confirmation or not")
+}
+
+// TestCreate_PublicReadPermitsUserWrite covers the loosened invariant:
+// public is the weakest read requirement, so any write role satisfies
+// writers-are-readers.
+func TestCreate_PublicReadPermitsUserWrite(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.CreateNamespace(admin, service.CreateNamespaceInput{
+		Name: "tariffs", ReadRole: "public", WriteRole: "user",
+		Document: []byte(`{}`), ConfirmPublic: "tariffs",
+	})
+	require.NoError(t, err)
+}
+
+func TestUpdateACL_PublishRequiresConfirmation(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired)
+
+	readRole, _, gerr := repo.GetACL("tariffs")
+	require.NoError(t, gerr)
+	assert.Equal(t, "user", readRole, "a rejected publish must not have changed the ACL")
+}
+
+func TestUpdateACL_PublishWithConfirmation(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user", ConfirmPublic: "tariffs",
+	}))
+	readRole, _, err := repo.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "public", readRole)
+}
+
+// TestUpdateACL_AlreadyPublicNeedsNoConfirmation: the guard exists to make
+// the transition deliberate. A namespace that is already public is not
+// transitioning, so an unrelated write-role edit must not demand it.
+func TestUpdateACL_AlreadyPublicNeedsNoConfirmation(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "admin",
+	}))
+}
+
+// TestUpdateACL_RevokePublic: unpublishing is an ordinary ACL edit and must
+// never be gated behind a confirmation.
+func TestUpdateACL_RevokePublic(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "user", WriteRole: "user",
+	}))
+	readRole, _, err := repo.GetACL("tariffs")
+	require.NoError(t, err)
+	assert.Equal(t, "user", readRole)
+}
+
+// TestUpdateACL_RevokeToAdminNeedsWriteRaised documents the sharp edge in
+// revocation: read=admin with write=user violates writers-are-readers, so
+// locking a public namespace all the way down means raising both.
+func TestUpdateACL_RevokeToAdminNeedsWriteRaised(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "admin", WriteRole: "user",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "admin", WriteRole: "admin",
+	}))
+}
+
+func TestUpdateACL_PublicWriteRoleRejected(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "public", ConfirmPublic: "tariffs",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigInvalidRole)
+}
+
+// TestUpdateACL_ConfirmationOnMissingNamespace: not-found must win over the
+// confirmation error, so the guard cannot be used to probe for existence.
+func TestUpdateACL_ConfirmationOnMissingNamespace(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	err := svc.UpdateACL(admin, "nosuchns", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user",
+	})
+	assert.ErrorIs(t, err, service.ErrConfigNamespaceNotFound)
+}
+
+// TestListVisible_AnonymousSeesOnlyPublic documents the service contract.
+// The HTTP list route is authenticated, so this path is not reachable
+// anonymously today — the test guards the behaviour if that ever changes.
+func TestListVisible_AnonymousSeesOnlyPublic(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "open", "public", "user")
+	seedNS(t, repo, "internal", "user", "user")
+	seedNS(t, repo, "secret", "admin", "admin")
+
+	list, err := svc.ListVisible(anon)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "open", list[0].Name)
+}
+
+// TestPutDocument_AnonymousCannotWrite: the write path has no anonymous
+// entry point at the HTTP layer, but the service must refuse regardless.
+func TestPutDocument_AnonymousCannotWrite(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "open", "public", "user")
+
+	_, err := svc.PutDocument(anon, "open", []byte(`{"k":2}`))
+	assert.ErrorIs(t, err, service.ErrConfigForbidden,
+		"a public namespace is readable without a token, never writable")
+}
+
+// --- audit ---
+//
+// The service does not record audit entries itself — the store does, inside
+// the transaction that performs the mutation. What the service decides is
+// *who* is recorded, so that is what these assert. Rollback behaviour is
+// tested against real SQLite in internal/store's integration suite, where it
+// is real; a fake cannot meaningfully assert it.
+
+func TestDelete_AuditRecordsTheCaller(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "temp", "admin", "admin")
+
+	require.NoError(t, svc.Delete(admin, "temp"))
+
+	entries, err := repo.ListAudit("temp")
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "create then delete")
+	assert.Equal(t, domain.AuditActionDelete, entries[1].Action)
+	assert.Equal(t, admin.Sub, entries[1].Actor,
+		"the deleting admin must be recorded, not the namespace's last writer")
+	assert.False(t, entries[1].At.IsZero(), "the service supplies the clock")
+}
+
+func TestUpdateACL_AuditRecordsPublishTransition(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user", ConfirmPublic: "tariffs",
+	}))
+
+	entries, err := repo.ListAudit("tariffs")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	assert.Equal(t, domain.AuditActionACLChange, entries[1].Action)
+	assert.Equal(t, admin.Sub, entries[1].Actor)
+	assert.Equal(t, "user", entries[1].OldReadRole)
+	assert.Equal(t, "public", entries[1].NewReadRole,
+		"publishing is the transition the trail exists to record")
+}
+
+// TestUpdateACL_RejectedPublishLeavesNoAuditEntry: the confirmation is
+// checked before the repository is touched, so a rejected publish must not
+// appear in the history at all.
+func TestUpdateACL_RejectedPublishLeavesNoAuditEntry(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user",
+	})
+	require.ErrorIs(t, err, service.ErrConfigPublicConfirmRequired)
+
+	entries, aerr := repo.ListAudit("tariffs")
+	require.NoError(t, aerr)
+	assert.Len(t, entries, 1, "only the create")
+}
+
+// --- reading the audit trail ---
+
+func TestListAudit_AdminOnly(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	for name, caller := range map[string]service.Caller{"user": user, "anonymous": anon} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.ListAudit(caller, "tariffs")
+			assert.ErrorIs(t, err, service.ErrConfigForbidden,
+				"the trail says who changed what and confirms the namespace exists")
+		})
+	}
+
+	entries, err := svc.ListAudit(admin, "tariffs")
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+}
+
+// TestListAudit_ReadRoleDoesNotGrantIt: a public namespace is world-readable,
+// but its history is not. Read access to a document says nothing about who
+// may see who has been changing its access rules.
+func TestListAudit_ReadRoleDoesNotGrantIt(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "public", "user")
+
+	_, err := svc.ListAudit(anon, "tariffs")
+	assert.ErrorIs(t, err, service.ErrConfigForbidden)
+}
+
+// TestListAudit_SurvivesDeletion is the case the trail exists for: "what
+// happened to the namespace that is no longer here". A not-found here would
+// destroy exactly the answer being asked for.
+func TestListAudit_SurvivesDeletion(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "temp", "user", "user")
+	require.NoError(t, svc.Delete(admin, "temp"))
+
+	entries, err := svc.ListAudit(admin, "temp")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	assert.Equal(t, domain.AuditActionDelete, entries[1].Action)
+}
+
+func TestListAudit_UnknownNamespaceIsEmptyNotNotFound(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	entries, err := svc.ListAudit(admin, "nosuchns")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestListAudit_InvalidName(t *testing.T) {
+	svc, _, _ := newConfigSvc(t)
+	_, err := svc.ListAudit(admin, "BAD NAME")
+	assert.ErrorIs(t, err, service.ErrConfigInvalidName)
+}
+
+// TestUpdateACL_GuardIsDecidedAgainstStoredState is the regression test for a
+// check-then-act race.
+//
+// Deciding "is this a publish?" from a snapshot read in one round trip and
+// then writing in another leaves a window. Admin A revokes public -> user;
+// admin B, holding a stale form, re-sends read_role=public as part of an
+// unrelated write-role edit. If B's read landed before A's write, B was
+// judged not to be publishing, skipped the guard, and then republished the
+// namespace with no confirmation — the exact failure the guard exists to
+// prevent, reached by interleaving rather than by a stale field.
+//
+// The window is closed by not having one: the repository compares the
+// incoming read role against the stored row inside the write transaction. So
+// what this asserts is structural — the service must not read the ACL
+// separately first. Reintroducing that read reopens the race, and trips this.
+func TestUpdateACL_GuardIsDecidedAgainstStoredState(t *testing.T) {
+	svc, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	repo.mu.Lock()
+	repo.getACLCalls = 0
+	repo.mu.Unlock()
+
+	require.NoError(t, svc.UpdateACL(admin, "tariffs", service.UpdateACLInput{
+		ReadRole: "public", WriteRole: "user", ConfirmPublic: "tariffs",
+	}))
+
+	repo.mu.Lock()
+	calls := repo.getACLCalls
+	repo.mu.Unlock()
+	assert.Zero(t, calls,
+		"the guard must be evaluated inside the write, not against a snapshot read beforehand")
+}
+
+// TestUpdateACL_RepositoryRefusesUnconfirmedPublish: the decision now lives
+// behind the repository contract, so it is the repository that must refuse.
+func TestUpdateACL_RepositoryRefusesUnconfirmedPublish(t *testing.T) {
+	_, repo, _ := newConfigSvc(t)
+	seedNS(t, repo, "tariffs", "user", "user")
+
+	err := repo.UpdateACL("tariffs", "public", "user", "admin-1", time.Now().UTC(), false)
+	assert.ErrorIs(t, err, domain.ErrPublishNotConfirmed)
+
+	readRole, _, gerr := repo.GetACL("tariffs")
+	require.NoError(t, gerr)
+	assert.Equal(t, "user", readRole, "and must not have written")
 }

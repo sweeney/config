@@ -5,7 +5,11 @@ components:
                 application/json:
                     schema:
                         $ref: '#/components/schemas/Error'
-            description: Validation failure (invalid name, role, document, or malformed body)
+            description: |
+                Validation failure. `error` is one of `invalid_request`
+                (malformed body), `invalid_name`, `invalid_role`,
+                `invalid_document`, or `confirm_required` (a request that would
+                publish a namespace omitted or mismatched `confirm_public`).
         Conflict:
             content:
                 application/json:
@@ -61,22 +65,109 @@ components:
     schemas:
         ACLUpdateRequest:
             properties:
+                confirm_public:
+                    description: |
+                        Required only when this request *publishes* the
+                        namespace — that is, when `read_role` is `public` and
+                        the namespace was not already public. Its value must be
+                        exactly the namespace name; missing or mismatched, the
+                        request is rejected with 400 `confirm_required` and
+                        nothing is changed. It is not required when the
+                        namespace is already public, and never required when
+                        revoking public.
+
+                        Publishing is the one ACL change that cannot be undone:
+                        revoking stops future reads but cannot unfetch what has
+                        already been served. Because this endpoint rewrites both
+                        roles on every call, a stale `read_role` carried by a
+                        client form could otherwise publish a namespace as a
+                        side effect of an unrelated edit. Binding the
+                        confirmation to the namespace name also stops a captured
+                        body being replayed against a different namespace.
+                    type: string
                 read_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/ReadRole'
                 write_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/WriteRole'
             required:
                 - read_role
                 - write_role
             type: object
+        AuditEntry:
+            description: |
+                One recorded change to a namespace's existence or its access
+                rules. Document writes are not audited and document bodies are
+                never recorded: the trail answers "who changed the access
+                rules", not "what was in it".
+            properties:
+                action:
+                    description: |
+                        `create` records a namespace coming into existence,
+                        `acl_change` a change to `read_role` or `write_role`,
+                        and `delete` its removal.
+                    enum:
+                        - create
+                        - acl_change
+                        - delete
+                    type: string
+                actor:
+                    description: |
+                        The `sub` of the admin who made the change — for a
+                        `create`, whoever created the namespace.
+                    example: user_01h8xyz
+                    type: string
+                at:
+                    description: |
+                        When the change was recorded. RFC 3339, UTC, always
+                        with milliseconds.
+                    example: "2024-01-15T09:30:00.000Z"
+                    format: date-time
+                    type: string
+                new_read_role:
+                    allOf:
+                        - $ref: '#/components/schemas/ReadRole'
+                    description: |
+                        Read role after the change. Omitted when there is none:
+                        a `delete` has no resulting ACL.
+                new_write_role:
+                    allOf:
+                        - $ref: '#/components/schemas/WriteRole'
+                    description: |
+                        Write role after the change. Omitted when there is
+                        none: a `delete` has no resulting ACL.
+                old_read_role:
+                    allOf:
+                        - $ref: '#/components/schemas/ReadRole'
+                    description: |
+                        Read role before the change. Omitted when there is
+                        none: a `create` has no previous ACL.
+                old_write_role:
+                    allOf:
+                        - $ref: '#/components/schemas/WriteRole'
+                    description: |
+                        Write role before the change. Omitted when there is
+                        none: a `create` has no previous ACL.
+            required:
+                - action
+                - actor
+                - at
+            type: object
         CreateNamespaceRequest:
             properties:
+                confirm_public:
+                    description: |
+                        Required when `read_role` is `public`, and ignored
+                        otherwise. Its value must be exactly the namespace name
+                        given in `name`; missing or mismatched, the request is
+                        rejected with 400 `confirm_required` and no namespace is
+                        created.
+
+                        Publishing is the one ACL choice that cannot be undone:
+                        revoking stops future reads but cannot unfetch what has
+                        already been served. Binding the confirmation to the
+                        namespace name also stops a captured body being replayed
+                        against a different namespace.
+                    type: string
                 document:
                     allOf:
                         - $ref: '#/components/schemas/NamespaceDocument'
@@ -86,19 +177,17 @@ components:
                     pattern: ^[a-z0-9_-]{1,64}$
                     type: string
                 read_role:
+                    allOf:
+                        - $ref: '#/components/schemas/ReadRole'
                     description: |
-                        Role required to read the namespace. Must be `admin` or `user`.
-                        `write_role` must not be less restrictive than `read_role`
-                        (i.e. `write_role=user` requires `read_role=user`).
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                        Role required to read the namespace. `public` serves the
+                        document to callers with no token at all, and requires
+                        `confirm_public`. `write_role` must not be less
+                        restrictive than `read_role` (so `write_role=user`
+                        requires a `read_role` of `user` or `public`, and
+                        `read_role=admin` requires `write_role=admin`).
                 write_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/WriteRole'
             required:
                 - name
                 - read_role
@@ -135,15 +224,9 @@ components:
                     pattern: ^[a-z0-9_-]{1,64}$
                     type: string
                 read_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/ReadRole'
                 write_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/WriteRole'
             required:
                 - name
                 - read_role
@@ -161,19 +244,13 @@ components:
                     pattern: ^[a-z0-9_-]{1,64}$
                     type: string
                 read_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/ReadRole'
                 updated_at:
                     example: "2024-01-15T09:30:00.000Z"
                     format: date-time
                     type: string
                 write_role:
-                    enum:
-                        - admin
-                        - user
-                    type: string
+                    $ref: '#/components/schemas/WriteRole'
             required:
                 - name
                 - read_role
@@ -195,6 +272,27 @@ components:
                 - name
                 - changed
             type: object
+        ReadRole:
+            description: |
+                Role a caller must hold to read a namespace. Roles are ordered
+                `public` < `user` < `admin`, and a caller satisfies any role at
+                or below its own. `public` requires no token at all: the
+                document is served to anonymous callers, and stays readable
+                even while identity is unreachable.
+            enum:
+                - admin
+                - public
+                - user
+            type: string
+        WriteRole:
+            description: |
+                Role a caller must hold to write a namespace's document. Unlike
+                `read_role` this is never `public`: a namespace may be readable
+                without a token, but nothing is ever anonymously writable.
+            enum:
+                - admin
+                - user
+            type: string
     securitySchemes:
         bearerAuth:
             bearerFormat: JWT
@@ -212,15 +310,59 @@ info:
         accepted. Service tokens are treated as `user` role; they cannot create,
         delete, or update ACLs regardless of namespace settings.
 
+        Every endpoint requires a token except `GET /api/v1/config/{ns}`, which
+        is optionally authenticated — see **Anonymous reads**.
+
         ## Role model
-        Each namespace declares `read_role` and `write_role` (each `admin`
-        or `user`). Admins always satisfy any role. Users only satisfy
-        `user`. Creating, deleting, and ACL-updating a namespace are all
+        Roles form an ordered lattice: `public` < `user` < `admin`. A caller
+        satisfies a role when its own rank is at least the required rank, so
+        admins satisfy every role, users satisfy `user` and `public`, and a
+        caller with no token satisfies only `public`.
+
+        Each namespace declares a `read_role` (`admin`, `user`, or `public`)
+        and a `write_role` (`admin` or `user` only — never `public`, because a
+        namespace may be readable without a token but nothing is ever
+        anonymously writable). `write_role` must not be less restrictive than
+        `read_role`. Creating, deleting, and ACL-updating a namespace are all
         admin-only regardless of `write_role`.
+
+        Moving a namespace's `read_role` to `public` additionally requires a
+        `confirm_public` field naming the namespace: publishing is the one ACL
+        change that cannot be undone, since revoking stops future reads but
+        cannot unfetch what has already been served.
+
+        ## Anonymous reads
+        `GET /api/v1/config/{ns}` answers a request with no `Authorization`
+        header by serving the document if the namespace's `read_role` is
+        `public`, and 404 otherwise. Because a private namespace and a missing
+        one are indistinguishable, anonymous callers cannot discover which
+        namespaces exist. An `Authorization` header that is present but invalid
+        or expired is still 401 — a broken token is never silently downgraded to
+        anonymous. Listing (`GET /api/v1/config`) still requires a token and
+        never advertises public namespaces to anonymous callers.
+
+        An anonymous read is told less about the namespace than an
+        authenticated one: it gets `X-Read-Role`, which the successful read
+        already implies, but not `X-Write-Role`.
+
+        ## Caching and CORS
+        Shared caching is keyed on the caller, not just the namespace. Only a
+        genuinely anonymous read of a `public` namespace is
+        `public, max-age=60`; every other answer — an authenticated read of
+        that same namespace included — is `private, no-store`, and 404s carry
+        those headers too. See `GET /api/v1/config/{ns}`.
+
+        A `public` namespace answers `Access-Control-Allow-Origin: *` so it can
+        be fetched from a browser on any origin, and its preflight
+        (`OPTIONS /api/v1/config/{ns}`) is answered for any origin so that a
+        non-simple GET works too. Every other route, and every cross-origin
+        request carrying a token, goes through the `CORS_ORIGINS` allow-list.
 
         ## No existence leak
         Callers who lack `read_role` receive 404 (not 403) on any operation
-        against a namespace, so they cannot probe namespace existence.
+        against a namespace, so they cannot probe namespace existence. This
+        holds for anonymous callers too: everything that is not `public` reads
+        as absent.
 
         ## Backups
         Every successful mutation triggers an async R2 backup. Rapid bursts
@@ -233,9 +375,15 @@ paths:
         get:
             description: |
                 Returns all namespaces whose `read_role` is satisfied by the
-                caller. Admins see everything; users see only `read_role=user`
-                namespaces. Never returns 403 — invisible namespaces are simply
-                omitted from the list.
+                caller. Admins see everything; users see `read_role=user` and
+                `read_role=public` namespaces. Never returns 403 — invisible
+                namespaces are simply omitted from the list.
+
+                This endpoint always requires a token, including for public
+                namespaces: being able to read a published document is not the
+                same as being handed an inventory of what exists. Anonymous
+                callers get 401 here, and reach public namespaces only by
+                fetching one by name.
             responses:
                 "200":
                     content:
@@ -275,6 +423,23 @@ paths:
             tags:
                 - admin
         get:
+            description: |
+                The one optionally authenticated endpoint. With a token, the
+                caller must satisfy the namespace's `read_role` as usual. With
+                no `Authorization` header at all, the document is returned only
+                if `read_role` is `public`; every other namespace — and every
+                name that does not exist — answers 404, so an anonymous caller
+                cannot tell the two apart or enumerate what is stored.
+
+                A header that is present but invalid or expired is still 401. A
+                broken token is never silently downgraded to anonymous, because
+                a client that thinks it is signed in should be told its token
+                failed rather than quietly served the public subset.
+
+                Identity outages follow the same split. A request carrying a
+                token still gets 503 with `Retry-After` when the token cannot be
+                verified; a request carrying no token needs nothing verified, so
+                anonymous reads of public namespaces keep working throughout.
             responses:
                 "200":
                     content:
@@ -283,39 +448,178 @@ paths:
                                 $ref: '#/components/schemas/NamespaceDocument'
                     description: Stored JSON document verbatim
                     headers:
+                        Access-Control-Allow-Origin:
+                            description: |
+                                `*` when the namespace's `read_role` is
+                                `public`. A published document is meant to be
+                                fetchable from anywhere, including a browser on
+                                an origin nobody here has heard of, and
+                                withholding the header protects nothing —
+                                server-to-server callers ignore CORS entirely —
+                                it only breaks the browser half of the
+                                audience.
+
+                                Private namespaces do not get it: they keep
+                                whatever the configured origin allow-list
+                                decides.
+                            schema:
+                                type: string
+                        Access-Control-Expose-Headers:
+                            description: |
+                                `X-Read-Role, X-Write-Role`, sent alongside the
+                                wildcard origin on a `public` namespace. The
+                                CORS middleware only sends this header to
+                                allow-listed origins, so without it the role
+                                headers are unreadable from JavaScript for
+                                exactly the audience the wildcard exists for.
+                            schema:
+                                type: string
                         Cache-Control:
-                            description: Always `private, no-store`
+                            description: |
+                                `public, max-age=60` only when the namespace's
+                                `read_role` is `public` **and** the request
+                                carried no `Authorization` header. Every other
+                                200 — including an authenticated read of a
+                                public namespace — is `private, no-store`.
+
+                                Caching is keyed on the caller, not just the
+                                namespace. `Vary` would keep a token-bearing
+                                copy correct, but it would also store one copy
+                                per distinct token and mark a response served
+                                to an identified principal as shared-cacheable.
+                                Keying on the caller also confines the
+                                revoke-latency window to the anonymous copies,
+                                which are the only ones a revoke cannot reach
+                                anyway.
                             schema:
                                 type: string
                         Vary:
-                            description: Always `Authorization`
+                            description: |
+                                Always contains `Authorization`, on both public
+                                and private namespaces, because this URL answers
+                                differently with and without a token. It may
+                                also contain `Origin` when the request carried
+                                an `Origin` header.
                             schema:
                                 type: string
                         X-Read-Role:
-                            description: Role required to read this namespace (`admin` or `user`)
+                            description: |
+                                Role required to read this namespace. Always
+                                sent, to anonymous and authenticated callers
+                                alike — the read having succeeded already
+                                implies it.
                             schema:
-                                enum:
-                                    - admin
-                                    - user
-                                type: string
+                                $ref: '#/components/schemas/ReadRole'
                         X-Write-Role:
-                            description: Role required to write this namespace (`admin` or `user`)
+                            description: |
+                                Role required to write this namespace. Sent
+                                only to a caller that presented a token; an
+                                anonymous read of a public namespace gets
+                                `X-Read-Role` alone.
+
+                                That a plain `user` token suffices to write is
+                                a nudge toward where to point a stolen one, and
+                                nobody without a token can act on it.
                             schema:
-                                enum:
-                                    - admin
-                                    - user
-                                type: string
+                                $ref: '#/components/schemas/WriteRole'
                 "400":
                     $ref: '#/components/responses/BadRequest'
                 "401":
                     $ref: '#/components/responses/Unauthorized'
                 "404":
-                    $ref: '#/components/responses/NotFound'
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Error'
+                    description: |
+                        Namespace missing **or** caller lacks read role. Both
+                        cases use 404 so namespace existence is not leaked.
+                    headers:
+                        Cache-Control:
+                            description: |
+                                Always `private, no-store`. Set before the
+                                lookup so the 404 carries it too: a 404 is
+                                heuristically cacheable (RFC 9111 §4.2.2) and
+                                is the only answer an anonymous caller gets for
+                                a private namespace, so without it a shared
+                                cache could key the anonymous 404 without
+                                regard to `Authorization` and replay it to a
+                                caller who *can* read that namespace.
+                            schema:
+                                type: string
+                        Vary:
+                            description: |
+                                Contains `Authorization`, for the same reason
+                                as `Cache-Control` above.
+                            schema:
+                                type: string
                 "500":
                     $ref: '#/components/responses/InternalServerError'
                 "503":
                     $ref: '#/components/responses/ServiceUnavailable'
+            security:
+                - bearerAuth: []
+                - {}
             summary: Fetch a namespace document
+            tags:
+                - config
+        options:
+            description: |
+                CORS preflight. Answered before the router runs, so it never
+                looks up the namespace.
+
+                An `Origin` on the configured allow-list gets the usual
+                allow-list headers, as it does on every route. An origin that
+                is *not* allow-listed gets a wildcard preflight — but only on
+                this path, the single-namespace document, which is the one
+                route readable without a token:
+
+                    Access-Control-Allow-Origin: *
+                    Access-Control-Allow-Methods: GET, OPTIONS
+                    Access-Control-Allow-Headers: Content-Type
+                    Access-Control-Expose-Headers: X-Read-Role, X-Write-Role
+                    Access-Control-Max-Age: 86400
+
+                Without it the wildcard on the GET only ever covered *simple*
+                requests: a client setting `Content-Type` on the GET, or
+                sending any custom header, triggers a preflight and is
+                refused.
+
+                This is safe because a preflight says only which method and
+                headers may be attempted — the GET itself still enforces the
+                ACL, and a namespace the caller may not read still answers
+                404.
+
+                `Authorization` is deliberately **not** advertised on the
+                wildcard preflight. The wildcard exists for anonymous reads; a
+                cross-origin request carrying a token still goes through the
+                `CORS_ORIGINS` allow-list. Every other route keeps allow-list
+                behaviour unchanged.
+            operationId: preflightNamespace
+            responses:
+                "204":
+                    description: |
+                        Preflight answer. Carries CORS headers when the request
+                        had an `Origin`; the body is always empty.
+                    headers:
+                        Access-Control-Allow-Headers:
+                            description: '`Content-Type` on the wildcard preflight; `Authorization, Content-Type` for an allow-listed origin.'
+                            schema:
+                                type: string
+                        Access-Control-Allow-Methods:
+                            description: '`GET, OPTIONS` on the wildcard preflight; the full method set for an allow-listed origin.'
+                            schema:
+                                type: string
+                        Access-Control-Allow-Origin:
+                            description: '`*` for a non-allow-listed origin, or the echoed origin when it is allow-listed.'
+                            schema:
+                                type: string
+                        Access-Control-Max-Age:
+                            description: '`86400`. How long the preflight result may be reused.'
+                            schema:
+                                type: integer
+            security: []
+            summary: CORS preflight for a namespace document
             tags:
                 - config
         parameters:
@@ -402,6 +706,17 @@ paths:
             description: |
                 Changes `read_role` and `write_role`; leaves the document untouched.
                 The same `write_role` ≥ `read_role` invariant applies as on create.
+
+                Both roles are rewritten on every call — there is no partial
+                update — so a request that carries a stale `read_role` will
+                apply it. When that value is `public` and the namespace was not
+                already public, the request must also carry `confirm_public` set
+                to the namespace name, or it is rejected with 400
+                `confirm_required` and nothing changes. That guard exists
+                because publishing cannot be taken back: revoking stops future
+                reads but cannot unfetch what has already been served. Revoking
+                public, or re-saving a namespace that is already public, needs
+                no confirmation.
             requestBody:
                 content:
                     application/json:
@@ -417,19 +732,13 @@ paths:
                     description: Updated
                     headers:
                         X-Read-Role:
-                            description: New read role after the update (`admin` or `user`)
+                            description: New read role after the update
                             schema:
-                                enum:
-                                    - admin
-                                    - user
-                                type: string
+                                $ref: '#/components/schemas/ReadRole'
                         X-Write-Role:
-                            description: New write role after the update (`admin` or `user`)
+                            description: New write role after the update
                             schema:
-                                enum:
-                                    - admin
-                                    - user
-                                type: string
+                                $ref: '#/components/schemas/WriteRole'
                 "400":
                     $ref: '#/components/responses/BadRequest'
                 "401":
@@ -445,6 +754,76 @@ paths:
             summary: Update namespace ACL (admin-only)
             tags:
                 - admin
+    /api/v1/config/namespaces/{ns}/audit:
+        get:
+            description: |
+                Returns the namespace's recorded ACL and lifecycle history,
+                oldest first: its creation, every change to `read_role` or
+                `write_role`, and its deletion. Document writes are not
+                audited and document bodies are never recorded — the trail
+                answers "who changed the access rules", not "what was in it".
+
+                Admin-only, **even when the namespace is public**. A document
+                and its history are different things, and publishing the one
+                does not publish the other. Every operation this trail records
+                is admin-only already, so anything weaker here would leak more
+                through the history than through the resource itself. A user
+                token gets 403, and so does a service token
+                (client_credentials `at+jwt`), which is pinned to `user` role.
+                An anonymous request gets 401.
+
+                An unknown or already-deleted namespace answers 200 with an
+                empty array rather than 404. Audit entries outlive the
+                namespace they describe, and "what happened to the one that is
+                no longer here" is precisely what this endpoint answers — so
+                there is no 404 response for this operation.
+            operationId: getNamespaceAudit
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                items:
+                                    $ref: '#/components/schemas/AuditEntry'
+                                type: array
+                    description: |
+                        Recorded history, oldest first. An empty array when the
+                        namespace has no history, never existed, or has been
+                        deleted.
+                    headers:
+                        Cache-Control:
+                            description: |
+                                Always `private, no-store`, on public and
+                                private namespaces alike. The history of a
+                                public namespace is not itself public, so this
+                                response is never shared-cacheable and never
+                                carries a wildcard
+                                `Access-Control-Allow-Origin`.
+                            schema:
+                                type: string
+                "400":
+                    $ref: '#/components/responses/BadRequest'
+                "401":
+                    $ref: '#/components/responses/Unauthorized'
+                "403":
+                    $ref: '#/components/responses/Forbidden'
+                "500":
+                    $ref: '#/components/responses/InternalServerError'
+                "503":
+                    $ref: '#/components/responses/ServiceUnavailable'
+            summary: Read namespace ACL history (admin-only)
+            tags:
+                - admin
+        parameters:
+            - description: |
+                Namespace name. Need not currently exist — history outlives the
+                namespace it describes.
+              in: path
+              name: ns
+              required: true
+              schema:
+                pattern: ^[a-z0-9_-]{1,64}$
+                type: string
     /healthz:
         get:
             responses:

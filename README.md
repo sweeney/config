@@ -2,7 +2,9 @@
 
 Stores structured configuration as named JSON documents with per-namespace
 role ACLs. Validates JWTs against the identity service's JWKS endpoint —
-so you authenticate exactly the same way you do with identity.
+so you authenticate exactly the same way you do with identity. A namespace
+can also be marked `read_role: public`, which makes it readable with no
+token at all; nothing is ever anonymously writable.
 
 - Default port: **8282**
 - OpenAPI spec (live): `GET /openapi.json` or `GET /openapi.yaml`
@@ -46,9 +48,19 @@ When the config service receives a request it:
 **The config service issues no tokens of its own.** Every Bearer token comes
 from identity. Token expiry, refresh, and rotation are handled there.
 
-**Service tokens (client credentials) are rejected.** v1 accepts user tokens
-only. The `requireUserToken` middleware returns `403` if the token's `typ`
-header is `at+jwt` (the OAuth 2.0 service token type).
+**One endpoint is optionally authenticated.** `GET /api/v1/config/{ns}`
+accepts a request with no `Authorization` header and treats it as the
+synthetic `public` role, which satisfies namespaces at `read_role: public`
+and nothing else. A header that *is* present must still verify: a bad or
+expired token gets `401`, never a silent downgrade to an anonymous read.
+Every other endpoint requires a token.
+
+**Service tokens (client credentials) are accepted, as `user`.** A token
+whose `typ` header is `at+jwt` (the OAuth 2.0 service token type) is verified
+like any other and pinned to the `user` role, whatever the client is
+otherwise entitled to. So a service token can read and write `user`
+namespaces but can never create, delete, change an ACL, or read an audit
+trail — those are admin-only, and no client-credentials grant reaches them.
 
 ### Token lifetime
 
@@ -101,7 +113,9 @@ service does not support client credentials in v1.
 https://config.example.com
 ```
 
-All API endpoints are under `/api/v1/`. The only unauth endpoint is `/healthz`.
+All API endpoints are under `/api/v1/`. `/healthz` needs no auth, and
+`GET /api/v1/config/{ns}` serves `read_role: public` namespaces without one.
+Everything else requires a Bearer token.
 
 ### Fetching a namespace document
 
@@ -118,6 +132,7 @@ Content-Type: application/json
 X-Read-Role: user
 X-Write-Role: admin
 Cache-Control: private, no-store
+Vary: Authorization
 
 {"temperature":"home/sensors/temp","humidity":"home/sensors/humidity"}
 ```
@@ -127,8 +142,27 @@ this namespace without needing a second request:
 
 | Header | Value | Meaning |
 |---|---|---|
-| `X-Read-Role` | `admin` or `user` | Role required to read |
-| `X-Write-Role` | `admin` or `user` | Role required to write |
+| `X-Read-Role` | `admin`, `user` or `public` | Role required to read |
+| `X-Write-Role` | `admin` or `user` | Role required to write. Sent only to a caller that presented a token |
+
+`X-Write-Role` is withheld from anonymous callers: that a plain `user` token
+suffices to write is a nudge toward where to point a stolen one, and nobody
+without a token can act on it. `X-Read-Role` stays, because a successful read
+already implies it.
+
+`Cache-Control` follows the *caller*, not just the read role: `public,
+max-age=60` only for an anonymous read of a `read_role: public` namespace, so
+shared caches can serve it; `private, no-store` for everything else, an
+authenticated read of that same public namespace included. `Vary:
+Authorization` is set either way — the same URL answers differently with and
+without a token, so a cache must never serve one response to the other. Both
+headers are set before the namespace lookup, so a `404` carries them too.
+
+A `read_role: public` namespace also answers with
+`Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers:
+X-Read-Role, X-Write-Role`, so it can be fetched — and its role headers read —
+from browser JavaScript on any origin. Everything else keeps the
+`CORS_ORIGINS` allow-list. See [Client guidance](#client-guidance).
 
 ### Namespace names
 
@@ -157,7 +191,12 @@ The `version` field is the git commit short SHA baked in at build time.
 ### `GET /api/v1/config` — list visible namespaces
 
 Returns summaries of every namespace the caller's role can read. Admins see
-all namespaces; users see only those with `read_role=user`.
+all namespaces; users see those with `read_role=user` and `read_role=public`.
+
+**A token is always required here**, including for public namespaces: the
+list endpoint answers `401` without one and never enumerates public
+namespaces to an anonymous caller. Knowing a namespace's name is the price of
+reading it anonymously; nothing advertises the names.
 
 ```bash
 curl https://config.example.com/api/v1/config \
@@ -213,6 +252,61 @@ namespace has `"document": {}` stored, you get `{}`.
 
 Both cases return the same response so callers cannot probe namespace existence
 without read access.
+
+#### Anonymous reads
+
+Omit the header entirely and the request is treated as the `public` role:
+
+```bash
+curl -i https://config.example.com/api/v1/config/tariffs
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Read-Role: public
+Cache-Control: public, max-age=60
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: X-Read-Role, X-Write-Role
+Vary: Authorization
+
+{"standing":0.51,"unit":0.24}
+```
+
+Note what is missing: **no `X-Write-Role`**. An authenticated read of this same
+namespace gets it; an anonymous one does not. And **`public, max-age=60` is the
+anonymous answer only** — read the same namespace with a token and you get
+`private, no-store`, like every other authenticated read. Caching is keyed on
+the caller, not the namespace: `Vary` would keep a token-bearing copy correct,
+but it would also store one copy per distinct token and mark a response served
+to an identified principal as shared-cacheable.
+
+The wildcard origin is part of publishing: a published document is meant to be
+fetchable from anywhere, including a browser on an origin this service has
+never heard of, and withholding the header would protect nothing because
+server-to-server callers ignore CORS entirely. A public namespace is therefore
+readable from front-end JavaScript on any site, with no token and no
+`CORS_ORIGINS` entry. Private namespaces do not get it.
+`Access-Control-Expose-Headers` rides along because the CORS middleware only
+sends it to allow-listed origins — without it the role headers would be
+unreadable from JS for exactly the audience the wildcard serves.
+
+The **preflight** is answered for any origin too, but only on this path. See
+[CORS](#client-guidance).
+
+Anonymously, a private namespace and a namespace that does not exist return
+byte-identical `404`s, so the anonymous path cannot be used to enumerate what
+exists. Those `404`s carry `Cache-Control: private, no-store` and
+`Vary: Authorization` as well — a `404` is heuristically cacheable, and it is
+the only answer an anonymous caller gets for a private namespace, so without
+them a shared cache could key it without regard to `Authorization` and replay
+it to someone who *can* read that namespace. A header that is present but
+carries a bad or expired token is `401` even on a public namespace — it is
+never downgraded to an anonymous read.
+
+Because an anonymous read verifies no token, it needs no JWKS and therefore
+keeps working while identity is unreachable, when authenticated requests are
+answering `503`. See **Identity coupling** in `docs/admin.md`.
 
 ---
 
@@ -287,10 +381,37 @@ a read-modify-write. The valid combinations:
 
 | `read_role` | `write_role` | Allowed? |
 |---|---|---|
+| `public` | `user` | ✓ anyone can read, tokenless; any user writes |
+| `public` | `admin` | ✓ anyone can read, tokenless; only admins write |
 | `user` | `user` | ✓ anyone can read and write |
 | `user` | `admin` | ✓ anyone can read; only admins write |
 | `admin` | `admin` | ✓ admins only |
 | `admin` | `user` | ✗ writers can't read — rejected |
+| any | `public` | ✗ `public` is a read role only — rejected |
+
+**Publishing requires confirmation.** Setting `read_role: public` — here or on
+PATCH — requires a `confirm_public` field whose value is exactly the namespace
+name. Otherwise the call is rejected with `400 confirm_required`:
+
+```bash
+curl -X POST https://config.example.com/api/v1/config/namespaces \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name":           "tariffs",
+    "read_role":      "public",
+    "write_role":     "admin",
+    "document":       {"unit":0.24},
+    "confirm_public": "tariffs"
+  }'
+```
+
+Publishing is the one ACL change that cannot be undone — revoking stops future
+reads but cannot unfetch what has already been served — and PATCH rewrites both
+roles on every call, so without the guard a stale `public` in a saved payload
+could publish a namespace as a side effect of an unrelated edit. Binding the
+confirmation to the name also stops a body being replayed against a different
+namespace.
 
 ---
 
@@ -314,6 +435,78 @@ Content-Type: application/json
 {"name":"mqtt_topics","read_role":"admin","write_role":"admin"}
 ```
 
+Both roles are replaced on every call — this is a whole-ACL replacement, not a
+partial update. Moving `read_role` to `public` requires `confirm_public` (see
+above); a namespace that is already public does not need it again, and revoking
+never does.
+
+Watch the read ≤ write invariant when revoking. A namespace at
+`read_role: public, write_role: user` can move to `read_role: user` freely, but
+going straight to `read_role: admin` must raise `write_role` to `admin` in the
+same PATCH, or the combination is rejected with `400 invalid_role`.
+
+---
+
+### `GET /api/v1/config/namespaces/{ns}/audit` — namespace history (admin only)
+
+Returns the namespace's recorded lifecycle changes as a JSON array, oldest
+first: one entry per `create`, `acl_change` and `delete`.
+
+```bash
+curl https://config.example.com/api/v1/config/namespaces/tariffs/audit \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+[
+  {
+    "action":         "create",
+    "new_read_role":  "user",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-01T09:14:02.113Z"
+  },
+  {
+    "action":         "acl_change",
+    "old_read_role":  "user",
+    "old_write_role": "admin",
+    "new_read_role":  "public",
+    "new_write_role": "admin",
+    "actor":          "usr_01H8ZQK3M7",
+    "at":             "2026-09-04T11:02:47.906Z"
+  }
+]
+```
+
+| Field | Notes |
+|---|---|
+| `action` | `create`, `acl_change` or `delete` |
+| `old_read_role`, `old_write_role` | The ACL before the change; omitted on a `create` |
+| `new_read_role`, `new_write_role` | The ACL after it; omitted on a `delete` |
+| `actor` | Subject of the token that made the change |
+| `at` | RFC 3339 UTC, millisecond precision |
+
+**Admin-only, including when the namespace is `read_role: public`.** Publishing
+a document does not publish its history: every operation the trail records is
+admin-only already, so a weaker rule here would leak more through the history
+than through the resource. A `user` token gets `403`, so does a service token
+(pinned to the `user` role), and a request with no token gets `401` even on a
+public namespace. The response is `Cache-Control: private, no-store` and never
+carries a wildcard origin.
+
+**Document writes are not audited, and document bodies are never stored.** The
+trail answers *who changed the rules, and when* — never *what was in it*.
+
+**An unknown or deleted namespace returns `200 []`, not `404`.** Entries
+outlive the namespace they describe, and "what happened to the one that is no
+longer here" is exactly what this answers. Nothing leaks by doing so — the
+caller is already an admin, who can list every namespace anyway. A name that
+does not match `^[a-z0-9_-]{1,64}$` is still `400 invalid_name`.
+
+The admin SPA shows the same history in its namespace view. For direct
+`sqlite3` access on the host, and for questions that span namespaces, see
+**Audit trail** in `docs/admin.md`.
+
 ---
 
 ## Error reference
@@ -327,16 +520,18 @@ All errors use the same envelope:
 | HTTP | `error` | Cause |
 |---|---|---|
 | 400 | `invalid_name` | Namespace name doesn't match `^[a-z0-9_-]{1,64}$` |
-| 400 | `invalid_role` | Role must be `admin` or `user`; or ACL constraint violated |
+| 400 | `invalid_role` | `read_role` must be `admin`, `user` or `public`; `write_role` must be `admin` or `user`; or `read_role` is stronger than `write_role` |
+| 400 | `confirm_required` | Setting `read_role: public` without `confirm_public` equal to the namespace name |
 | 400 | `invalid_document` | Body isn't a JSON object, or nesting > 64 levels |
 | 400 | `invalid_request` | Malformed JSON body |
-| 401 | `unauthorized` | Missing `Authorization` header |
-| 401 | `unauthorized` | Token expired, signature invalid, or wrong issuer |
+| 401 | `unauthorized` | Missing `Authorization` header on an endpoint that requires one (everything except `GET /api/v1/config/{ns}`) |
+| 401 | `unauthorized` | Token expired, signature invalid, or wrong issuer — including on a public namespace, where a bad token is never downgraded to an anonymous read |
 | 403 | `account_disabled` | Token valid but the identity account is disabled |
-| 403 | `forbidden` | Service token presented (user token required) |
+| 403 | `forbidden` | Service token used for an admin-only operation — service tokens are pinned to the `user` role |
+| 403 | `forbidden` | Token carries a role the service does not recognise |
 | 403 | `forbidden` | Caller can read the namespace but their role doesn't satisfy `write_role` |
-| 403 | `forbidden` | Operation requires `admin` (create/delete/patch-acl) |
-| 404 | `not_found` | Namespace missing, or caller lacks `read_role` |
+| 403 | `forbidden` | Operation requires `admin` (create/delete/patch-acl, and reading a namespace's audit trail — which stays admin-only even when the namespace is `read_role: public`) |
+| 404 | `not_found` | Namespace missing, or caller lacks `read_role` — including an anonymous caller on any namespace that isn't `read_role: public` |
 | 409 | `conflict` | `POST /namespaces` with a name that already exists |
 | 413 | `document_too_large` | Stored document would exceed 64 KB |
 | 413 | `request_too_large` | Request body exceeds 128 KB |
@@ -346,31 +541,52 @@ All errors use the same envelope:
 
 ## Role model and ACL matrix
 
-Each namespace carries a `read_role` and a `write_role`, each `admin` or `user`.
-Callers carry a role claim in their JWT.
+Each namespace carries a `read_role` (`admin`, `user` or `public`) and a
+`write_role` (`admin` or `user`). Callers carry a role claim in their JWT; a
+request with no `Authorization` header is the synthetic `public` caller.
+
+Roles are ranked `public` (0) < `user` (1) < `admin` (2), and two rules cover
+every decision:
+
+- A caller may read a namespace when its rank is at least the namespace's
+  `read_role` rank.
+- A namespace's `read_role` may be no stronger than its `write_role`.
+
+A role the service does not recognise is unranked and satisfies nothing, so a
+malformed `role` claim fails closed rather than falling through to `public`.
 
 **Role resolution:**
 
-| Caller role | Satisfies `admin` requirement | Satisfies `user` requirement |
-|---|---|---|
-| `admin` | ✓ | ✓ |
-| `user` | ✗ | ✓ |
+| Caller role | Satisfies `admin` | Satisfies `user` | Satisfies `public` |
+|---|---|---|---|
+| `admin` | ✓ | ✓ | ✓ |
+| `user` | ✗ | ✓ | ✓ |
+| `public` (no token) | ✗ | ✗ | ✓ |
+
+`public` is a valid `read_role` only, never a `write_role`. A namespace may be
+readable without a token; nothing is ever anonymously writable.
 
 **Per-operation requirements:**
 
 | Operation | Required role |
 |---|---|
-| `GET /api/v1/config` | Any valid user token |
-| `GET /api/v1/config/{ns}` | Satisfies namespace `read_role` |
+| `GET /api/v1/config` | Any valid user token (never anonymous) |
+| `GET /api/v1/config/{ns}` | Satisfies namespace `read_role`; anonymous when that is `public` |
 | `PUT /api/v1/config/{ns}` | Satisfies namespace `write_role` |
 | `DELETE /api/v1/config/{ns}` | `admin` (regardless of namespace ACL) |
 | `POST /api/v1/config/namespaces` | `admin` |
 | `PATCH /api/v1/config/namespaces/{ns}` | `admin` |
+| `GET /api/v1/config/namespaces/{ns}/audit` | `admin`, even when the namespace is `read_role: public` |
 
 **No existence leak:** any operation by a caller who fails the `read_role`
 check returns **404**, never 403. Callers who satisfy `read_role` but fail
 `write_role` receive **403** (they already know the namespace exists from the
 GET).
+
+The audit endpoint sits outside that rule in both directions: a non-admin gets
+**403** rather than 404, and an admin asking about a namespace that does not
+exist gets **`200 []`** rather than 404. Neither leaks anything, because only
+admins reach it and admins can list every namespace anyway.
 
 ---
 
@@ -522,9 +738,16 @@ waiting for a 401. Identity returns `expires_in` alongside the token if you
 need to compute the deadline.
 
 **Config caching.** The config service sets `Cache-Control: private, no-store`
-on document responses. Cache on the client side with your own TTL. A reasonable
-default for most config is 1–5 minutes; shorter for anything the service needs
-to react to quickly.
+on document responses, with one exception: an *anonymous* read of a
+`read_role: public` namespace gets `public, max-age=60` so shared caches can
+serve it. Send a token to that same namespace and you are back to
+`private, no-store` — the decision follows the caller, not the namespace.
+Cache on the client side with your own TTL. A reasonable default for most
+config is 1–5 minutes; shorter for anything the service needs to react to
+quickly. Note that the 60-second TTL on a public namespace is also its revoke
+latency — un-publishing does not purge edge or browser caches. That window now
+applies only to the anonymous copies, which are the only ones a revoke could
+never have reached anyway.
 
 **404 is authoritative.** If the namespace doesn't exist or your token can't
 read it, you get 404. Don't retry 404s in a loop. Check your role and whether
@@ -541,15 +764,47 @@ re-apply configuration on every deploy.
 
 **Don't store secrets here.** Config documents are intended for non-sensitive
 structured data — MQTT topics, device names, feature flags, UI copy. Anyone
-with `read_role` access can read everything in the document.
+with `read_role` access can read everything in the document — and for a
+`read_role: public` namespace, that is anyone at all. See **Public namespaces**
+in `docs/admin.md` before publishing one.
 
 **Rate limiting.** The API allows 5 requests/second per IP (burst 20). Service
 startups that need config often boot in parallel; this budget is intentionally
 higher than identity's 30 req/min to accommodate boot bursts.
 
 **CORS.** `PUT`, `PATCH`, `DELETE`, `POST` and `GET` against `/api/v1/*` paths
-include CORS headers when the request `Origin` is in the allowed list. The SPA
-admin UI (`/`, `/static/*`) has a separate, permissive CSP.
+include CORS headers when the request `Origin` is in the allowed list. The one
+exception is a `GET` of a `read_role: public` namespace, which answers
+`Access-Control-Allow-Origin: *` regardless of the origin — a published
+document is meant to be fetchable from anywhere, and withholding the header
+would only break browser callers, never server-to-server ones. It also carries
+`Access-Control-Expose-Headers: X-Read-Role, X-Write-Role`, so those headers
+are readable from JS on any origin rather than only allow-listed ones.
+
+An `OPTIONS` **preflight** from a non-allow-listed origin is answered too, but
+only for a single-namespace path (`/api/v1/config/{ns}` — exactly one segment
+after `/api/v1/config/`):
+
+```http
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, OPTIONS
+Access-Control-Allow-Headers: Content-Type
+Access-Control-Expose-Headers: X-Read-Role, X-Write-Role
+Access-Control-Max-Age: 86400
+```
+
+Without it the wildcard covered only *simple* requests: set `Content-Type` on
+the GET, or send any custom header, and the browser preflights and is refused.
+Answering it is safe because a preflight says only which method and headers may
+be *attempted* — the GET still enforces the ACL, and a namespace you cannot
+read still answers `404`. `Authorization` is deliberately not on that list: the
+wildcard is for anonymous reads, and a cross-origin request carrying a token
+still needs a `CORS_ORIGINS` entry.
+
+So you can fetch a public namespace from front-end JavaScript on any site with
+no token and no `CORS_ORIGINS` entry; nothing else is reachable that way, and
+every other route keeps allow-list behaviour unchanged. The SPA admin UI (`/`,
+`/static/*`) has a separate, permissive CSP.
 
 ---
 

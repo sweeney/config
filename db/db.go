@@ -12,5 +12,17 @@ var migrationsFS embed.FS
 type Database = commondb.Database
 
 func Open(path string) (*Database, error) {
-	return commondb.OpenWithMigrations(path, migrationsFS, "migrations")
+	database, err := commondb.OpenWithMigrations(path, migrationsFS, "migrations")
+	if err != nil {
+		return nil, err
+	}
+
+	// Schema steps that cannot be expressed as re-runnable SQL migrations.
+	// See schema.go for why this lives here rather than in db/migrations/.
+	if err := ensurePublicReadRole(database.DB(), path); err != nil {
+		database.Close()
+		return nil, err
+	}
+
+	return database, nil
 }

@@ -20,9 +20,9 @@ are I/O boundaries that can't run in a unit test:
 | R2 backup | `fakeBackup` — implements `domain.BackupService`, counts `TriggerAsync()` calls |
 | Identity JWKS | `testIssuer` — in-process EC signer/verifier (handler tests only) |
 
-The real SQLite store is exercised only in the e2e suite. There are no
-`testify/mock` mocks — everything is a hand-written fake with real
-behaviour.
+The real SQLite store is exercised by the integration layer (layer 3) and
+again end-to-end by `scripts/e2e.sh`. There are no `testify/mock` mocks —
+everything is a hand-written fake with real behaviour.
 
 **Red/green discipline.** Write the failing test first, then make it pass.
 Do not write a test for code that already exists without first confirming
@@ -58,6 +58,12 @@ Key things tested:
 - `ErrConfigNamespaceNotFound` vs `ErrConfigForbidden` distinction: a
   namespace the caller can't read must return not-found to avoid leaking
   existence
+- The role lattice (`public` < `user` < `admin`), enumerated exhaustively
+  over every (namespace read role, caller role) pair rather than
+  spot-checked — it is the authorization primitive everything else rests on
+- The publish confirmation: required on the transition into `public`, not
+  when already public and never when revoking; bound to the namespace name;
+  not usable as an existence oracle
 
 ### 2. Handler tests (`internal/handler/`)
 
@@ -84,8 +90,67 @@ Key things tested:
 - SPA bundle mounted/unmounted based on env config
 - OpenAPI spec endpoints unauthenticated
 - Error envelope shape — no SQL or stack traces in `message`
+- The anonymous read path: `200` on a public namespace with no
+  `Authorization` header, `404` on a private one, and those two responses
+  being byte-identical to a `404` for a namespace that does not exist
+- A present-but-invalid token still `401` where anonymous would have
+  succeeded — a broken token is never silently downgraded
+- An anonymous public read succeeding while the verifier reports
+  `ErrKeysUnavailable`, and a presented token still getting `503`
+- `Cache-Control` following the read role, `Vary: Authorization` on both
+- That no route other than the single-namespace GET became anonymous
+- `Access-Control-Allow-Origin: *` on a public namespace and not on a
+  private one, and that the handler appends to `Vary` rather than replacing
+  the value the CORS middleware set upstream
+- The audit endpoint being admin-only even when the namespace is public,
+  refusing service tokens, and returning an empty array rather than
+  not-found for a namespace that never existed or has been deleted
 
-### 3. E2e tests (`scripts/e2e.sh`)
+### 3. Integration tests (`db/`, `internal/store/`)
+
+The persistence layer against a real SQLite database. Each test opens a
+fresh database with `db.Open` in a `t.TempDir()`, so there is no shared
+state between tests and nothing to clean up.
+
+Two files:
+
+| File | What it covers |
+|---|---|
+| `db/db_test.go` | `db.Open` — file creation, migrations (including idempotency on reopen), WAL mode, file permissions, foreign keys |
+| `internal/store/config_store_integration_test.go` | `ConfigStore` as a real implementation of `domain.ConfigRepository` — create/get/list/update/delete, ACL reads and writes, duplicate-name conflict, the role `CHECK` constraint rejecting invalid values, and the `config_audit` trail including its rollback with a failed mutation |
+
+This is where migration correctness is verified directly: the tests assert
+the `config_namespaces` table exists after `db.Open`, and that opening an
+already-migrated database again is a no-op.
+
+It is also the only layer where two guarantees can be tested honestly:
+
+- **The schema rebuild** in `db/schema.go` — that an old-schema database is
+  widened in place, that every column of every pre-existing row survives,
+  that the index is recreated, and that a second `Open` does not rebuild.
+- **What the rebuild does when it goes wrong**, which is the part worth
+  having: that the pre-rebuild snapshot is a restorable database carrying
+  the *old* schema and every row; that a snapshot which cannot be written
+  aborts the migration and leaves the database untouched, rather than
+  migrating with no way back; and that a fault injected mid-rebuild rolls
+  back to a wholly un-migrated database with no rows lost. The clock used to
+  name snapshots is pinned through `db/export_test.go` so the failure case
+  can occupy the path in advance.
+- **Audit atomicity** — that a mutation which fails takes its audit row with
+  it. The role `CHECK` constraint is the failure injector, so the rollback
+  is a real database rollback. A fake cannot assert this: both writes happen
+  under one mutex there, so it would only be asserting its own construction.
+  The fakes therefore model entry shape and presence only.
+
+Both files are gated behind `//go:build integration`, so they are invisible
+to a plain `go test ./...` (which reports `[no test files]` for both
+packages). Run them with the build tag:
+
+```bash
+go test -race -count=1 -tags=integration ./...
+```
+
+### 4. E2e tests (`scripts/e2e.sh`)
 
 Runs against live servers. Requires both identity and config running. Gets
 admin and user tokens from identity, then exercises every config endpoint.
@@ -107,9 +172,9 @@ DB_PATH=/tmp/e2e-config.db PORT=8282 IDENTITY_ENV=development \
 
 The e2e suite covers the full integration path including real JWKS
 verification — the config server fetches identity's public key and
-validates every token cryptographically. This is the only layer that
-exercises `internal/store/` (real SQLite) and `internal/config/` (env
-loading).
+validates every token cryptographically. It is the only layer that
+exercises `internal/config/` (env loading) and the wiring in
+`cmd/server/`; the store itself is covered more cheaply by layer 3.
 
 ## Running locally
 
@@ -122,6 +187,9 @@ go test -race -count=1 ./...
 
 # Specific package
 go test -v ./internal/handler/...
+
+# Integration tests (real SQLite — build-tagged, not run by default)
+go test -race -count=1 -tags=integration ./...
 
 # E2e (requires running servers — see above)
 ./scripts/e2e.sh
@@ -139,6 +207,18 @@ every push and PR.
 3. Unit + handler tests with `-race -count=1 -coverprofile`
 4. Test result summary posted to the GitHub Actions step summary (pass/fail counts, coverage by package, slowest tests)
 5. HTML coverage report uploaded as an artifact (retained 30 days)
+
+### `integration` job
+
+Runs the build-tagged integration layer as its own check:
+
+```bash
+go test -race -count=1 -tags=integration ./...
+```
+
+It repeats the `test` job's checkout / `setup-go` / `go mod verify` setup
+but skips the coverage and step-summary machinery — it is a straight
+pass/fail signal that the real SQLite store and migrations still work.
 
 ### `build` job
 
@@ -186,7 +266,6 @@ duplication beats a premature abstraction.
 |---|---|
 | JWT signature verification | `common/auth` (identity repo) |
 | JWKS fetch / key rotation | `common/auth` (identity repo) |
-| SQLite migration correctness | Implicitly by e2e (first-run migration) |
 | R2 backup upload | `common/backup` (identity repo) |
 | Rate limiting | `common/ratelimit` (identity repo) |
 
@@ -201,7 +280,12 @@ For a new endpoint or behaviour:
 2. Run it — confirm it fails for the right reason
 3. Implement the behaviour
 4. Add a handler-layer test (`internal/handler/router_test.go`)
-5. Add an e2e check to `scripts/e2e.sh` if it touches auth wiring or
+5. Add integration coverage if the change touches `internal/store/` or
+   `db/` — a new query, a column, or a migration belongs in
+   `internal/store/config_store_integration_test.go` or `db/db_test.go`.
+   Remember the `//go:build integration` tag and run
+   `go test -race -count=1 -tags=integration ./...`
+6. Add an e2e check to `scripts/e2e.sh` if it touches auth wiring or
    end-to-end data flow (not just for completeness — e2e is slow to run
    against a live stack)
 

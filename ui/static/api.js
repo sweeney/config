@@ -38,11 +38,18 @@ window.ConfigAPI = (function () {
       headers: { 'Content-Type': 'application/json' },
       body:    typeof doc === 'string' ? doc : JSON.stringify(doc),
     })),
+    // input: { name, read_role, write_role, document, confirm_public? }.
+    // Serialised whole, so `confirm_public` — required when read_role is
+    // `public` — rides along without special handling here. Without it the
+    // API answers 400 {"error":"confirm_required"}, surfaced as err.body.error.
     create:   async (input)        => check(await Auth.authedFetch(api('/namespaces'), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(input),
     })),
+    // acl: { read_role, write_role, confirm_public? }. Same as create: the
+    // confirmation is just another body field, required only when this call
+    // moves read_role to `public`.
     updateACL: async (ns, acl) => check(await Auth.authedFetch(api('/namespaces/' + encodeURIComponent(ns)), {
       method:  'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -51,5 +58,14 @@ window.ConfigAPI = (function () {
     delete:   async (ns) => check(await Auth.authedFetch(api('/' + encodeURIComponent(ns)), {
       method: 'DELETE',
     })),
+    // Admin-only, whatever the namespace's own ACL says — a public namespace
+    // does not have a public history. Non-admins get 403 (401 anonymously),
+    // surfaced here as err.status like any other failure.
+    //
+    // Entries come back oldest-first, and a namespace that never existed (or
+    // has since been deleted) answers `200 []` rather than 404: an empty array
+    // means "nothing recorded", never "no such namespace".
+    audit:    async (ns) => check(await Auth.authedFetch(
+      api('/namespaces/' + encodeURIComponent(ns) + '/audit'))),
   };
 })();

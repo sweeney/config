@@ -84,6 +84,22 @@ type CreateNamespaceInput struct {
 	ReadRole  string
 	WriteRole string
 	Document  []byte
+
+	// ConfirmPublic must equal Name when ReadRole is public. See
+	// ErrConfigPublicConfirmRequired.
+	ConfirmPublic string
+}
+
+// UpdateACLInput carries a replacement ACL. Both roles are always required:
+// a PATCH rewrites the pair, it does not merge into it.
+type UpdateACLInput struct {
+	ReadRole  string
+	WriteRole string
+
+	// ConfirmPublic must equal the namespace name when this update moves
+	// ReadRole to public. It is not required when the namespace is already
+	// public, nor when revoking. See ErrConfigPublicConfirmRequired.
+	ConfirmPublic string
 }
 
 func (s *ConfigService) CreateNamespace(caller Caller, in CreateNamespaceInput) (*domain.ConfigNamespace, error) {
@@ -93,11 +109,14 @@ func (s *ConfigService) CreateNamespace(caller Caller, in CreateNamespaceInput) 
 	if !configNameRE.MatchString(in.Name) {
 		return nil, ErrConfigInvalidName
 	}
-	if !domain.IsValidConfigRole(in.ReadRole) || !domain.IsValidConfigRole(in.WriteRole) {
+	if !domain.IsValidReadRole(in.ReadRole) || !domain.IsValidWriteRole(in.WriteRole) {
 		return nil, ErrConfigInvalidRole
 	}
 	if !writersAreReaders(in.ReadRole, in.WriteRole) {
 		return nil, ErrConfigInvalidRole
+	}
+	if in.ReadRole == domain.ConfigRolePublic && in.ConfirmPublic != in.Name {
+		return nil, ErrConfigPublicConfirmRequired
 	}
 	normalizedDoc, err := validateDocument(in.Document)
 	if err != nil {
@@ -171,27 +190,70 @@ func (s *ConfigService) PutDocument(caller Caller, name string, document []byte)
 	return true, nil
 }
 
-func (s *ConfigService) UpdateACL(caller Caller, name, readRole, writeRole string) error {
+// UpdateACL replaces a namespace's ACL. Publishing — moving read access to
+// public — additionally requires in.ConfirmPublic to echo the namespace
+// name; see ErrConfigPublicConfirmRequired.
+func (s *ConfigService) UpdateACL(caller Caller, name string, in UpdateACLInput) error {
 	if caller.Role != domain.ConfigRoleAdmin {
 		return ErrConfigForbidden
 	}
 	if !configNameRE.MatchString(name) {
 		return ErrConfigInvalidName
 	}
-	if !domain.IsValidConfigRole(readRole) || !domain.IsValidConfigRole(writeRole) {
+	if !domain.IsValidReadRole(in.ReadRole) || !domain.IsValidWriteRole(in.WriteRole) {
 		return ErrConfigInvalidRole
 	}
-	if !writersAreReaders(readRole, writeRole) {
+	if !writersAreReaders(in.ReadRole, in.WriteRole) {
 		return ErrConfigInvalidRole
 	}
-	if err := s.repo.UpdateACL(name, readRole, writeRole, caller.Sub, s.now()); err != nil {
+
+	// The publish guard is evaluated by the repository, inside the same
+	// transaction as the write and against the row being overwritten.
+	// Deciding it here from a separately-read snapshot left a window: a
+	// concurrent revoke between the read and the write made a genuine publish
+	// look like an edit to an already-public namespace, and the confirmation
+	// was skipped on a request that did in fact publish.
+	//
+	// Not-found still beats the confirmation error, because the repository
+	// reads the row before it judges the transition — so the guard is not an
+	// existence oracle. It also costs one query fewer than it used to.
+	if err := s.repo.UpdateACL(
+		name, in.ReadRole, in.WriteRole, caller.Sub, s.now(), in.ConfirmPublic == name,
+	); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return ErrConfigNamespaceNotFound
+		}
+		if errors.Is(err, domain.ErrPublishNotConfirmed) {
+			return ErrConfigPublicConfirmRequired
 		}
 		return err
 	}
 	s.fireBackup()
 	return nil
+}
+
+// ListAudit returns a namespace's recorded history, oldest first.
+//
+// Admin-only, and deliberately not gated by the namespace's read role: the
+// document and its history are different things. A public namespace is
+// world-readable, but who has been changing its access rules, and when it
+// became public, is operational detail — and every operation the trail
+// records is admin-only already, so anything weaker would leak more through
+// the history than through the resource.
+//
+// An unknown namespace returns an empty history rather than not-found.
+// Entries outlive the namespace they describe, so "what happened to the one
+// that is no longer here" is precisely the question this answers, and a
+// not-found would destroy it. Nothing leaks by doing so — the caller is
+// already an admin, who may list every namespace anyway.
+func (s *ConfigService) ListAudit(caller Caller, name string) ([]domain.AuditEntry, error) {
+	if caller.Role != domain.ConfigRoleAdmin {
+		return nil, ErrConfigForbidden
+	}
+	if !configNameRE.MatchString(name) {
+		return nil, ErrConfigInvalidName
+	}
+	return s.repo.ListAudit(name)
 }
 
 func (s *ConfigService) Delete(caller Caller, name string) error {
@@ -201,7 +263,7 @@ func (s *ConfigService) Delete(caller Caller, name string) error {
 	if !configNameRE.MatchString(name) {
 		return ErrConfigInvalidName
 	}
-	if err := s.repo.Delete(name); err != nil {
+	if err := s.repo.Delete(name, caller.Sub, s.now()); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return ErrConfigNamespaceNotFound
 		}
@@ -263,19 +325,33 @@ func enforceJSONDepth(doc []byte, maxDepth int) error {
 	}
 }
 
+// roleAllows reports whether a caller holding callerRole satisfies a
+// requirement of required. Both must be known roles: an unrecognised role
+// never satisfies anything, so a malformed claim fails closed.
 func roleAllows(required, callerRole string) bool {
-	if callerRole == domain.ConfigRoleAdmin {
-		return true
+	callerRank, ok := domain.RoleRank(callerRole)
+	if !ok {
+		return false
 	}
-	if required == domain.ConfigRoleUser && callerRole == domain.ConfigRoleUser {
-		return true
+	requiredRank, ok := domain.RoleRank(required)
+	if !ok {
+		return false
 	}
-	return false
+	return callerRank >= requiredRank
 }
 
+// writersAreReaders enforces that every writer of a namespace can also read
+// it — the read bar must be no higher than the write bar. Without it, a
+// write-but-not-read role could use PUT's byte-equality no-op detection as a
+// read oracle for a document it is not allowed to see.
 func writersAreReaders(readRole, writeRole string) bool {
-	if writeRole == domain.ConfigRoleAdmin {
-		return true
+	readRank, ok := domain.RoleRank(readRole)
+	if !ok {
+		return false
 	}
-	return readRole == domain.ConfigRoleUser
+	writeRank, ok := domain.RoleRank(writeRole)
+	if !ok {
+		return false
+	}
+	return readRank <= writeRank
 }

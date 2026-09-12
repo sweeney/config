@@ -17,6 +17,12 @@
   const LOGOUT_BTN = document.getElementById('logout-btn');
   const TOAST      = document.getElementById('toast');
 
+  // The signed-in user's identity record (identity's /api/v1/auth/me), fetched
+  // once during bootstrap — before the first route() — so views can gate on
+  // role without a call of their own. Stays null when that lookup failed;
+  // callers must treat null as "unknown", not as "not an admin".
+  let ME = null;
+
   // ── helpers ────────────────────────────────────────────────────────
   function el(tag, attrs, children) {
     const e = document.createElement(tag);
@@ -51,8 +57,39 @@
     return d.toLocaleString();
   }
 
+  // fmtTime restates a timestamp in the viewer's zone, which is right for
+  // "updated <when>" on the list but wrong for an audit trail that may be read
+  // from another continent while comparing against server logs. Audit rows get
+  // this instead: the wire value, stamped UTC, with the local rendering parked
+  // on a title attribute for anyone who wants it.
+  function fmtUTC(s) {
+    if (!s) return '';
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) +
+      ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' UTC';
+  }
+
   function badge(role) {
     return el('span', { class: 'badge ' + role, text: role });
+  }
+  // Same badge, but tolerant of a role the API omitted (a `create` carries no
+  // old_* roles, a `delete` no new_* ones) so a malformed row renders a dash
+  // instead of the string "undefined" in a role-coloured pill.
+  function roleBadge(role) {
+    return role ? badge(role) : el('span', { class: 'badge', text: '—' });
+  }
+
+  // The API's own `message` is the right thing to show for most failures.
+  // `confirm_required` is the exception: it is not really an error about the
+  // data, it is the server asking for a step this form can point at.
+  function errText(err) {
+    const body = err && err.body;
+    if (body && body.error === 'confirm_required') {
+      return 'Publishing needs confirmation: type the namespace name into the confirmation box before saving.';
+    }
+    return err.message;
   }
 
   // ── views ──────────────────────────────────────────────────────────
@@ -105,14 +142,260 @@
     return root;
   }
 
-  function roleSelect(name, value) {
+  // Roles are an ordered lattice: public < user < admin. `public` is a read
+  // role only — a namespace may be readable without a token, but nothing is
+  // ever anonymously writable, so it must never appear in the write list.
+  const READ_ROLES  = ['admin', 'user', 'public'];
+  const WRITE_ROLES = ['admin', 'user'];
+
+  function roleSelect(name, value, roles) {
     const sel = el('select', { name: name });
-    for (const role of ['admin', 'user']) {
+    for (const role of roles) {
       const opt = el('option', { value: role, text: role });
       if (value === role) opt.selected = true;
       sel.appendChild(opt);
     }
     return sel;
+  }
+  function readRoleSelect(name, value)  { return roleSelect(name, value, READ_ROLES); }
+  function writeRoleSelect(name, value) { return roleSelect(name, value, WRITE_ROLES); }
+
+  // ── publish confirmation ───────────────────────────────────────────
+  //
+  // A read role of `public` means the document can be fetched with no
+  // Authorization header at all, and that is not reversible in any way that
+  // matters: revoking stops future reads, but whatever has already been
+  // fetched is out. So the API refuses to publish unless the request body
+  // carries `confirm_public` equal to the namespace name, and this builds the
+  // matching UI — a warning, plus a box the operator types the name into.
+  //
+  //   ┌────────────────────────────────────────────────────────────────┐
+  //   │ DO NOT PRE-FILL THIS INPUT.                                    │
+  //   │ Not with the namespace name, not from the name field, not on   │
+  //   │ focus, not on select-public, not "as a convenience". The only  │
+  //   │ thing this guard is worth is the human keystrokes. An          │
+  //   │ auto-filled box confirms nothing: it turns the server check    │
+  //   │ into a formality that an unrelated edit satisfies by accident, │
+  //   │ which is precisely the accident the guard exists to stop.      │
+  //   └────────────────────────────────────────────────────────────────┘
+  //
+  // opts:
+  //   readSel     — the read-role <select> to watch
+  //   submitBtn   — button to hold disabled until the typed name matches
+  //   currentRole — the namespace's stored read role, or null when creating
+  //   nameFn      — returns the namespace name as currently entered/known
+  function publishGuard(opts) {
+    let currentRole = opts.currentRole;
+
+    const input = el('input', {
+      type: 'text',
+      // Deliberately hostile to anything that would fill this in on the
+      // operator's behalf — browser autofill and password managers included.
+      autocomplete:   'off',
+      autocapitalize: 'off',
+      autocorrect:    'off',
+      spellcheck:     'false',
+      placeholder:    'type the namespace name',
+    });
+    const hint = el('div', { class: 'form-help' });
+    const box  = el('div', { class: 'publish-confirm', hidden: true }, [
+      el('h3', { text: 'This will publish the namespace' }),
+      el('p', { text: 'A read role of “public” makes this document readable by anyone who knows the URL, with no token at all. Revoking the role later stops new reads — it does not un-publish copies that have already been fetched.' }),
+      el('label', { text: 'Type the namespace name to confirm' }),
+      input,
+      hint,
+    ]);
+
+    // True only for the *transition* into public. An already-public namespace
+    // edited for some other reason is not publishing, and neither is revoking.
+    function publishing() {
+      return opts.readSel.value === 'public' && currentRole !== 'public';
+    }
+    function satisfied() {
+      if (!publishing()) return true;
+      const want = opts.nameFn();
+      return want !== '' && input.value === want;
+    }
+    function sync() {
+      const on = publishing();
+      box.hidden = !on;
+      // Drop anything typed once the box is hidden, so a confirmation can
+      // never sit out of sight and re-arm itself if the role flips back.
+      if (!on) input.value = '';
+      const want = on ? opts.nameFn() : '';
+      hint.textContent = !on          ? ''
+        : want === ''                 ? 'Enter a namespace name above first.'
+        : input.value === want        ? ''
+        :                               'Must match “' + want + '” exactly.';
+      opts.submitBtn.disabled = !satisfied();
+    }
+
+    opts.readSel.addEventListener('change', sync);
+    input.addEventListener('input', sync);
+    sync();
+
+    return {
+      box:        box,
+      sync:       sync,
+      publishing: publishing,
+      // The raw typed value. Never substitute nameFn() here — see above.
+      value:      () => input.value,
+      // Call after a successful save: the role we just sent is now the stored
+      // one, so a follow-up edit must not re-ask for the same confirmation.
+      commit:     () => { currentRole = opts.readSel.value; },
+    };
+  }
+
+  // ── audit history ──────────────────────────────────────────────────
+  //
+  // GET /namespaces/{ns}/audit is admin-only and answers `no-store`, so there
+  // is nothing to cache and nothing most visits want: #/edit/{ns} is opened to
+  // change a document far more often than to read its ACL history. The section
+  // therefore renders collapsed and fetches on first expand, keeping what it
+  // got until an ACL update in this view invalidates it.
+
+  // True only for the *transition* into public — the same distinction
+  // publishGuard makes, and for the same reason. A namespace that was already
+  // public before the change was not published by it, and a revoke is not a
+  // publish. `create` has no old_read_role, so creating straight into public
+  // counts; `delete` has no new_read_role, so it never does.
+  function publishesRead(item) {
+    return item.new_read_role === 'public' && item.old_read_role !== 'public';
+  }
+
+  function roleChange(label, from, to) {
+    return el('span', { class: 'audit-change' }, [
+      el('span', { class: 'audit-field', text: label }),
+      roleBadge(from),
+      el('span', { class: 'audit-arrow', text: '→' }),
+      roleBadge(to),
+    ]);
+  }
+
+  // A row's description, as nodes: what changed, in the operator's words
+  // rather than the wire's field names.
+  function auditWhat(item) {
+    if (item.action === 'create') {
+      return [
+        el('span', { class: 'audit-verb', text: 'created with' }),
+        el('span', { class: 'audit-change' }, [
+          el('span', { class: 'audit-field', text: 'read' }), roleBadge(item.new_read_role),
+        ]),
+        el('span', { class: 'audit-change' }, [
+          el('span', { class: 'audit-field', text: 'write' }), roleBadge(item.new_write_role),
+        ]),
+      ];
+    }
+    if (item.action === 'delete') {
+      return [el('span', { class: 'audit-verb', text: 'deleted' })];
+    }
+    if (item.action === 'acl_change') {
+      const parts = [];
+      // Only the roles that actually moved. A PATCH always sends both roles,
+      // so a write-only edit records an unchanged read role too; listing it
+      // would bury the one line that matters under a restatement.
+      if (item.old_read_role  !== item.new_read_role)  parts.push(roleChange('read role',  item.old_read_role,  item.new_read_role));
+      if (item.old_write_role !== item.new_write_role) parts.push(roleChange('write role', item.old_write_role, item.new_write_role));
+      if (parts.length) return parts;
+      return [el('span', { class: 'audit-verb', text: 'access control re-saved, no role changed' })];
+    }
+    // An action this build does not know about — a newer server, most likely.
+    // Show it rather than dropping the row on the floor.
+    return [el('span', { class: 'audit-verb', text: String(item.action || 'changed') })];
+  }
+
+  function auditRow(item) {
+    const published = publishesRead(item);
+    const what = el('div', { class: 'audit-what' }, auditWhat(item));
+    if (published) what.insertBefore(el('span', { class: 'badge public', text: 'published' }), what.firstChild);
+    const meta = el('div', { class: 'audit-meta' }, [
+      el('code', { class: 'audit-actor', text: item.actor || 'unknown actor' }),
+      el('span', { text: '·' }),
+      el('time', {
+        class:    'audit-at',
+        datetime: item.at || false,
+        title:    item.at ? fmtTime(item.at) + ' local time' : false,
+        text:     fmtUTC(item.at) || 'time unknown',
+      }),
+    ]);
+    return el('li', { class: published ? 'audit-entry published' : 'audit-entry' }, [what, meta]);
+  }
+
+  // Returns null when the section should not exist at all, otherwise
+  // { el, invalidate }.
+  function auditSection(name) {
+    // A known non-admin gets no panel rather than a panel that always 403s:
+    // the endpoint is admin-only whatever the namespace's ACL says, so for a
+    // user-role operator there is no state in which it could ever fill in.
+    // An *unknown* role still gets the panel — /auth/me failing on a network
+    // blip must not quietly hide an admin's audit trail — and falls back to
+    // the 403 note in load() if it turns out not to be an admin after all.
+    if (ME && ME.role !== 'admin') return null;
+
+    const toggle = el('button', { type: 'button', class: 'btn-secondary', text: 'Show history' });
+    const body   = el('div', { class: 'audit-body', hidden: true });
+    const wrap   = el('div', { class: 'card audit' }, [
+      el('div', { class: 'button-row' }, [
+        toggle,
+        el('span', { class: 'form-help', text: 'Who changed this namespace\u2019s access control, and when.' }),
+      ]),
+      body,
+    ]);
+
+    let open = false, loaded = false, loading = false;
+
+    function render(items) {
+      clear(body);
+      if (!items || items.length === 0) {
+        // Also what an unknown or already-deleted namespace looks like: the
+        // API answers `200 []` for those rather than 404.
+        body.appendChild(el('div', { class: 'empty', text: 'No recorded changes for this namespace.' }));
+        return;
+      }
+      body.appendChild(el('p', { class: 'form-help', text: 'Newest first. Times are UTC — hover a timestamp for local time.' }));
+      const ul = el('ul', { class: 'audit-list' });
+      // The API returns oldest-first; an operator opening this is asking
+      // "what happened to this namespace lately", so it reads newest-first.
+      for (let i = items.length - 1; i >= 0; i--) ul.appendChild(auditRow(items[i]));
+      body.appendChild(ul);
+    }
+
+    async function load() {
+      if (loading) return;
+      loading = true;
+      clear(body);
+      body.appendChild(el('div', { class: 'loading', text: 'Loading history…' }));
+      try {
+        const items = await ConfigAPI.audit(name);
+        loaded = true;
+        render(items);
+      } catch (err) {
+        // Deliberately not marked loaded: a 403 here means the role guess
+        // above was wrong, anything else is transient, and both are worth
+        // retrying if the operator collapses and re-expands.
+        clear(body);
+        body.appendChild(el('div', { class: 'empty', text: err.status === 403
+          ? 'History is visible to admins only.'
+          : 'Failed to load history: ' + err.message }));
+      } finally {
+        loading = false;
+      }
+    }
+
+    toggle.addEventListener('click', () => {
+      open = !open;
+      body.hidden = !open;
+      toggle.textContent = open ? 'Hide history' : 'Show history';
+      if (open && !loaded) load();
+    });
+
+    return {
+      el: wrap,
+      // Called after this view changes the ACL: the cached list is now a
+      // change behind. Refetch if the operator is looking, otherwise just
+      // drop it so the next expand goes back to the server.
+      invalidate: () => { loaded = false; if (open) load(); },
+    };
   }
 
   function viewNew() {
@@ -121,8 +404,8 @@
     root.appendChild(el('p', { class: 'form-help', text: 'Names must match ^[a-z0-9_-]{1,64}$. Documents must be JSON objects (≤ 64KB).' }));
 
     const nameInp = el('input', { type: 'text', name: 'name', placeholder: 'e.g. mqtt_topics', autofocus: true });
-    const readSel = roleSelect('read_role', 'admin');
-    const writeSel = roleSelect('write_role', 'admin');
+    const readSel = readRoleSelect('read_role', 'admin');
+    const writeSel = writeRoleSelect('write_role', 'admin');
 
     const editorHost = el('div');
     const editor = JSONEditor.create(editorHost, { value: '{}\n' });
@@ -130,6 +413,18 @@
     const errBox = el('div', { class: 'form-error' });
     const submitBtn = el('button', { type: 'submit', text: 'Create' });
     const cancelBtn = el('a', { class: 'btn btn-secondary', href: '#/', text: 'Cancel' });
+
+    // A namespace being created has no prior read role, so choosing `public`
+    // here is always a publish and always needs confirming.
+    const guard = publishGuard({
+      readSel:     readSel,
+      submitBtn:   submitBtn,
+      currentRole: null,
+      nameFn:      () => nameInp.value.trim(),
+    });
+    // The confirmation is bound to the name, and the name is still being
+    // typed: renaming after confirming invalidates the confirmation.
+    nameInp.addEventListener('input', guard.sync);
 
     const form = el('form', {
       on: { submit: async (e) => {
@@ -140,18 +435,25 @@
         catch (err) { errBox.textContent = err.message; return; }
         submitBtn.disabled = true;
         try {
-          await ConfigAPI.create({
+          const body = {
             name:       nameInp.value.trim(),
             read_role:  readSel.value,
             write_role: writeSel.value,
             document:   parsed.obj,
-          });
+          };
+          // Sent only for a real transition into public, and only ever the
+          // value the operator typed. The API answers `confirm_required` if
+          // it is missing or does not echo the namespace name.
+          if (guard.publishing()) body.confirm_public = guard.value();
+          await ConfigAPI.create(body);
           toast('Namespace created');
           location.hash = '#/edit/' + encodeURIComponent(nameInp.value.trim());
         } catch (err) {
-          errBox.textContent = err.message;
+          errBox.textContent = errText(err);
         } finally {
-          submitBtn.disabled = false;
+          // Re-enables only if the form is still in a submittable state —
+          // an unconfirmed publish stays disabled.
+          guard.sync();
         }
       } },
     });
@@ -159,6 +461,7 @@
     form.appendChild(nameInp);
     form.appendChild(el('label', { text: 'Read role' }));
     form.appendChild(readSel);
+    form.appendChild(guard.box);
     form.appendChild(el('label', { text: 'Write role (must satisfy read role)' }));
     form.appendChild(writeSel);
     form.appendChild(el('label', { text: 'Initial document' }));
@@ -230,30 +533,55 @@
 
     // ─ ACL ─
     root.appendChild(el('h2', { text: 'Access control' }));
-    const aclReadSel  = roleSelect('read_role',  readRole  || 'admin');
-    const aclWriteSel = roleSelect('write_role', writeRole || 'admin');
+    const aclReadSel  = readRoleSelect('read_role',  readRole  || 'admin');
+    const aclWriteSel = writeRoleSelect('write_role', writeRole || 'admin');
     const aclErr = el('div', { class: 'form-error' });
     const aclBtn = el('button', { type: 'button', text: 'Update ACL' });
+    // The PATCH always sends both roles, so changing only the write role
+    // re-sends read_role unchanged. Passing the namespace's stored read role
+    // as currentRole is what keeps that quiet: the guard fires on the
+    // transition into public, not on the value being public, so neither a
+    // write-only edit of an already-public namespace nor a revoke asks for
+    // confirmation.
+    const aclGuard = publishGuard({
+      readSel:     aclReadSel,
+      submitBtn:   aclBtn,
+      currentRole: readRole,
+      nameFn:      () => name,
+    });
     aclBtn.addEventListener('click', async () => {
       aclErr.textContent = '';
       aclBtn.disabled = true;
       try {
-        await ConfigAPI.updateACL(name, { read_role: aclReadSel.value, write_role: aclWriteSel.value });
+        const acl = { read_role: aclReadSel.value, write_role: aclWriteSel.value };
+        if (aclGuard.publishing()) acl.confirm_public = aclGuard.value();
+        await ConfigAPI.updateACL(name, acl);
+        aclGuard.commit();
+        if (audit) audit.invalidate();
         toast('ACL updated');
       } catch (err) {
-        aclErr.textContent = err.message;
-        toast('ACL update failed: ' + err.message, 'error');
+        aclErr.textContent = errText(err);
+        toast('ACL update failed: ' + errText(err), 'error');
       } finally {
-        aclBtn.disabled = false;
+        aclGuard.sync();
       }
     });
     const aclGrid = el('div', { class: 'card' }, [
       el('label', { text: 'Read role' }), aclReadSel,
+      aclGuard.box,
       el('label', { text: 'Write role (must satisfy read role)' }), aclWriteSel,
       el('div', { class: 'button-row' }, [aclBtn]),
       aclErr,
     ]);
     root.appendChild(aclGrid);
+
+    // ─ History ─
+    // Null for a non-admin, who cannot read the audit endpoint at all.
+    const audit = auditSection(name);
+    if (audit) {
+      root.appendChild(el('h2', { text: 'History' }));
+      root.appendChild(audit.el);
+    }
 
     // ─ Delete ─
     root.appendChild(el('h2', { text: 'Danger zone' }));
@@ -341,6 +669,7 @@
         const meResp = await Auth.authedFetch(cfg.identity_url + '/api/v1/auth/me');
         if (meResp.ok) {
           const me = await meResp.json();
+          ME = me;
           USER_INFO.textContent = me.username + ' (' + me.role + ')';
         }
       } catch (e) {

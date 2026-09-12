@@ -10,4 +10,14 @@ var (
 	ErrConfigInvalidRole       = errors.New("invalid config role")
 	ErrConfigInvalidDocument   = errors.New("config document must be a JSON object")
 	ErrConfigDocumentTooLarge  = errors.New("config document exceeds size limit")
+
+	// ErrConfigPublicConfirmRequired is returned when a namespace is being
+	// made publicly readable without the caller echoing its name back. The
+	// guard exists because publishing is the one ACL change whose effect
+	// cannot be taken back: revoking the role stops future reads, but
+	// anything already fetched is gone. Binding the confirmation to the
+	// namespace name means a request body cannot be replayed against a
+	// different namespace, and a stray dropdown cannot publish one as a
+	// side effect of an unrelated edit.
+	ErrConfigPublicConfirmRequired = errors.New("publishing a namespace requires confirmation")
 )
