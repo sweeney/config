@@ -100,12 +100,16 @@ func (r *fakeConfigRepo) Create(ns *domain.ConfigNamespace, actor domain.Actor) 
 	return nil
 }
 
-func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) error {
+func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, actor domain.Actor, at time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns, ok := r.data[name]
 	if !ok {
-		return domain.ErrNotFound
+		return false, domain.ErrNotFound
+	}
+	// Same comparison the real store makes, in the same place.
+	if string(ns.Document) == string(document) {
+		return false, nil
 	}
 	r.audit.Record(domain.AuditEntry{
 		Namespace:     name,
@@ -118,7 +122,7 @@ func (r *fakeConfigRepo) UpdateDocument(name string, document []byte, actor doma
 	ns.UpdatedBy = actor.Sub
 	ns.UpdatedByUsername = actor.Username
 	ns.UpdatedAt = at
-	return nil
+	return true, nil
 }
 
 func (r *fakeConfigRepo) UpdateACL(name, readRole, writeRole string, actor domain.Actor, at time.Time, publishConfirmed bool) error {
