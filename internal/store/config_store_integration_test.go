@@ -512,7 +512,9 @@ func TestConfigStore_RecordsWhoLastWroteTheDocument(t *testing.T) {
 }
 
 // TestConfigStore_List_CarriesWhoLastWrote: the list is where this is
-// surfaced, so the summary has to carry it.
+// surfaced, so the summary carries the name — and only the name. The
+// identity subject is not plumbed through, so it cannot be put back on the
+// response by someone noticing the field is already populated.
 func TestConfigStore_List_CarriesWhoLastWrote(t *testing.T) {
 	s := store.NewConfigStore(openTestDB(t))
 	now := time.Now().UTC().Truncate(time.Second)
@@ -524,7 +526,6 @@ func TestConfigStore_List_CarriesWhoLastWrote(t *testing.T) {
 	list, err := s.List()
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	assert.Equal(t, "sub-1", list[0].UpdatedBy)
 	assert.Equal(t, "alice", list[0].UpdatedByUsername)
 }
 

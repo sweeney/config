@@ -125,11 +125,16 @@ type ConfigNamespace struct {
 
 // ConfigNamespaceSummary is returned by List — no document body.
 type ConfigNamespaceSummary struct {
-	Name              string
-	ReadRole          string
-	WriteRole         string
-	UpdatedAt         time.Time
-	UpdatedBy         string
+	Name      string
+	ReadRole  string
+	WriteRole string
+	UpdatedAt time.Time
+
+	// UpdatedByUsername only: the identity subject is deliberately not
+	// carried here. The decision was to withhold it from the list, and a
+	// populated field one line from the handler is an invitation to put it
+	// back on the grounds that it is already there. ConfigNamespace keeps
+	// UpdatedBy — the column is still written, and Get still returns it.
 	UpdatedByUsername string
 	CreatedAt         time.Time
 }

@@ -23,7 +23,7 @@ func NewConfigStore(database *db.Database) *ConfigStore {
 
 func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 	rows, err := s.db.DB().Query(
-		`SELECT name, read_role, write_role, updated_at, updated_by,
+		`SELECT name, read_role, write_role, updated_at,
 		        updated_by_username, created_at
 		 FROM config_namespaces ORDER BY name ASC`,
 	)
@@ -40,7 +40,7 @@ func (s *ConfigStore) List() ([]domain.ConfigNamespaceSummary, error) {
 			updatedAt, createdAt string
 		)
 		if err := rows.Scan(&sum.Name, &sum.ReadRole, &sum.WriteRole, &updatedAt,
-			&sum.UpdatedBy, &updatedByUsername, &createdAt); err != nil {
+			&updatedByUsername, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan config namespace: %w", err)
 		}
 		sum.UpdatedByUsername = updatedByUsername.String

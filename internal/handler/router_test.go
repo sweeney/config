@@ -152,7 +152,7 @@ func (r *fakeRepo) List() ([]domain.ConfigNamespaceSummary, error) {
 	for _, ns := range r.data {
 		out = append(out, domain.ConfigNamespaceSummary{
 			Name: ns.Name, ReadRole: ns.ReadRole, WriteRole: ns.WriteRole,
-			UpdatedAt: ns.UpdatedAt, UpdatedBy: ns.UpdatedBy,
+			UpdatedAt:         ns.UpdatedAt,
 			UpdatedByUsername: ns.UpdatedByUsername, CreatedAt: ns.CreatedAt,
 		})
 	}

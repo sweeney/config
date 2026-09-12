@@ -48,7 +48,6 @@ func (r *fakeConfigRepo) List() ([]domain.ConfigNamespaceSummary, error) {
 			ReadRole:          ns.ReadRole,
 			WriteRole:         ns.WriteRole,
 			UpdatedAt:         ns.UpdatedAt,
-			UpdatedBy:         ns.UpdatedBy,
 			UpdatedByUsername: ns.UpdatedByUsername,
 			CreatedAt:         ns.CreatedAt,
 		})
