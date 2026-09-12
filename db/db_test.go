@@ -323,7 +323,7 @@ func TestOpen_WriteRoleStillRejectsPublic(t *testing.T) {
 
 func snapshotFiles(t *testing.T, dbPath string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(dbPath + ".pre-public-rebuild-*")
+	matches, err := filepath.Glob(dbPath + ".pre-*-rebuild-*")
 	require.NoError(t, err)
 	return matches
 }
@@ -816,4 +816,45 @@ func TestOpen_SchemaStepsAreRecordedAndSkipped(t *testing.T) {
 		"SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_step_sentinel'").Scan(&n))
 	assert.Equal(t, 1, n, "no table was rebuilt on the second open")
 	assert.Equal(t, v, userVersion(t, second.DB()))
+}
+
+// TestOpen_BothRebuildsOnOneBoot: a database old enough to need both schema
+// steps takes two snapshots on the same boot. Deriving their names from the
+// clock alone collided at whole-second resolution, and VACUUM INTO refuses an
+// existing file — so the second step failed the boot outright, on the
+// restored-old-backup path the snapshots exist to protect.
+func TestOpen_BothRebuildsOnOneBoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ancient.db")
+	raw := rawOpen(t, path)
+	_, err := raw.Exec(oldSchemaDDL)
+	require.NoError(t, err)
+	_, err = raw.Exec(oldAuditDDL)
+	require.NoError(t, err)
+	require.NoError(t, insertNamespace(raw, "houses", "admin", "admin"))
+	_, err = raw.Exec(
+		`INSERT INTO config_audit (namespace, action, actor, at) VALUES ('houses','create','sub-1','t')`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	database, err := db.Open(path)
+	require.NoError(t, err, "both steps must be able to run on one boot")
+	defer database.Close()
+
+	assert.GreaterOrEqual(t, userVersion(t, database.DB()), 2)
+	assert.Len(t, snapshotFiles(t, path), 2, "one snapshot per step, distinctly named")
+
+	// Both rebuilds actually happened, and carried their data.
+	var ddl string
+	require.NoError(t, database.DB().QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='config_namespaces'").Scan(&ddl))
+	assert.Contains(t, ddl, "'public'")
+	_, err = database.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, actor, at) VALUES ('houses','document_write','s','t')`)
+	assert.NoError(t, err)
+	var ns, audit int
+	require.NoError(t, database.DB().QueryRow("SELECT COUNT(*) FROM config_namespaces").Scan(&ns))
+	require.NoError(t, database.DB().QueryRow(
+		"SELECT COUNT(*) FROM config_audit WHERE action='create'").Scan(&audit))
+	assert.Equal(t, 1, ns, "the namespace survived")
+	assert.Equal(t, 1, audit, "and so did its history")
 }

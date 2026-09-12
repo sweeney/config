@@ -324,7 +324,7 @@ cmd_verify() {
 
   head_ "Pre-rebuild snapshot"
   local snap
-  snap=$(ls -1t "${CONFIG_DB}".pre-public-rebuild-* 2>/dev/null | head -1 || true)
+  snap=$(ls -1t "${CONFIG_DB}".pre-*-rebuild-* 2>/dev/null | head -1 || true)
   if [ -n "$snap" ]; then
     ok "snapshot present: $(basename "$snap") ($(du -h "$snap" | awk '{print $1}'))"
     if sq_file "$snap" "SELECT 1;" >/dev/null 2>&1; then

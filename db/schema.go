@@ -131,7 +131,11 @@ const newNamespacesDDL = `CREATE TABLE %s (
 var snapshotClock = func() time.Time { return time.Now().UTC() }
 
 // snapshotBeforeRebuild writes a consistent copy of the database next to it
-// and returns the path.
+// and returns the path. label distinguishes the step: a database old enough
+// to need two rebuilds takes two snapshots on the same boot, and a name
+// derived from the clock alone collided at whole-second resolution — VACUUM
+// INTO refuses an existing file, so the second step failed the boot outright.
+// The label also tells an operator which snapshot is which.
 //
 // VACUUM INTO rather than a file copy: the database runs in WAL mode, where
 // committed transactions may still be sitting in the -wal file, so copying
@@ -140,9 +144,9 @@ var snapshotClock = func() time.Time { return time.Now().UTC() }
 // The name carries a UTC timestamp so a second attempt can never overwrite
 // the snapshot from the first — the older one is the more original, and
 // clobbering it is exactly the mistake you cannot undo.
-func snapshotBeforeRebuild(sqlDB *sql.DB, dbPath string) (string, error) {
-	target := fmt.Sprintf("%s.pre-public-rebuild-%s",
-		dbPath, snapshotClock().Format("20060102T150405Z"))
+func snapshotBeforeRebuild(sqlDB *sql.DB, dbPath, label string) (string, error) {
+	target := fmt.Sprintf("%s.pre-%s-rebuild-%s",
+		dbPath, label, snapshotClock().Format("20060102T150405Z"))
 	if _, err := sqlDB.Exec("VACUUM INTO ?", target); err != nil {
 		return "", fmt.Errorf("write pre-rebuild snapshot to %s: %w", target, err)
 	}
@@ -237,7 +241,7 @@ func ensurePublicReadRole(sqlDB *sql.DB, dbPath string) error {
 	// Snapshot only when there is something to lose. A fresh install rebuilds
 	// an empty table on first boot, and snapshotting nothing is just litter.
 	if rows > 0 {
-		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath)
+		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath, "public")
 		if err != nil {
 			// Deliberately fatal. A database left un-migrated is recoverable;
 			// one migrated with no way back is not.
@@ -318,7 +322,7 @@ func widenAuditActions(sqlDB *sql.DB, dbPath string) error {
 	// error; it does not cover a logic error that commits cleanly, and there
 	// would then be nothing to go back to.
 	if rows > 0 {
-		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath)
+		snapshot, err := snapshotBeforeRebuild(sqlDB, dbPath, "audit")
 		if err != nil {
 			return err
 		}
