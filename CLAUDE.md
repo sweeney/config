@@ -97,7 +97,7 @@ layers, and how to add new tests.
 | `internal/auth/middleware.go` | `RequireAuth` / `OptionalAuth` middleware (thin wrapper over `common/auth`) |
 | `internal/config/config.go` | Env var loading (`ConfigSvcConfig`) |
 | `db/db.go` | Opens SQLite with migrations via `common/db` |
-| `db/schema.go` | Versioned schema steps run from `db.Open`, tracked in `PRAGMA user_version` — the ledger `common/db` lacks. Currently two table rebuilds SQLite cannot express as `ALTER` |
+| `db/schema.go` | Versioned schema steps run from `db.Open`, tracked in `PRAGMA user_version`. Distinct from `schema_migrations`, which `common/db` uses to track applied files in `db/migrations/`. Currently two table rebuilds SQLite cannot express as `ALTER` |
 | `db/migrations/001_init.sql` | Schema: `config_namespaces` table |
 | `db/migrations/002_config_audit.sql` | Schema: `config_audit` table (create / acl_change / document_write / delete) |
 | `db/migrations/003_audit_actor_username.sql` | Adds `config_audit.actor_username` |

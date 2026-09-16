@@ -12,25 +12,37 @@ import (
 
 // The read_role CHECK constraint on config_namespaces has to gain 'public'.
 // SQLite cannot ALTER a CHECK constraint, so widening it means the full
-// table-rebuild dance, and that cannot live in db/migrations/: common/db's
-// migration runner keeps no ledger — it Execs every migration file on every
-// startup and relies on CREATE TABLE IF NOT EXISTS for idempotence. A rebuild
-// expressed as SQL there would therefore re-run on every boot.
+// table-rebuild dance, and that cannot live in db/migrations/.
 //
-// It also cannot be a one-off run by hand. `config-server --restore-backup`
-// pulls an older SQLite file down from R2 and drops it into place; a restore of
-// a pre-migration backup would silently revert the schema and every public
-// namespace would start failing at the CHECK. Running the rebuild inside Open,
-// guarded by an "is it already done?" probe, makes restores self-healing.
+// One of the two original reasons for that has expired. common/db's migration
+// runner used to keep no ledger — it Exec'd every file on every startup — so a
+// rebuild expressed as SQL there would have re-run on every boot. Since
+// common/v0.6.0 the runner records applied migrations in schema_migrations and
+// offers each file exactly once, so that particular hazard is gone.
+//
+// The reason that survives was always the stronger one: a rebuild cannot be a
+// one-off run by hand either. `config-server --restore-backup` pulls an older
+// SQLite file down from R2 and drops it into place, and a restore of a
+// pre-migration backup would silently revert the schema — every public
+// namespace would start failing at the CHECK. A ledger does not help here,
+// because the restored file brings its own. Running the rebuild inside Open,
+// guarded by an "is it already done?" probe, is what makes restores
+// self-healing.
 //
 // Note the asymmetry: write_role deliberately does NOT gain 'public'. A
 // namespace may be readable without a token; nothing is ever anonymously
 // writable.
 
 // currentSchemaVersion is the number of schema steps this binary knows about.
-// It is recorded in PRAGMA user_version, which acts as the ledger the
-// migration runner in common/db does not have: steps below the recorded
-// version are skipped outright rather than re-derived.
+// It is recorded in PRAGMA user_version: steps below the recorded version are
+// skipped outright rather than re-derived.
+//
+// There are two ledgers now, tracking different things. schema_migrations (in
+// common/db, since v0.6.0) records which files in db/migrations/ have been
+// applied. user_version records how many of the rebuild steps in this file
+// have run. Neither substitutes for the other — a restore from R2 can move the
+// schema backwards underneath both, which is why each step keeps its own
+// "is it already done?" probe rather than trusting its counter alone.
 //
 // Recording it matters more than it looks. Without it each step's "has this
 // been done?" question is re-answered on every Open, and a probe that fails

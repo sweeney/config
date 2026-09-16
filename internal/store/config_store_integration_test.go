@@ -451,8 +451,18 @@ func TestConfigStore_Audit_UsernameIsOptional(t *testing.T) {
 }
 
 // TestConfigStore_Audit_UsernameSurvivesReopen guards the migration itself:
-// ALTER TABLE ADD COLUMN re-runs on every boot under common/db's ledger-less
-// runner, and must not disturb rows already written.
+// 003's ALTER TABLE ADD COLUMN must not disturb rows already written when it
+// is re-run.
+//
+// Since common/v0.6.0 a plain reopen no longer re-runs anything — the ledger
+// records 003 and never offers it again — so this test drops schema_migrations
+// before reopening. That is the shape of the upgrade boot on a database that
+// predates the ledger, which is the only time the re-run actually happens, and
+// it is the thing worth guarding. Without the drop this test passes no matter
+// what 003 does, which is worse than not having it.
+//
+// db.TestOpen_AdoptionPreservesUnbackfilledColumns covers the same path from
+// the db package; this one covers it through the store's own read path.
 func TestConfigStore_Audit_UsernameSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.db")
@@ -465,6 +475,9 @@ func TestConfigStore_Audit_UsernameSurvivesReopen(t *testing.T) {
 		Name: "tariffs", ReadRole: "user", WriteRole: "user",
 		Document: []byte(`{}`), UpdatedAt: now, CreatedAt: now,
 	}, domain.Actor{Sub: "sub-1", Username: "alice"}))
+	// Make it a pre-ledger database, so reopening genuinely re-runs 003.
+	_, err = first.DB().Exec(`DROP TABLE schema_migrations`)
+	require.NoError(t, err)
 	require.NoError(t, first.Close())
 
 	second, err := db.Open(path)
