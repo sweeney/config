@@ -245,9 +245,10 @@ func TestOpen_RebuildRecreatesReadRoleIndex(t *testing.T) {
 	assert.Equal(t, "idx_config_namespaces_read_role", idxName)
 }
 
-// TestOpen_RebuildIsIdempotent is the critical test: common/db has no
-// migration ledger, so Open runs on every boot. The second Open must detect
-// the schema is already correct and do nothing. A sentinel index (which a
+// TestOpen_RebuildIsIdempotent is the critical test: the rebuild steps in
+// schema.go run from Open on every boot, gated by user_version rather than by
+// common/db's migration ledger, which does not cover them. The second Open
+// must detect the schema is already correct and do nothing. A sentinel index (which a
 // DROP TABLE would take with it) is the tell-tale for an unnecessary rebuild.
 func TestOpen_RebuildIsIdempotent(t *testing.T) {
 	const sentinelIndex = "idx_rebuild_sentinel"

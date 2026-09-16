@@ -66,14 +66,30 @@ func TestOpen_RecordsMigrationsInLedger(t *testing.T) {
 	}, migrationLedger(t, path), "every shipped migration should be recorded")
 }
 
-// TestOpen_AdoptsPreLedgerDatabase is the upgrade boot: a database migrated by
-// common/v0.5.0 must open cleanly and end up with a complete ledger.
+// TestOpen_AdoptsPreLedgerDatabase is the upgrade boot.
+//
+// It starts from newOldSchemaDB rather than a fresh database, because those are
+// two different shapes and production has the second one. A fresh database gets
+// the wide read_role CHECK straight from 001_init.sql and never rebuilds; a
+// deployed one was created before that widening, so ensurePublicReadRole and
+// widenAuditActions have rebuilt both tables, and its DDL is the rebuild's
+// rather than the migrations'. Adoption has to survive the shape we actually
+// have, including a CREATE TABLE IF NOT EXISTS meeting a renamed-into-place
+// table.
 func TestOpen_AdoptsPreLedgerDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "test.db")
+	path := newOldSchemaDB(t)
+	raw := rawOpen(t, path)
+	require.NoError(t, insertNamespace(raw, "mqtt", "user", "admin"))
+	require.NoError(t, raw.Close())
 
+	// First boot: runs the migrations and the schema.go rebuilds, as the
+	// pre-ledger binary did.
 	database, err := db.Open(path)
 	require.NoError(t, err)
-	require.NoError(t, insertNamespace(database.DB(), "mqtt", "user", "admin"))
+	_, err = database.DB().Exec(
+		`INSERT INTO config_audit (namespace, action, actor, at)
+		 VALUES ('mqtt', 'create', 'sub-1', '2026-01-01T00:00:00Z')`)
+	require.NoError(t, err)
 	require.NoError(t, database.Close())
 
 	dropLedger(t, path)
@@ -84,9 +100,15 @@ func TestOpen_AdoptsPreLedgerDatabase(t *testing.T) {
 
 	assert.Len(t, migrationLedger(t, path), 4, "adoption should record every migration")
 
-	var namespaces int
+	// Both tables are counted. A re-run that fails (an unguarded CREATE INDEX)
+	// stops the boot and any of these tests would catch it. A re-run that
+	// silently succeeds -- a seed INSERT in some future migration -- shows up
+	// only as a row count, and only in the table it seeds.
+	var namespaces, audits int
 	require.NoError(t, adopted.DB().QueryRow(`SELECT COUNT(*) FROM config_namespaces`).Scan(&namespaces))
-	assert.Equal(t, 1, namespaces, "adoption must not disturb existing rows")
+	require.NoError(t, adopted.DB().QueryRow(`SELECT COUNT(*) FROM config_audit`).Scan(&audits))
+	assert.Equal(t, 1, namespaces, "adoption must not disturb or duplicate namespace rows")
+	assert.Equal(t, 1, audits, "adoption must not disturb or duplicate audit rows")
 }
 
 // TestOpen_AdoptionPreservesUnbackfilledColumns guards the two ADD COLUMN
@@ -94,11 +116,13 @@ func TestOpen_AdoptsPreLedgerDatabase(t *testing.T) {
 // that actually executed would be visible as a column reset to NULL — or, if
 // the runner stopped tolerating it, as a failed boot.
 func TestOpen_AdoptionPreservesUnbackfilledColumns(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "test.db")
+	path := newOldSchemaDB(t)
+	raw := rawOpen(t, path)
+	require.NoError(t, insertNamespace(raw, "mqtt", "user", "admin"))
+	require.NoError(t, raw.Close())
 
 	database, err := db.Open(path)
 	require.NoError(t, err)
-	require.NoError(t, insertNamespace(database.DB(), "mqtt", "user", "admin"))
 	_, err = database.DB().Exec(
 		`UPDATE config_namespaces SET updated_by_username = 'martin' WHERE name = 'mqtt'`)
 	require.NoError(t, err)

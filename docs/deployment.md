@@ -44,10 +44,13 @@ There is nothing to run by hand. Deploying the new binary and
 restarting is the whole procedure. What to know about it:
 
 - **It lives in Go, not in `db/migrations/`.** It runs from `db.Open`,
-  in `db/schema.go`. The migration runner in `common/db` keeps no
-  ledger — it `Exec`s every `.sql` file on every startup and leans on
-  `CREATE TABLE IF NOT EXISTS` for idempotence — so a rebuild written
-  as SQL there would re-run on every boot.
+  in `db/schema.go`. It cannot be expressed as a `.sql` migration
+  because a restore can move the schema backwards underneath it — see
+  `--restore-backup` below, which is the reason that still holds. (The
+  original reason was that `common/db`'s runner kept no ledger and
+  re-ran every file on every boot. Since `common/v0.6.0` it records
+  applied migrations in `schema_migrations` and offers each file
+  once.)
 - **It runs on every open and is idempotent.** Before rebuilding
   anything it probes the database: insert a row with
   `read_role='public'` inside a transaction that always rolls back. If
@@ -66,10 +69,9 @@ restarting is the whole procedure. What to know about it:
 - **A brand-new database never takes the rebuild path at all.**
   `db/migrations/001_init.sql` now creates `config_namespaces` already
   accepting `read_role='public'`, so a fresh install is born at the
-  right shape. Widening that statement is safe with the ledger-less
-  runner precisely because it is `CREATE TABLE IF NOT EXISTS`: a
-  database that already has the table does not re-run it, and so still
-  reaches the rebuild.
+  right shape. Widening that statement was safe precisely because it is
+  `CREATE TABLE IF NOT EXISTS`: a database that already has the table
+  is unaffected by it, and so still reaches the rebuild.
 - **Running on every open is what makes `--restore-backup` safe.**
   A restore drops an older SQLite file from R2 into `DB_PATH`. Without
   the rebuild happening at startup, restoring a pre-migration backup
@@ -146,10 +148,13 @@ restored pre-migration backup takes.
 config db: schema settled at version 2, nothing to do
 ```
 
-`PRAGMA user_version` is a step counter, and it is the ledger
-`common/db`'s migration runner does not have: steps at or below the
-recorded number are skipped outright rather than each re-deciding
-whether it has already run. The run that applied them recorded it, so
+`PRAGMA user_version` is a step counter for the rebuilds in
+`db/schema.go`: steps at or below the recorded number are skipped
+outright rather than each re-deciding whether it has already run. It is
+a separate thing from `schema_migrations`, which `common/db` uses to
+track which files in `db/migrations/` have been applied — two ledgers,
+counting two different kinds of change, neither substituting for the
+other. The run that applied them recorded it, so
 later boots short-circuit without probing the database at all. They still say so, deliberately: silence
 would leave "checked and settled" and "a binary that never checked"
 looking identical, and which of those you are looking at is the whole
@@ -219,6 +224,63 @@ namespace deleted while rolled back leaves no trace, and nothing marks
 the discontinuity. Someone reading a namespace's history later sees an
 unbroken sequence that quietly omits that window. If you roll back,
 note the start and end times somewhere the next person will find them.
+
+## The migration ledger (`schema_migrations`)
+
+Since `common/v0.6.0`, `common/db` records every applied migration in a
+`schema_migrations` table and never offers an applied file again. Before
+that it re-ran every `.sql` file on every boot and relied on
+`CREATE TABLE IF NOT EXISTS` and a tolerated `duplicate column name` for
+idempotence.
+
+**Never edit a migration in `db/migrations/` once it has shipped —
+comments included.** The ledger stores a SHA-256 of each file's body
+alongside the row, and a deployed database whose recorded checksum no
+longer matches logs this on *every* boot, forever:
+
+```
+db: WARNING: migration 003_audit_actor_username.sql has changed since it was
+applied here (recorded 8f2a1c0b9e44, now 8857831e3750). Databases that already
+ran it will not run it again, so this edit reaches only new databases.
+```
+
+The warning is correct to exist: a database that already ran the file will
+not run it again, so the edit reaches only new databases and the two drift
+apart silently. Add a new migration instead. To fix a comment, you would
+have to accept the warning permanently.
+
+### The one-off adoption boot
+
+The first start on the release that introduced the ledger prints lines you
+will not see again. A database created before the ledger has the full
+schema and no `schema_migrations` table, so the runner adopts it: it
+re-runs each migration once, tolerates what is already there, and records
+the result.
+
+```
+db: applying migrations from migrations
+db: 003_audit_actor_username.sql: column already present, skipping: ALTER TABLE config_audit ADD COLUMN actor_username TEXT
+db: 004_namespace_updated_by_username.sql: column already present, skipping: ALTER TABLE config_namespaces ADD COLUMN updated_by_username TEXT
+db: applied 4 migration(s)
+```
+
+**`column already present, skipping` is expected here and is not an
+error.** It appears exactly once, on the adoption boot, for each
+`ALTER TABLE ADD COLUMN` migration. Every boot after that is silent —
+no `applying migrations` line at all. If you see these lines a second
+time, the ledger is not being written and that is worth investigating.
+
+Adoption is a no-op for this service only because every migration is
+either `CREATE ... IF NOT EXISTS` or a bare `ADD COLUMN`. A migration of
+any other shape would genuinely re-execute on that one boot: an unguarded
+`CREATE INDEX` fails the boot, and a seed `INSERT` would silently double
+its rows. `db/ledger_test.go` pins this down so a future migration cannot
+break it unnoticed.
+
+Note that a rollback to a pre-`v0.6.0` binary reinstates the old runner,
+which splits migration files on semicolons with no awareness of comments.
+That is why the prose in `db/migrations/*.sql` avoids semicolons even
+though the current runner no longer cares.
 
 ## First-time install on a new host
 
