@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 
-	"github.com/sweeney/config/internal/config"
 	"github.com/sweeney/common/backup/cli"
+	"github.com/sweeney/config/internal/config"
 )
 
 func backupCfg() (cli.BackupConfig, error) {
