@@ -4,7 +4,7 @@ import (
 	"errors"
 	"time"
 
-	commonapierr "github.com/sweeney/identity/common/apierr"
+	commonapierr "github.com/sweeney/common/web/apierr"
 )
 
 var (

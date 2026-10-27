@@ -264,13 +264,14 @@ duplication beats a premature abstraction.
 
 | Thing | Where it is tested |
 |---|---|
-| JWT signature verification | `common/auth` (identity repo) |
-| JWKS fetch / key rotation | `common/auth` (identity repo) |
-| R2 backup upload | `common/backup` (identity repo) |
-| Rate limiting | `common/ratelimit` (identity repo) |
+| JWT signature verification | `github.com/sweeney/identity/common/auth` |
+| JWKS fetch / key rotation | `github.com/sweeney/identity/common/auth` |
+| R2 backup upload | `github.com/sweeney/common/backup` |
+| Rate limiting | `github.com/sweeney/common/web/ratelimit` |
 
-These are tested in `github.com/sweeney/identity/common/`. The config repo
-trusts those packages and does not re-test them.
+These are tested in their own modules: `auth` in the identity repo, the rest in
+the `sweeney/common` repo. The config repo trusts those packages and does not
+re-test them.
 
 ## Adding new tests
 

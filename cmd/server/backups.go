@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/sweeney/config/internal/config"
-	"github.com/sweeney/identity/common/cli"
+	"github.com/sweeney/common/backup/cli"
 )
 
 func backupCfg() (cli.BackupConfig, error) {
