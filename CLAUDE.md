@@ -30,12 +30,25 @@ see **Identity coupling** in `docs/admin.md`.
 
 ```
 module github.com/sweeney/config
-require github.com/sweeney/identity/common v0.5.0
+require (
+    github.com/sweeney/common/backup  v0.1.0
+    github.com/sweeney/common/db      v0.1.0
+    github.com/sweeney/common/web     v0.2.0
+    github.com/sweeney/identity/common v0.7.0
+)
 ```
 
-The `common/` sub-module (at `github.com/sweeney/identity/common`) provides:
-shared DB helpers, JWKS token parsing, R2 backup, rate limiting, and the
-OpenAPI YAML→JSON converter. See **Updating common/** below.
+Shared code comes from two places:
+
+- `github.com/sweeney/identity/common` — **`auth` only**: JWKS token parsing
+  for Identity-issued tokens. It lives in the identity repo because it changes
+  in lockstep with Identity's token issuer.
+- `github.com/sweeney/common` — generic service infrastructure, one module per
+  dependency weight: `db` (SQLite + `schema_migrations` ledger), `backup` (R2
+  backup, plus `backup/cli` for `--list-backups`/`--restore-backup`), and
+  `web` (`apierr`, `ratelimit`, the OpenAPI YAML→JSON `spec` converter).
+
+See **Updating shared modules** below.
 
 ## Running locally
 
@@ -114,24 +127,21 @@ layers, and how to add new tests.
 | `docs/admin.md` | Operational guide: namespaces, ACLs, backups, SPA |
 | `docs/walkthrough.md` | Executable walkthrough of every endpoint |
 
-## Updating common/
+## Updating shared modules
 
-`common/` is a Go sub-module inside the identity repo at
-`github.com/sweeney/identity/common`. To consume a new version:
+Both repos tag per module, with the module's directory as the tag prefix, and
+this repo pins exact versions:
 
-1. Make and commit changes in `identity/common/` in the identity repo.
-2. Tag the new version from the identity repo root:
-   ```bash
-   git tag common/v0.1.1
-   git push origin common/v0.1.1
-   ```
-3. In this repo, update the requirement and tidy:
-   ```bash
-   go get github.com/sweeney/identity/common@v0.1.1
-   go mod tidy
-   ```
-4. Run the test suite to confirm nothing broke.
+- `auth`: changes are made in the identity repo's `common/` and tagged there as
+  `common/vX.Y.Z`; consume with
+  `go get github.com/sweeney/identity/common@vX.Y.Z`.
+- `db`, `backup`, `web`: changes are made in the `sweeney/common` repo and
+  tagged there as `db/vX.Y.Z`, `backup/vX.Y.Z` or `web/vX.Y.Z`; consume with
+  e.g. `go get github.com/sweeney/common/web@vX.Y.Z`.
+
+Then `go mod tidy` and run the test suite to confirm nothing broke.
 
 The config repo **must not** import any package from
 `github.com/sweeney/identity/internal/` — those are internal to identity.
-Shared code belongs in `common/`.
+Shared code belongs in `identity/common` (token verification) or
+`sweeney/common` (everything else).

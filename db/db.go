@@ -3,7 +3,7 @@ package db
 import (
 	"embed"
 
-	commondb "github.com/sweeney/identity/common/db"
+	commondb "github.com/sweeney/common/db"
 )
 
 //go:embed migrations

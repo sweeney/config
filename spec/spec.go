@@ -6,7 +6,7 @@ package spec
 import (
 	_ "embed"
 
-	commonspec "github.com/sweeney/identity/common/spec"
+	commonspec "github.com/sweeney/common/web/spec"
 )
 
 //go:embed openapi.yaml
