@@ -109,6 +109,7 @@ expect "a malformed --since is refused" 2 "--since must be" --on-host --since ye
 ENV_FILE=/nonexistent expect "a missing env file is a precondition failure" 2 "env file not found" --on-host
 expect "the remote form needs a host" 2 "From the dev machine"
 expect "--dry-run prints and runs nothing" 0 "would run:" --dry-run sweeney@example.invalid
+expect "the remote copy goes in a private mktemp -d directory" 0 "mktemp -d" --dry-run sweeney@example.invalid
 
 echo
 echo "$pass passed, $fail failed"

@@ -12,8 +12,9 @@
 #   ./deploy/check-backups.sh --dry-run sweeney@192.168.1.200   # print, run nothing
 #   ./deploy/check-backups.sh --since 2026-10-29 sweeney@192.168.1.200
 #
-# That copies this script to /tmp on the host, runs it there with sudo (you are
-# asked for your password: the env file is root 0600), and removes the copy.
+# That copies this script into a private mktemp -d directory on the host, runs
+# it there with sudo (you are asked for your password: the env file is root
+# 0600), and removes the directory.
 #
 # On the host directly:
 #
@@ -83,17 +84,26 @@ if [ "$ON_HOST" -eq 0 ]; then
   for c in ssh scp; do
     command -v "$c" >/dev/null || die "required command not found: $c"
   done
-  tmp="/tmp/check-backups.$$.sh"
   printf "Read-only check of config's R2 backups on %s (since %s).\n" "$REMOTE" "$SINCE"
-  printf "It copies this script to %s, runs it with sudo, then removes it.\n\n" "$tmp"
+  printf "It copies this script into a private temporary directory on the host,\n"
+  printf "runs it with sudo, then removes the directory.\n\n"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf "would run:\n  scp %q %q\n  ssh -t %q sudo bash %q --on-host --since %q; rm -f %q\n" \
-      "$0" "$REMOTE:$tmp" "$REMOTE" "$tmp" "$SINCE" "$tmp"
+    printf "would run:\n  ssh %q mktemp -d /tmp/check-backups.XXXXXXXX    # -> DIR\n" "$REMOTE"
+    printf "  scp %q %q\n" "$0" "$REMOTE:DIR/check-backups.sh"
+    printf "  ssh -t %q sudo bash DIR/check-backups.sh --on-host --since %q; rm -rf DIR\n" "$REMOTE" "$SINCE"
     exit 0
   fi
-  scp -q "$0" "$REMOTE:$tmp" || die "could not copy the script to $REMOTE"
-  # The copy is removed whatever the check's outcome, and its exit code kept.
-  ssh -t "$REMOTE" "sudo bash $tmp --on-host --since $SINCE; rc=\$?; rm -f $tmp; exit \$rc"
+  # mktemp -d on the host: a directory only this user can write, with an
+  # unpredictable name, so nothing else on the host can swap the script that
+  # is about to run as root.
+  dir=$(ssh "$REMOTE" 'mktemp -d /tmp/check-backups.XXXXXXXX') || die "could not create a temporary directory on $REMOTE"
+  case "$dir" in
+    /tmp/check-backups.*) ;;
+    *) die "unexpected temporary directory from $REMOTE: $dir" ;;
+  esac
+  scp -q "$0" "$REMOTE:$dir/check-backups.sh" || die "could not copy the script to $REMOTE"
+  # The directory is removed whatever the check's outcome, and its exit code kept.
+  ssh -t "$REMOTE" "sudo bash $dir/check-backups.sh --on-host --since $SINCE; rc=\$?; rm -rf $dir; exit \$rc"
   exit $?
 fi
 
