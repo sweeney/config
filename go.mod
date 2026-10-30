@@ -7,7 +7,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/sweeney/common/backup v0.1.0
 	github.com/sweeney/common/db v0.1.0
-	github.com/sweeney/common/web v0.2.0
+	github.com/sweeney/common/web v0.2.1
 	github.com/sweeney/identity/common v0.7.0
 )
 
