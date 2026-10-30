@@ -192,6 +192,20 @@ disk it sits on:
 ./bin/config-server --list-backups | head
 ```
 
+To confirm from the dev machine that backups are landing, without reading the
+listing by eye, run the read-only check (it asks for your sudo password on the
+host, because the env file is root 0600):
+
+```bash
+./deploy/check-backups.sh sweeney@192.168.1.200            # --dry-run to preview
+```
+
+It passes when, since `--since` (default: the move to `sweeney/common/backup`,
+2026-10-28 13:04 UTC), every backup is under `{IDENTITY_ENV}/backups/config/`
+and none under another service's prefix; every UTC day has one (config's
+daily backup runs at 00:00 UTC whether or not anything was written); and the
+journal has no `backup_failure`. Its tests are `deploy/check-backups_test.sh`.
+
 ### Rolling back
 
 Rolling back to the previous binary is safe and fails closed. This has
