@@ -696,6 +696,10 @@ production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
   production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
 ```
 
+`--list-backups` ends with the command to restore one, naming the binary
+as you invoked it (e.g. `/opt/config/bin/config-server --restore-backup
+<key>`), so it can be pasted as is.
+
 The restore writes to the path from `DB_PATH` (default `config.db`). Stop
 the config service before restoring — the restore CLI overwrites the
 file even if the service is running, which will corrupt the SQLite WAL.

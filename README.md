@@ -958,5 +958,5 @@ Rapid write bursts coalesce into one backup per `BACKUP_MIN_INTERVAL` (default
 
 ```bash
 ./bin/config-server --list-backups
-./bin/config-server --restore-backup 2026/05/01/config-20260501-120000.sqlite3
+./bin/config-server --restore-backup production/backups/config/2026/05/01/config-2026-05-01T12:00:00Z.sqlite3
 ```
