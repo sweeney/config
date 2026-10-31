@@ -8,15 +8,15 @@
 #
 # From the dev machine (the usual way):
 #
-#   ./deploy/check-backups.sh sweeney@192.168.1.200
-#   ./deploy/check-backups.sh --dry-run sweeney@192.168.1.200   # print, run nothing
-#   ./deploy/check-backups.sh --since 2026-10-29 sweeney@192.168.1.200
+#   ./deploy/check-backups.sh sweeney@<host>
+#   ./deploy/check-backups.sh --dry-run sweeney@<host>   # print, run nothing
+#   ./deploy/check-backups.sh --since 2026-10-29 sweeney@<host>
 #
-# That copies this script into a private mktemp -d directory on the host, runs
-# it there with sudo (you are asked for your password: the env file is root
-# 0600), and removes the directory.
+# That copies this script and lib.sh into a private mktemp -d directory on the
+# host, runs it there with sudo (you are asked for your password: the env file
+# is root 0600), and removes the directory.
 #
-# On the host directly:
+# On the host directly, with lib.sh beside it:
 #
 #   sudo ./check-backups.sh --on-host [--since 2026-10-28T13:04:25Z]
 #
@@ -39,6 +39,10 @@
 
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=deploy/lib.sh
+. "$HERE/lib.sh"
+
 CONFIG_ENV_FILE="${CONFIG_ENV_FILE:-/etc/config/config.env}"
 CONFIG_BIN="${CONFIG_BIN:-/opt/config/bin/config-server}"
 CONFIG_UNIT="${CONFIG_UNIT:-config}"
@@ -53,12 +57,8 @@ ok()    { printf "  [ ok ] %s\n" "$*"; PASS=$((PASS+1)); }
 bad()   { printf "  [FAIL] %s\n" "$*"; FAIL=$((FAIL+1)); }
 info()  { printf "         %s\n" "$*"; }
 head_() { printf "\n== %s ==\n" "$*"; }
-die()   { printf "\nERROR: %s\n" "$*" >&2; exit 2; }
 
-usage() {
-  sed -n '2,30p' "$0" | sed 's/^#//; s/^ //'
-  exit 2
-}
+usage() { usage_from_header "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -81,48 +81,29 @@ esac
 # ── From the dev machine: copy this script over and run it there ──────────────
 if [ "$ON_HOST" -eq 0 ]; then
   [ -n "$REMOTE" ] || usage
-  for c in ssh scp; do
-    command -v "$c" >/dev/null || die "required command not found: $c"
-  done
   printf "Read-only check of config's R2 backups on %s (since %s).\n" "$REMOTE" "$SINCE"
   printf "It copies this script into a private temporary directory on the host,\n"
   printf "runs it with sudo, then removes the directory.\n\n"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf "would run:\n  ssh %q mktemp -d /tmp/check-backups.XXXXXXXX    # -> DIR\n" "$REMOTE"
-    printf "  scp %q %q\n" "$0" "$REMOTE:DIR/check-backups.sh"
-    printf "  ssh -t %q sudo bash DIR/check-backups.sh --on-host --since %q; rm -rf DIR\n" "$REMOTE" "$SINCE"
+    print_run_on_host "$REMOTE" "$0" --on-host --since "$SINCE"
     exit 0
   fi
-  # mktemp -d on the host: a directory only this user can write, with an
-  # unpredictable name, so nothing else on the host can swap the script that
-  # is about to run as root.
-  dir=$(ssh "$REMOTE" 'mktemp -d /tmp/check-backups.XXXXXXXX') || die "could not create a temporary directory on $REMOTE"
-  case "$dir" in
-    /tmp/check-backups.*) ;;
-    *) die "unexpected temporary directory from $REMOTE: $dir" ;;
-  esac
-  scp -q "$0" "$REMOTE:$dir/check-backups.sh" || die "could not copy the script to $REMOTE"
-  # The directory is removed whatever the check's outcome, and its exit code kept.
-  ssh -t "$REMOTE" "sudo bash $dir/check-backups.sh --on-host --since $SINCE; rc=\$?; rm -rf $dir; exit \$rc"
-  exit $?
+  rc=0
+  run_on_host "$REMOTE" "$0" --on-host --since "$SINCE" || rc=$?
+  exit "$rc"
 fi
 
 # ── On the host ───────────────────────────────────────────────────────────────
 [ "$DRY_RUN" -eq 0 ] || die "--dry-run applies to the dev-machine form; on the host the check is already read-only"
-if [ "${SKIP_ROOT_CHECK:-0}" != "1" ]; then
-  [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo): the env file is mode 600"
-fi
+require_root "the env file is mode 600"
 for c in python3 journalctl; do
   command -v "$c" >/dev/null 2>&1 || die "required command not found: $c"
 done
 [ -x "$CONFIG_BIN" ] || die "config binary not found or not executable: $CONFIG_BIN"
 [ -f "$CONFIG_ENV_FILE" ] || die "env file not found: $CONFIG_ENV_FILE"
 [ -r "$CONFIG_ENV_FILE" ] || die "env file not readable: $CONFIG_ENV_FILE (need root)"
-# Sourced, never echoed: it holds the R2 credentials.
-set -a
-# shellcheck disable=SC1090
-. "$CONFIG_ENV_FILE"
-set +a
+# Parsed as systemd does, never sourced or echoed: it holds the R2 credentials.
+load_env_file "$CONFIG_ENV_FILE"
 TODAY="${TODAY:-$(date -u +%Y-%m-%d)}"
 
 head_ "R2 listing"

@@ -30,7 +30,10 @@ for c in ssh scp; do
 done
 chmod +x "$WORK/bin/"*
 
-printf 'IDENTITY_ENV=production\nR2_SECRET_ACCESS_KEY=s3cr3t-do-not-print\n' >"$WORK/config.env"
+# As a systemd EnvironmentFile allows: an unquoted space, and a backtick that
+# must never run. Sourced as bash, the first would run a command.
+# shellcheck disable=SC2016 # the backtick is literal on purpose
+printf 'IDENTITY_ENV=production\nCORS_ORIGINS=https://a.example https://b.example\nR2_SECRET_ACCESS_KEY=s3cr3t-do-not-print`touch %s/ran`\n' "$WORK" >"$WORK/config.env"
 
 # listing writes a --list-backups output in common/backup v0.1.1's format, one
 # row per key given, ending with its restore hint.
@@ -112,6 +115,8 @@ ENV_FILE=/nonexistent expect "a missing env file is a precondition failure" 2 "e
 expect "the remote form needs a host" 2 "From the dev machine"
 expect "--dry-run prints and runs nothing" 0 "would run:" --dry-run sweeney@example.invalid
 expect "the remote copy goes in a private mktemp -d directory" 0 "mktemp -d" --dry-run sweeney@example.invalid
+expect "the remote copy takes lib.sh with it" 0 "$HERE/lib.sh" --dry-run sweeney@example.invalid
+if [ -e "$WORK/ran" ]; then echo "FAIL  nothing in the env file is run"; fail=$((fail+1)); else echo "ok    nothing in the env file is run"; pass=$((pass+1)); fi
 
 echo
 echo "$pass passed, $fail failed"

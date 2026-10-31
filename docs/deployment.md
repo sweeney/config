@@ -197,7 +197,7 @@ listing by eye, run the read-only check (it asks for your sudo password on the
 host, because the env file is root 0600):
 
 ```bash
-./deploy/check-backups.sh sweeney@192.168.1.200            # --dry-run to preview
+./deploy/check-backups.sh sweeney@<host>            # --dry-run to preview
 ```
 
 It passes when, since `--since` (default: the move to `sweeney/common/backup`,
