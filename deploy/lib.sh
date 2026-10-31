@@ -61,8 +61,9 @@ load_env_file() {
     local q="${value:0:1}"
     if [ "$q" = '"' ] || [ "$q" = "'" ]; then
       local inner="${value:1}"
-      [ "${#value}" -ge 2 ] && [ "${value: -1}" = "$q" ] \
-        || die "$file line $n: a quote is opened and not closed"
+      if [ "${#value}" -lt 2 ] || [ "${value: -1}" != "$q" ]; then
+        die "$file line $n: a quote is opened and not closed"
+      fi
       inner="${inner%"$q"}"
       case "$inner" in *"$q"*) die "$file line $n: quoted pieces are not supported (systemd would join them)" ;; esac
       value=$inner
