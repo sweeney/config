@@ -223,22 +223,27 @@ healthy() {
   done
 }
 
+# rollback PHASE puts the previous database back, given the phase the
+# restore had reached.
 rollback() {
-  local f base unhealthy="$safety/restored-unhealthy"
+  local entered=$1 f base unhealthy="$safety/restored-unhealthy" restored=()
   say ""
   say "Rolling back to the previous database."
   systemctl stop "$CONFIG_UNIT" >>"$LOG" 2>&1 || say "  warning: systemctl stop $CONFIG_UNIT failed"
-  # If the previous database was moved aside (or there was none), whatever is
-  # at the live path now is the restored copy: keep it for diagnosis.
-  if [ -e "$safety/$(basename "$db")" ] || [ "$prev_exists" -eq 0 ]; then
-    for f in "$db" "$db-wal" "$db-shm"; do
-      if [ -e "$f" ]; then
-        if ! { as_service_user mkdir -p "$unhealthy" && mv -- "$f" "$unhealthy/"; }; then
-          say "  warning: could not move $f aside"
-        fi
+  # The live database file is the restored copy if the previous one reached
+  # $safety (or there was none). Its -wal/-shm are the restored copy's only
+  # once the swap finished: the staging file had none, so before that any
+  # live -wal/-shm is still the previous database's. Keep the restored copy
+  # for diagnosis.
+  if [ -e "$safety/$(basename "$db")" ] || [ "$prev_exists" -eq 0 ]; then restored+=("$db"); fi
+  if [ "$entered" = swapped ]; then restored+=("$db-wal" "$db-shm"); fi
+  for f in ${restored[@]+"${restored[@]}"}; do
+    if [ -e "$f" ]; then
+      if ! { as_service_user mkdir -p "$unhealthy" && mv -- "$f" "$unhealthy/"; }; then
+        say "  warning: could not move $f aside"
       fi
-    done
-  fi
+    fi
+  done
   for f in "$safety"/*; do
     base=$(basename "$f")
     if [ ! -f "$f" ] || [ "$base" = restore.log ]; then continue; fi
@@ -278,8 +283,9 @@ recover() {
       say "Nothing was swapped; $CONFIG_UNIT was started again on the previous database."
       exit 1 ;;
     *)
+      local entered=$phase
       phase=rolling_back
-      rollback
+      rollback "$entered"
       exit 1 ;;
   esac
 }

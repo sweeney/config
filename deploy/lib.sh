@@ -36,10 +36,13 @@ require_root() {
 #
 # Handled as systemd does: blank lines and lines starting with # or ; are
 # skipped; whitespace around the key and value is trimmed; a value wrapped
-# in matching double or single quotes is unwrapped, with \" and \\ unescaped
-# inside double quotes. A line ending in a backslash (a continuation, for
-# systemd) is refused rather than misread. Errors name the line, never the
-# value, which may be a secret.
+# in one pair of double or single quotes is unwrapped. Where systemd does
+# something a plain reading would not, the line is refused rather than
+# misread (checked against systemd 257): any backslash (systemd unescapes
+# \$, \`, \" and \\ in double quotes, drops a lone one unquoted, and joins
+# lines ending in one), a quote inside a quoted value (systemd joins
+# adjacent quoted pieces), and a quote that is opened and not closed.
+# Errors name the line, never the value, which may be a secret.
 load_env_file() {
   local file=$1 line key value n=0
   while IFS= read -r line || [ -n "$line" ]; do
@@ -54,12 +57,15 @@ load_env_file() {
     value="${line#*=}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
-    if [ "${#value}" -ge 2 ] && [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ]; then
-      value="${value:1:${#value}-2}"
-      value="${value//\\\"/\"}"
-      value="${value//\\\\/\\}"
-    elif [ "${#value}" -ge 2 ] && [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ]; then
-      value="${value:1:${#value}-2}"
+    case "$value" in *\\*) die "$file line $n: backslashes are not supported (systemd would unescape them)" ;; esac
+    local q="${value:0:1}"
+    if [ "$q" = '"' ] || [ "$q" = "'" ]; then
+      local inner="${value:1}"
+      [ "${#value}" -ge 2 ] && [ "${value: -1}" = "$q" ] \
+        || die "$file line $n: a quote is opened and not closed"
+      inner="${inner%"$q"}"
+      case "$inner" in *"$q"*) die "$file line $n: quoted pieces are not supported (systemd would join them)" ;; esac
+      value=$inner
     fi
     export "$key=$value"
   done <"$file"

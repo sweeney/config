@@ -15,6 +15,7 @@ trap 'rm -rf "$WORK"' EXIT
 command -v sqlite3 >/dev/null || { echo "sqlite3 is needed to run these tests" >&2; exit 2; }
 REAL_MKTEMP=$(command -v mktemp)
 REAL_SLEEP=$(command -v sleep)
+REAL_MV=$(command -v mv)
 
 mkdir -p "$WORK/bin"
 # config-server: --list-backups prints $LISTING; --restore-backup KEY writes to
@@ -78,6 +79,19 @@ cat >"$WORK/bin/sleep" <<EOF
 #!/usr/bin/env bash
 exec $REAL_SLEEP 0.05
 EOF
+# mv fails the first move of the live database's -wal when MV_FAIL=wal, as a
+# one-off error would; later moves of it succeed.
+cat >"$WORK/bin/mv" <<EOF
+#!/usr/bin/env bash
+if [ "\${MV_FAIL:-}" = wal ] && [ ! -e "$WORK/mv-failed" ]; then
+  for a; do
+    if [ "\$a" = "$WORK/data/config.db-wal" ]; then
+      : >"$WORK/mv-failed"; echo "mv: cannot move \$a" >&2; exit 1
+    fi
+  done
+fi
+exec $REAL_MV "\$@"
+EOF
 # mktemp fails when MKTEMP_FAIL=1.
 cat >"$WORK/bin/mktemp" <<EOF
 #!/usr/bin/env bash
@@ -127,7 +141,7 @@ listing production "$(key 2026-10-30)" "$(key 2026-10-31)" \
 # Everything here reads the live database -readonly, as the script does: a
 # read-write open would delete the stale -wal on close (Debian's sqlite3 does).
 reset() {
-  rm -rf "$WORK/data" "$WORK/started-once" "$WORK/curl-called" "$WORK/gate" "$WORK/ran"
+  rm -rf "$WORK/data" "$WORK/started-once" "$WORK/curl-called" "$WORK/gate" "$WORK/ran" "$WORK/mv-failed"
   mkdir -p "$WORK/data"
   sqlite3 "$WORK/data/config.db" "$schema INSERT INTO config_namespaces VALUES ('live');"
   echo stale-wal >"$WORK/data/config.db-wal"
@@ -176,8 +190,10 @@ in_order() {
   [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
 }
 # untouched — the live database, its WAL and the service are as reset left them.
+# The -wal is checked before live() opens the database, so no open can hide
+# a missing one.
 untouched() {
-  [ "$(live)" = live ] && [ -e "$WORK/data/config.db-wal" ] \
+  [ -e "$WORK/data/config.db-wal" ] && [ "$(live)" = live ] \
     && notcalled "systemctl stop" && [ ! -e "$WORK/data/restore-staging.sqlite3" ]
 }
 
@@ -274,6 +290,14 @@ HEALTH=old-only run 1 "unhealthy on the restored database: puts the previous one
   && check "its -wal back beside it" [ -e "$WORK/data/config.db-wal" ] \
   && check "restored copy kept aside" [ -f "$(safety_dir)/restored-unhealthy/config.db" ] \
   && check "says it rolled back and is healthy" has "healthy again on the previous database" \
+  && done_
+
+reset
+MV_FAIL=wal run 1 "a swap that fails between the database and its -wal keeps that -wal with the previous database" --on-host --yes "$(key 2026-10-30)" \
+  && check "the previous -wal is still beside config.db" grep -qx stale-wal "$WORK/data/config.db-wal" \
+  && check "it was not filed as the restored copy's" [ ! -e "$(safety_dir)/restored-unhealthy/config.db-wal" ] \
+  && check "previous database live again" [ "$(live)" = live ] \
+  && check "says it rolled back" has "healthy again on the previous database" \
   && done_
 
 reset

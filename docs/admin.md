@@ -704,7 +704,9 @@ replacing anything, for confirmation (`--yes` skips it). In order, it:
    `development`, so the listing, not the env file, is the authority);
 2. downloads it beside the database as the `config` user, with the
    service's environment (parsed as systemd parses `EnvironmentFile`, never
-   sourced as shell), while the service keeps running, and checks it with
+   sourced as shell; a line it cannot read the way systemd would, such as
+   one with a backslash, is refused, naming the line, not the value), while
+   the service keeps running, and checks it with
    `PRAGMA integrity_check` and a count of its namespaces;
 3. shows the current and backup namespace counts and asks to confirm. A
    backup with no namespaces is refused unless `--yes` is given;
