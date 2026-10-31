@@ -954,9 +954,11 @@ a copy of `config.db` to:
 ```
 
 Rapid write bursts coalesce into one backup per `BACKUP_MIN_INTERVAL` (default
-30 s). A `changed: false` PUT produces no backup. To list and restore:
+30 s). A `changed: false` PUT produces no backup. To list and restore, stopping
+the service first (restoring under a running one corrupts its WAL; see
+**Restoring from backup** in `docs/admin.md`):
 
 ```bash
 ./bin/config-server --list-backups
-./bin/config-server --restore-backup 2026/05/01/config-20260501-120000.sqlite3
+./bin/config-server --restore-backup production/backups/config/2026/05/01/config-2026-05-01T12:00:00Z.sqlite3
 ```

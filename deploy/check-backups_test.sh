@@ -32,8 +32,8 @@ chmod +x "$WORK/bin/"*
 
 printf 'IDENTITY_ENV=production\nR2_SECRET_ACCESS_KEY=s3cr3t-do-not-print\n' >"$WORK/config.env"
 
-# listing writes a --list-backups output in common/backup v0.1.0's format, one
-# row per key given.
+# listing writes a --list-backups output in common/backup v0.1.1's format, one
+# row per key given, ending with its restore hint.
 listing() {
   {
     printf 'Listing config backups for environment: production\n\n'
@@ -45,6 +45,7 @@ listing() {
       i=$((i+1))
     done
     printf '\n%d backup(s) found.\n' "$#"
+    printf '\nTo restore (stop the service first): /opt/config/bin/config-server --restore-backup <key>\n'
   } >"$WORK/listing"
 }
 key() { printf 'production/backups/%s/%s/config-%sT00:00:00Z.sqlite3' "$1" "${2//-//}" "$2"; }
@@ -81,6 +82,7 @@ listing "$(key config 2026-10-28)" "$(key config 2026-10-29)" "$(key config 2026
 healthy_journal
 expect "healthy: daily backups under config/" 0 "5 ok, 0 failure(s)" --on-host
 expect "healthy: counts only those after the deploy" 0 "2 backup(s) under production/backups/config/" --on-host
+expect "the restore hint is not read as a backup" 0 "environment production: 3 backup(s) listed" --on-host
 
 listing "$(key config 2026-10-29)"
 expect "a missing day fails" 1 "no backup on 2026-10-30" --on-host
