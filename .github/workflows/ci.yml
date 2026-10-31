@@ -156,6 +156,30 @@ jobs:
             coverage.txt
           retention-days: 30
 
+  deploy-scripts:
+    name: Deploy script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install sqlite3
+        run: sudo apt-get update -q && sudo apt-get install -y -q sqlite3
+
+      - name: shellcheck
+        run: |
+          shellcheck -x -P . deploy/lib.sh deploy/lib_test.sh \
+            deploy/check-backups.sh deploy/check-backups_test.sh \
+            deploy/restore-backup.sh deploy/restore-backup_test.sh
+
+      - name: lib.sh
+        run: deploy/lib_test.sh
+
+      - name: check-backups.sh
+        run: deploy/check-backups_test.sh
+
+      - name: restore-backup.sh
+        run: deploy/restore-backup_test.sh
+
   integration:
     name: Integration tests
     runs-on: ubuntu-latest

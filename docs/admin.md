@@ -684,34 +684,56 @@ production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
 
 ## Restoring from backup
 
-On garibaldi, restore with `deploy/restore-backup.sh`, from the dev machine:
+On the host, restore with `deploy/restore-backup.sh`, from the dev machine:
 
 ```bash
 # See what it would do: checks the backup is listed, changes nothing
-./deploy/restore-backup.sh --dry-run --latest sweeney@192.168.1.200
+./deploy/restore-backup.sh --dry-run --latest sweeney@<host>
 
 # Restore the newest backup, or a specific key
-./deploy/restore-backup.sh --latest sweeney@192.168.1.200
-./deploy/restore-backup.sh sweeney@192.168.1.200 \
+./deploy/restore-backup.sh --latest sweeney@<host>
+./deploy/restore-backup.sh sweeney@<host> \
   production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
 ```
 
 It asks for your sudo password (the env file is root 0600) and, before
 replacing anything, for confirmation (`--yes` skips it). In order, it:
 
-1. checks the key is one of this environment's config backups;
+1. checks the key is one of the config backups for the environment the
+   listing names (the binary maps any `IDENTITY_ENV` but `production` to
+   `development`, so the listing, not the env file, is the authority);
 2. downloads it beside the database as the `config` user, with the
-   service's environment, and checks it with `PRAGMA integrity_check` and a
-   read of `config_namespaces`, while the service keeps running;
-3. stops the service, moves the current database **and its `-wal`/`-shm`**
-   into `pre-restore-<time>/` beside it (a stale WAL would otherwise be
-   replayed into the restored file), and moves the download into place;
-4. starts the service and waits for `/healthz`. If it is not healthy, it puts
-   the previous database back and starts the service again.
+   service's environment (parsed as systemd parses `EnvironmentFile`, never
+   sourced as shell; a line it cannot read the way systemd would, such as
+   one with a backslash, is refused, naming the line, not the value), while
+   the service keeps running, and checks it with
+   `PRAGMA integrity_check` and a count of its namespaces;
+3. shows the current and backup namespace counts and asks to confirm. A
+   backup with no namespaces is refused unless `--yes` is given;
+4. creates `pre-restore-<time>-<random>/` beside the database and checks it
+   is writable, then stops the service, moves the current database **and its
+   `-wal`/`-shm`** into it (a stale WAL would otherwise be replayed into the
+   restored file), and moves the download into place;
+5. starts the service and waits up to 30 seconds for `/healthz`.
 
-A bad download changes nothing. The previous database stays in
-`/var/lib/config/pre-restore-<time>/` until you remove it. Its tests are
-`deploy/restore-backup_test.sh`.
+Until the stop, any failure changes nothing. After it, any failure (a start
+that fails, a service that is not healthy, an error, a Ctrl-C) puts the
+previous database back, keeping the restored copy in
+`pre-restore-…/restored-unhealthy/`, starts the service again, and says
+where each file is. A dropped ssh connection does not interrupt it, and what
+it prints is also written to `pre-restore-…/restore.log`.
+
+The restored file is not migrated until the service opens it:
+`--restore-backup` runs before the database is opened, so the first start
+after the swap runs any migrations, and the health check covers them. A
+backup taken by a newer binary than the one running depends on how the
+schema code treats steps it does not know; if the service does not come up
+healthy, the script rolls back.
+
+The previous database stays in `/var/lib/config/pre-restore-…/` until you
+remove it. The tests are `deploy/restore-backup_test.sh`, and the helpers it
+shares with `check-backups.sh` are in `deploy/lib.sh` (`deploy/lib_test.sh`);
+CI runs all three suites and shellcheck.
 
 ### By hand
 
