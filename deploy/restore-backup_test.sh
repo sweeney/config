@@ -42,7 +42,7 @@ cat >"$WORK/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
   show) echo "${UNIT_WORKDIR-}"; exit 0 ;;
-  start) echo "systemctl start $2 live=$(sqlite3 "$LIVE_DB" 'SELECT group_concat(name) FROM config_namespaces' 2>/dev/null)" >>"$CALLS" ;;
+  start) echo "systemctl start $2 live=$(sqlite3 -readonly "$LIVE_DB" 'SELECT group_concat(name) FROM config_namespaces' 2>/dev/null)" >>"$CALLS" ;;
   *) echo "systemctl $*" >>"$CALLS" ;;
 esac
 case "${SYSTEMCTL_FAIL:-}:$1" in
@@ -64,7 +64,7 @@ EOF
 cat >"$WORK/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 : >"$WORK_DIR/curl-called"
-prev() { [ "$(sqlite3 "$LIVE_DB" "SELECT name FROM config_namespaces" 2>/dev/null)" = live ]; }
+prev() { [ "$(sqlite3 -readonly "$LIVE_DB" "SELECT name FROM config_namespaces" 2>/dev/null)" = live ]; }
 case "${HEALTH:-ok}" in
   ok) ;;
   old-only) prev || exit 22 ;;
@@ -124,6 +124,8 @@ listing production "$(key 2026-10-30)" "$(key 2026-10-31)" \
   "production/backups/identity/2026/11/01/identity-2026-11-01T00:00:00Z.sqlite3" >"$WORK/listing"
 
 # reset puts a live database (one namespace, "live") and a stale -wal in place.
+# Everything here reads the live database -readonly, as the script does: a
+# read-write open would delete the stale -wal on close (Debian's sqlite3 does).
 reset() {
   rm -rf "$WORK/data" "$WORK/started-once" "$WORK/curl-called" "$WORK/gate" "$WORK/ran"
   mkdir -p "$WORK/data"
@@ -131,7 +133,7 @@ reset() {
   echo stale-wal >"$WORK/data/config.db-wal"
   : >"$WORK/calls"
 }
-live() { sqlite3 "$WORK/data/config.db" 'SELECT group_concat(name) FROM config_namespaces' 2>&1; }
+live() { sqlite3 -readonly "$WORK/data/config.db" 'SELECT group_concat(name) FROM config_namespaces' 2>&1; }
 
 # invoke ARGS... runs the script with the stubs and fixtures. It execs, so
 # when run in the background $! is the script itself, for the signal tests.
