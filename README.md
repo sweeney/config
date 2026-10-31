@@ -962,3 +962,7 @@ the service first (restoring under a running one corrupts its WAL; see
 ./bin/config-server --list-backups
 ./bin/config-server --restore-backup production/backups/config/2026/05/01/config-2026-05-01T12:00:00Z.sqlite3
 ```
+
+On a host, restore with `./deploy/restore-backup.sh` instead: it checks the
+download before touching anything, swaps it in with the service stopped, and
+puts the previous database back if the service is not healthy afterwards.

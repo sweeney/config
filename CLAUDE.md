@@ -85,6 +85,9 @@ See `docs/deployment.md` for the layout and routine operations.
 ./config-server --restore-backup [key]  # Restore from R2 backup
 ```
 
+On a host, restore with `./deploy/restore-backup.sh` (stops the service,
+keeps the previous DB, rolls back if unhealthy); see `docs/admin.md`.
+
 ## Testing
 
 ```bash

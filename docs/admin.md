@@ -684,16 +684,42 @@ production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
 
 ## Restoring from backup
 
+On garibaldi, restore with `deploy/restore-backup.sh`, from the dev machine:
+
 ```bash
-# List available config backups
-./bin/config-server --list-backups
+# See what it would do: checks the backup is listed, changes nothing
+./deploy/restore-backup.sh --dry-run --latest sweeney@192.168.1.200
 
-# Restore the most recent (interactive picker)
-./bin/config-server --restore-backup
-
-# Or restore a specific key
-./bin/config-server --restore-backup \
+# Restore the newest backup, or a specific key
+./deploy/restore-backup.sh --latest sweeney@192.168.1.200
+./deploy/restore-backup.sh sweeney@192.168.1.200 \
   production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
+```
+
+It asks for your sudo password (the env file is root 0600) and, before
+replacing anything, for confirmation (`--yes` skips it). In order, it:
+
+1. checks the key is one of this environment's config backups;
+2. downloads it beside the database as the `config` user, with the
+   service's environment, and checks it with `PRAGMA integrity_check` and a
+   read of `config_namespaces`, while the service keeps running;
+3. stops the service, moves the current database **and its `-wal`/`-shm`**
+   into `pre-restore-<time>/` beside it (a stale WAL would otherwise be
+   replayed into the restored file), and moves the download into place;
+4. starts the service and waits for `/healthz`. If it is not healthy, it puts
+   the previous database back and starts the service again.
+
+A bad download changes nothing. The previous database stays in
+`/var/lib/config/pre-restore-<time>/` until you remove it. Its tests are
+`deploy/restore-backup_test.sh`.
+
+### By hand
+
+`--list-backups` and `--restore-backup` are the CLI underneath. Locally:
+
+```bash
+./bin/config-server --list-backups
+./bin/config-server --restore-backup        # interactive picker
 ```
 
 `--list-backups` ends with a reminder of how to restore, naming the binary
@@ -703,20 +729,11 @@ as you invoked it:
 To restore (stop the service first): /opt/config/bin/config-server --restore-backup <key>
 ```
 
-It is a reminder, not a command to paste. The restore also needs the
-service's environment (`/etc/config/config.env` on garibaldi) for the R2
-credentials and `DB_PATH`; without `DB_PATH` it writes `config.db` in the
-current directory, not the live database.
-
-The restore writes to the path from `DB_PATH` (default `config.db`). Stop
-the config service before restoring — the restore CLI overwrites the
-file even if the service is running, which will corrupt the SQLite WAL.
-
-```bash
-sudo systemctl stop config
-sudo -u config ./bin/config-server --restore-backup
-sudo systemctl start config
-```
+It is a reminder, not a command to paste. The restore writes to `DB_PATH`
+(default `config.db`, relative to the working directory) and needs the R2
+credentials, so on a host it must run with the service's environment, as
+the service user, with the service stopped: restoring under a running
+service corrupts the SQLite WAL. That is what the script does for you.
 
 ## Identity coupling
 
