@@ -696,9 +696,17 @@ production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
   production/backups/config/2026/04/24/config-2026-04-24T15:30:45Z.sqlite3
 ```
 
-`--list-backups` ends with the command to restore one, naming the binary
-as you invoked it (e.g. `/opt/config/bin/config-server --restore-backup
-<key>`), so it can be pasted as is.
+`--list-backups` ends with a reminder of how to restore, naming the binary
+as you invoked it:
+
+```
+To restore (stop the service first): /opt/config/bin/config-server --restore-backup <key>
+```
+
+It is a reminder, not a command to paste. The restore also needs the
+service's environment (`/etc/config/config.env` on garibaldi) for the R2
+credentials and `DB_PATH`; without `DB_PATH` it writes `config.db` in the
+current directory, not the live database.
 
 The restore writes to the path from `DB_PATH` (default `config.db`). Stop
 the config service before restoring — the restore CLI overwrites the
