@@ -206,6 +206,9 @@ and none under another service's prefix; every UTC day has one (config's
 daily backup runs at 00:00 UTC whether or not anything was written); and the
 journal has no `backup_failure`. Its tests are `deploy/check-backups_test.sh`.
 
+To restore one, use `deploy/restore-backup.sh`; see **Restoring from
+backup** in `docs/admin.md`.
+
 ### Rolling back
 
 Rolling back to the previous binary is safe and fails closed. This has
